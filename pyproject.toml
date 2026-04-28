@@ -40,3 +40,8 @@ target-version = "py310"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "cluster: tests that require cluster sif containers (skipped by default)",
+    "gpu: tests that require a GPU (run via sbatch only)",
+]
+addopts = "-m 'not cluster and not gpu'"
