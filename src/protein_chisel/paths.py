@@ -21,6 +21,7 @@ ROSETTA_SIF = Path("/net/software/containers/rosetta.sif")
 UNIVERSAL_SIF = Path("/net/software/containers/universal.sif")
 ESMFOLD_SIF = Path("/net/software/containers/esmfold.sif")
 AF3_SIF = Path("/net/software/containers/af3.sif")  # final filter only
+METAL3D_SIF = Path("/net/software/containers/pipelines/metal3d.sif")
 
 
 # ---- HuggingFace caches ----------------------------------------------------

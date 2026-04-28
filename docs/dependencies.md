@@ -16,6 +16,7 @@ When you add a new tool wrapper, also add the underlying dependency here. Whenev
 | `universal.sif` | `/net/software/containers/universal.sif` | softadmin | (in `/net/software/containers/spec/`) | General-purpose Python 3.11 environment. **Has fair-esm 2.0.1 — not compatible with new evolutionaryscale `esm` package.** |
 | `esmfold.sif` | `/net/software/containers/esmfold.sif` | softadmin | `/net/software/containers/spec/esmfold.spec` | Old ESM (`fair-esm` 2.0.1) on Python 3.7. Used by legacy `~/special_scripts/ESM/*.py`. |
 | `af3.sif` | `/net/software/containers/af3.sif` | softadmin | (in spec/) | AlphaFold3. Used as the *final* filter outside the inner loop. |
+| `metal3d.sif` | `/net/software/containers/pipelines/metal3d.sif` | jbutch (lab pipelines) | `/net/software/containers/pipelines/metal3d.def` | Metal3D — predicts metal-binding sites and scores existing metal coordination. Reference: https://github.com/baker-laboratory/pipelines/pull/258. |
 
 ### Cluster `.sif` build conventions
 
@@ -77,6 +78,9 @@ These weights are the **`fair-esm`** format and are loaded inside `esmfold.sif` 
 | fpocket | (not installed yet — TBD) | https://github.com/Discngine/fpocket. Add to a future sif or apt install in `pyrosetta.sif`. |
 | ThermoMPNN | (not installed yet — TBD) | https://github.com/Kuhlman-Lab/ThermoMPNN. |
 | ESM-IF1 | inside `esmfold.sif` | Old fair-esm; usable for ensemble diversity. |
+| ProLIF | (not installed yet — TBD) | https://github.com/chemosim-lab/ProLIF — protein-ligand interaction fingerprints (hbonds, salt bridges, π-stacks, hydrophobic, etc). Useful for *characterizing* a design's interaction pattern with the ligand. |
+| PLIP | (not installed yet — TBD) | https://github.com/pharmai/plip — alternative interaction profiler. Pick one of ProLIF or PLIP, not both. |
+| APBS | (not installed yet — TBD) | https://www.poissonboltzmann.org/ — electrostatic potential maps. Heavy; reserve for late-stage characterization. |
 
 ---
 
@@ -95,3 +99,22 @@ These weights are the **`fair-esm`** format and are loaded inside `esmfold.sif` 
 | `tools/fpocket_run` | TBD | fpocket binary | install pending |
 | `tools/thermompnn` | TBD | ThermoMPNN weights | install pending |
 | `tools/esm_if` | `esmfold.sif` | `ESM2_WEIGHTS_DIR` | not yet wrapped |
+| `tools/secondary_structure` | `pyrosetta.sif` | — | DSSP per-residue labels |
+| `tools/chemical_interactions` | `pyrosetta.sif` | — | hbonds, salt bridges, π-π, π-cation, fa_elec |
+| `tools/metal3d_score` | `metal3d.sif` | (its own weights, in sif) | not yet wrapped |
+| `tools/prolif_or_plip` | TBD | — | install pending |
+
+---
+
+## Reference scripts to modernize
+
+Living in `~/special_scripts/`. These contain patterns and metric definitions we're porting into `protein_chisel`. Don't import from them — use them as reference and write modern equivalents in `tools/` or `filters/`.
+
+| Legacy script | What it does | Where it lands here |
+|---|---|---|
+| `metrics_and_hbond_rosetta_seth_no_RELAX_V2.py` | RosettaScripts XML wrapping ~25 metrics: SAP, NetCharge (no HIS), Ddg, LigInterfaceEnergy, ContactMolecularSurface, ShapeComplementarity, Holes/InterfaceHoles, ExposedHydrophobics, SecondaryStructureCount, PreProline, LongestContPolar/Apolar, ElectrostaticComplementarity, plus per-atom hbonds and per-atom ligand SASA. | Split across `tools/pyrosetta_repack`, `tools/rosetta_ligand_ddg`, `tools/secondary_structure`, `tools/chemical_interactions`, `filters/sap_score`, `filters/protparam`. The XML pattern stays — we just decompose it into individually-callable metric functions. |
+| `hbonding_network.py` | Iterates pose's `HBondSet`, classifies prot↔water / water↔water / lig↔water hbonds, dumps CSV. | `tools/chemical_interactions` (hbond detection module). |
+| `design_filtering/metric_monster__MAIN.py` | Half-finished orchestrator: `contact_counter` + `protein_size_shape_metrics` + `execute_fpocket_on_holo_structure`, combines CSVs with prefixes, supports parallel runs. | The orchestration pattern → `pipelines/`. The individual metric calculators → `tools/`. The CSV-prefix-merge pattern is good and we'll keep it for results assembly. |
+| `ESM/ESM_mutation_suggestions.py` | ESM-2 masked-token mutation suggestions per position. | `tools/esmc_score` (masked-token ESM-C scoring). API has changed — old fair-esm `Alphabet.get_batch_converter` becomes new evolutionaryscale `model.encode(ESMProtein(...))`. |
+| `ESM/ESM_score_sequences.py` | ESM-2 pseudo-perplexity scoring of sequences in a fasta. | `tools/esmc_score` (perplexity mode). |
+| `upgraded_fastMPNNdesign/run_pipeline.py` + `pipeline_constants.py` | A more polished pipeline runner with `PipelineRunner` class, structured StepOutputs dataclass, hash-based internal basenames, container/script registry. | Reference for `pipelines/` orchestrator structure. The `PipelineRunner` + step-defaults + arg-mapping pattern is solid; adopt the spirit, not the exact code. |

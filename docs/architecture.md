@@ -32,26 +32,94 @@ This codebase is explicitly built to **avoid AF2/AF3/Boltz in the inner loop**. 
 - Cheap structural mini-eval: PyRosetta sidechain repack + Rosetta ligand interface ddG + fpocket geometry, all on the **fixed designed backbone** (no folding).
 - AF3 only as the final filter on the top 50–100 candidates.
 
-## Logit fusion (product of experts)
+## Logit fusion — and an important asymmetry between samplers
 
-The intended way to combine multiple per-position log-prob distributions:
+LigandMPNN's logits are **not** the same kind of distribution as ESM-C / SaProt logits, and naive product-of-experts fusion across all three is incorrect.
+
+| Model | What its per-position logits represent |
+|---|---|
+| LigandMPNN | Autoregressive: `p(aa_i | structure, ligand, aa_{decoded so far})`. Conditioned on a partial sequence determined by MPNN's own decoding order. |
+| ESM-C | Masked-LM marginal: `p(aa_i | aa_rest)` with position `i` masked. |
+| SaProt | Masked-LM marginal conditioned on AA + 3Di tokens. |
+
+These distributions live in different conditional regimes. Don't average / multiply them as if they were peer distributions over the same conditioning set.
+
+**The right pattern: PLM logits as a bias to MPNN's native sampler.**
 
 ```
-log p_combined(aa | pos) = α · log p_LigandMPNN(aa | structure, ligand)
-                         + β · log p_ESM-C(aa | sequence)
-                         + γ · log p_SaProt(aa | seq + 3Di)
+log p_sample(aa_i) = log p_LigandMPNN(aa_i | structure, ligand, ctx)
+                   + β · log p_ESM-C(aa_i | seq_minus_i)
+                   + γ · log p_SaProt(aa_i | seq_minus_i, 3Di)
 ```
 
-Then sample (temperature τ) from `p_combined`. LigandMPNN already exposes per-position bias (`--bias_AA_per_residue`) so this is implemented by:
-
-1. Compute ESM-C and SaProt logits on the original designed sequence — once.
-2. Convert to a per-position bias matrix (β·log p_ESM-C + γ·log p_SaProt).
-3. Pass to LigandMPNN at sampling time.
+LigandMPNN exposes `--bias_AA_per_residue` which is added to its own per-position logits at decode time. Pre-compute the PLM marginals on the *original designed sequence* once, fold them into a bias matrix, and let MPNN sample with that bias. MPNN remains the primary generative process; the PLMs nudge the distribution.
 
 Per position class:
-- **active site** → freeze (β=γ=0; identity also frozen by MPNN constraints).
-- **first shell** → low bias (β=γ small).
-- **surface** → bias allowed; charge/solubility filters do the heavy lifting downstream.
+- **active site** → freeze identity entirely (β = γ = 0; MPNN identity-fix on this position).
+- **first shell** → small bias (β, γ small) so structure-aware MPNN dominates.
+- **surface** → larger bias allowed; downstream hard filters (charge, pI) handle design objectives.
+
+**Pure-PLM pseudo-logits as a fallback.** When LigandMPNN isn't an option (e.g. the iterative walk pipeline below, where you need a per-position conditional and MPNN's autoregressive ordering would have to be re-run for each position), use just `log p_ESM-C + log p_SaProt` — both are masked-LM marginals, so they fuse cleanly.
+
+## Iterative single-mutation walk (Gibbs / MH pipeline)
+
+A separate pipeline alongside the batch `enzyme_optimize_v1`. Useful when you start from an already-good sequence and want to refine it one residue at a time, with each step seeing all previous steps.
+
+```
+s ← starting sequence
+for t in 1..T:
+    pick a position i (uniform / round-robin / weighted by uncertainty)
+    skip if i is frozen (active site / first-shell-locked)
+    compute p(aa | s_{-i}) from fused PLM marginals (ESM-C + SaProt)
+    propose aa* ~ p (with temperature)
+    accept aa* iff cheap filters still pass on s' = s with i ← aa*
+        (regex / ProtParam / quick PyRosetta repack-and-score Δ)
+    update s ← s' on accept
+loop until convergence (no accepted moves in N consecutive sweeps)
+```
+
+Properties:
+- **Honors structural epistasis implicitly**: each mutation is evaluated in the context of all previous mutations.
+- **PLM-only** (no MPNN per step) keeps the inner loop cheap.
+- **MH acceptance** with cheap filters as the energy function lets you steer toward target charge / SAP / ddG without a single weighted scoring formula.
+- Use **temperature schedule** (anneal high → low) for simulated annealing variant.
+- Output is one walked sequence; run many parallel chains from the same start to get a diverse library.
+
+When to prefer this pipeline vs. batch MPNN:
+- Batch MPNN: better for "redesign large fraction of the protein at once."
+- Iterative walk: better for "polish a sequence with a small number of carefully chosen mutations" — closer to what directed evolution does.
+
+## Position classification (extended)
+
+Done once per design. Per residue, record:
+
+| Feature | How |
+|---|---|
+| `class` ∈ {active_site, first_shell, pocket, buried, surface} | distance to ligand/catalytic atoms + SASA + fpocket pocket map |
+| `sasa` Å² | PyRosetta `getSASA` (Coventry recipe) |
+| `dist_ligand` Å | min distance to any ligand heavy atom |
+| `dist_catalytic` Å | min distance to any theozyme catalytic atom |
+| `secondary_structure` ∈ {H, E, L, ...} | DSSP (PyRosetta `SecondaryStructureMetric`) — can be passed downstream as a per-position feature for sampling priors |
+| `secondary_structure_reduced` ∈ {H, E, L} | DSSP reduced alphabet |
+| `phi`, `psi` | backbone dihedrals |
+| `chain` | for multi-chain inputs |
+| `in_pocket` (bool) | fpocket membership |
+| `original_aa` | wild-type / designed-sequence AA at this position |
+
+Output is a single JSON consumed by every downstream tool. Secondary-structure labels can drive sampling priors directly (e.g., disallow proline in helix interiors except at known helix breaks).
+
+## Chemical interactions and biophysics
+
+Beyond the basic Rosetta metrics (`fa_elec`, `hbond_sc`, `hbond_bb_*`), planned tools cover:
+
+- **Hydrogen bonds & networks** — PyRosetta `HBondSet`, classify donor/acceptor by residue+atom; track *which* protein positions hbond to ligand / catalytic residues, with energies. Modernize from `~/special_scripts/metrics_and_hbond_rosetta_seth_no_RELAX_V2.py` and `~/special_scripts/hbonding_network.py`.
+- **Salt bridges & cation-π** — RosettaScripts `arg_cation_pi` reweighting (already used in legacy script); explicit detection via geometry.
+- **Aromatic π-π stacking** — geometric: pairs of aromatic rings (FYW + ligand aromatics), centroid distance < 6 Å, plane angle 0° or 90° (parallel/T-shape). Custom helper.
+- **Electrostatic complementarity** — RosettaScripts `ElectrostaticComplementarityMetric` (in legacy script).
+- **Electric field at active site** — APBS-derived 3D potential, sampled at theozyme TS midpoint or specific atoms. Heavier; reserve for late-stage characterization, not inner loop.
+- **Metal-binding suitability** — Metal3D (`/net/software/containers/pipelines/metal3d.sif`) when ligand is a metal cofactor or design has metal-coordinating residues.
+- **Per-atom SASA on ligand** — Coventry SASA recipe, from legacy script.
+- **Pocket geometry** — fpocket post-repack: volume, bottleneck, hydrophobicity, charge, druggability score.
 
 ## Position classification
 
