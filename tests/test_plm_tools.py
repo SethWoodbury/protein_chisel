@@ -27,12 +27,32 @@ def test_esmc_logits_shape_and_normalization():
     from protein_chisel.tools.esmc import esmc_logits
 
     seq = "MEEVEEYARLVIEAIEKHRDLIREAIEEEIRIYRETGEETHAKR"
-    res = esmc_logits(seq, model_name="esmc_300m", device="cpu")
+    # Use unmasked path here for speed (masked is L forward passes); we
+    # exercise the masked path explicitly below on a shorter sequence.
+    res = esmc_logits(seq, model_name="esmc_300m", device="cpu", masked=False)
     L = len(seq)
     assert res.log_probs.shape == (L, 20)
-    # rows sum to 1 in probability space
     sums = np.exp(res.log_probs).sum(axis=-1)
     assert np.allclose(sums, 1.0, atol=1e-3)
+
+
+def test_esmc_logits_masked_differs_from_unmasked():
+    """Masked-LM marginals must differ from unmasked single-pass logits.
+
+    Regression test for the bug where esmc_logits used a single unmasked
+    forward pass (so the model saw the true AA at each position) — that
+    is NOT a masked-LM marginal and was wrong for fusion.
+    """
+    from protein_chisel.tools.esmc import esmc_logits
+
+    seq = "MGGGAA"  # short enough to keep CPU runtime modest
+    res_unmasked = esmc_logits(seq, model_name="esmc_300m", device="cpu", masked=False)
+    res_masked = esmc_logits(seq, model_name="esmc_300m", device="cpu", masked=True)
+    assert res_unmasked.log_probs.shape == res_masked.log_probs.shape
+    diff = np.abs(res_unmasked.log_probs - res_masked.log_probs).max()
+    assert diff > 0.1, (
+        f"masked and unmasked logits should differ; max abs diff {diff:.4f}"
+    )
 
 
 def test_esmc_score_pseudo_perplexity_finite():
