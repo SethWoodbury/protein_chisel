@@ -149,3 +149,19 @@ def test_length_filter_forbidden_terminal():
     assert not ok
     ok, _ = passes_length_filter("MGGG", cfg)
     assert ok
+
+
+def test_length_filter_empty_with_terminal_constraints_fails():
+    """Empty sequence cannot satisfy must_start_with → must fail."""
+    from protein_chisel.filters.length import LengthFilterConfig, passes_length_filter
+
+    ok, reason = passes_length_filter("", LengthFilterConfig(must_start_with="M"))
+    assert not ok
+    assert "empty" in reason.lower()
+
+
+def test_length_filter_empty_with_no_constraints_passes():
+    from protein_chisel.filters.length import LengthFilterConfig, passes_length_filter
+
+    ok, _ = passes_length_filter("", LengthFilterConfig())
+    assert ok

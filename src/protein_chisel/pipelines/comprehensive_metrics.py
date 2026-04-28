@@ -93,12 +93,14 @@ def run_comprehensive_metrics(
         manifest = _manifest_for_pose(entry, params, cfg)
         manifest_path = per_dir / "_manifest.json"
         row_path = per_dir / "metrics.tsv"
+        # Unique key per pose so multi-conformer outputs don't overwrite.
+        out_key = f"{entry.sequence_id}__conf{entry.conformer_index}"
 
         if skip_existing and manifest_matches(manifest, manifest_path) and row_path.exists():
-            LOGGER.info("skipping %s (manifest matches)", entry.sequence_id)
+            LOGGER.info("skipping %s (manifest matches)", out_key)
             row = pd.read_csv(row_path, sep="\t").iloc[0].to_dict()
             rows.append(row)
-            per_pose_outputs[entry.sequence_id] = _list_outputs(per_dir)
+            per_pose_outputs[out_key] = _list_outputs(per_dir)
             continue
 
         LOGGER.info("processing %s", entry.path)
@@ -106,7 +108,7 @@ def run_comprehensive_metrics(
         rows.append(row)
         manifest.to_json(manifest_path)
         pd.DataFrame([row]).to_csv(row_path, sep="\t", index=False)
-        per_pose_outputs[entry.sequence_id] = _list_outputs(per_dir)
+        per_pose_outputs[out_key] = _list_outputs(per_dir)
 
     df = pd.DataFrame(rows)
     # MetricTable requires (sequence_id, conformer_index) ID columns; ensure they're present.
@@ -127,24 +129,32 @@ def run_comprehensive_metrics(
 def _manifest_for_pose(
     entry: PoseEntry, params: list[str | Path], cfg: ComprehensiveMetricsConfig
 ) -> Manifest:
-    config_dict: dict[str, Any] = {
-        "tool_flags": {k: v for k, v in cfg.__dict__.items() if isinstance(v, bool)},
-        "params": [str(p) for p in params],
-        "metadata": {
-            "sequence_id": entry.sequence_id,
-            "conformer_index": entry.conformer_index,
-            "fold_source": entry.fold_source,
-        },
-    }
+    # Capture ALL config fields (booleans + numeric thresholds + tuples) so
+    # changes to e.g. salt_bridge_cutoff trigger a re-run.
+    serializable_cfg: dict[str, Any] = {}
+    for k, v in cfg.__dict__.items():
+        if isinstance(v, (bool, int, float, str, type(None))):
+            serializable_cfg[k] = v
+        elif isinstance(v, (list, tuple)):
+            serializable_cfg[k] = list(v)
+        else:
+            serializable_cfg[k] = repr(v)
+
+    from protein_chisel import __version__ as chisel_version
+
     return Manifest.for_stage(
         stage="comprehensive_metrics",
         input_paths=[entry.path],
-        config=config_dict,
-        tool_versions={
-            # We can't easily get pyrosetta __version__ at host time; tools that
-            # need it fill it in once they import. Caller can override.
-            "protein_chisel": "0.0.1",
+        config={
+            "tool_config": serializable_cfg,
+            "params": [str(p) for p in params],
+            "metadata": {
+                "sequence_id": entry.sequence_id,
+                "conformer_index": entry.conformer_index,
+                "fold_source": entry.fold_source,
+            },
         },
+        tool_versions={"protein_chisel": chisel_version},
     )
 
 
@@ -164,12 +174,14 @@ def _run_one_pose(
 ) -> dict[str, Any]:
     """Run all enabled tools on one pose; return a metrics row."""
     pdb = entry.path
+    pose_id = f"{entry.sequence_id}__conf{entry.conformer_index}"
     row: dict[str, Any] = {
         "sequence_id": entry.sequence_id,
         "conformer_index": entry.conformer_index,
         "fold_source": entry.fold_source,
         "is_apo": entry.is_apo,
         "pdb_path": str(pdb),
+        "pose_id": pose_id,
     }
 
     catres = parse_remark_666(pdb)
@@ -179,7 +191,7 @@ def _run_one_pose(
     if cfg.run_position_table:
         from protein_chisel.tools.classify_positions import classify_positions
 
-        pt = classify_positions(pdb, pose_id=entry.sequence_id, catres=catres, params=params)
+        pt = classify_positions(pdb, pose_id=pose_id, catres=catres, params=params)
         pt.to_parquet(per_dir / "positions.tsv")
         row["positions__n_residues"] = int((pt.df["is_protein"]).sum())
         row["positions__n_active_site"] = int((pt.df["class"] == "active_site").sum())

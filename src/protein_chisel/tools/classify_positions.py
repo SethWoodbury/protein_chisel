@@ -49,10 +49,11 @@ from protein_chisel.io.schemas import PositionTable
 
 @dataclass
 class ClassifyConfig:
-    first_shell_radius: float = 5.0       # Å
-    active_site_radius: float = 4.0       # Å around catalytic atoms
-    buried_sasa_cutoff: float = 20.0      # Å²
-    surface_sasa_cutoff: float = 20.0     # Å² (>= this is surface)
+    first_shell_radius: float = 5.0       # Å — within this of any ligand atom
+    buried_sasa_cutoff: float = 20.0      # Å² — strictly below = buried;
+                                           # at-or-above = surface (no separate
+                                           # surface_sasa_cutoff: same cutoff
+                                           # both sides keeps classes disjoint)
     sasa_probe: float = 1.4               # Å (solvent probe)
 
 

@@ -34,9 +34,16 @@ def test_chemical_interactions_design():
     # All hbond energies negative (favorable)
     assert all(h["energy"] < 0 for h in res.hbonds)
 
-    # Each hbond row has the canonical fields
+    # Each hbond row has the canonical fields. The donor side carries both
+    # the polar H name (donor_h_atom) and the heavy-atom name (donor_heavy_atom);
+    # the acceptor side has acceptor_atom.
     for h in res.hbonds[:3]:
-        assert {"donor_res", "acceptor_res", "donor_atom", "acceptor_atom", "energy"} <= set(h)
+        required = {
+            "donor_res", "acceptor_res",
+            "donor_h_atom", "donor_heavy_atom",
+            "acceptor_atom", "energy",
+        }
+        assert required <= set(h), f"missing fields: {required - set(h)}"
 
     # Salt bridges, π-π, π-cation may or may not occur but should return lists
     assert isinstance(res.salt_bridges, list)

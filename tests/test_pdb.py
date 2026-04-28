@@ -120,6 +120,36 @@ def test_remark_666_serialization_format():
     assert line.endswith("\n")
 
 
+def test_remark_666_chain_resno_keying_avoids_collision(tmp_path: Path):
+    """Same resno on different chains must not collapse when key_by='chain_resno'."""
+    pdb = tmp_path / "x.pdb"
+    pdb.write_text(
+        "REMARK 666 MATCH TEMPLATE B YYE  209 MATCH MOTIF A HIS  64  1  1\n"
+        "REMARK 666 MATCH TEMPLATE B YYE  209 MATCH MOTIF C HIS  64  2  1\n"
+        "ATOM      1  N   MET A   1       0.0   0.0   0.0  1.00  0.00           N\n"
+    )
+    by_resno = parse_remark_666(pdb)
+    by_chain_resno = parse_remark_666(pdb, key_by="chain_resno")
+    # Default keying collapses
+    assert len(by_resno) == 1
+    # chain_resno keying preserves both
+    assert len(by_chain_resno) == 2
+    assert ("A", 64) in by_chain_resno and ("C", 64) in by_chain_resno
+
+
+def test_remark_666_serialization_is_80_chars():
+    cr = CatalyticResidue(
+        chain="A", name3="HIS", resno=188,
+        target_chain="B", target_name3="YYE", target_resno=209,
+        cst_no=1, cst_no_var=1,
+    )
+    line = cr.to_remark_line()
+    # body is 80 chars + a single newline
+    assert len(line) == 81
+    assert line.endswith("\n")
+    assert len(line.rstrip("\n")) == 80
+
+
 def test_remark_666_inserts_when_no_existing(tmp_path: Path):
     """Writing remarks into a PDB that had none should put them just before ATOM."""
     src = tmp_path / "noremarks.pdb"

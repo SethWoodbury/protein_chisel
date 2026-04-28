@@ -134,70 +134,116 @@ def saprot_logits(
     chain: Optional[str] = None,
     model_name: str = "saprot_35m",
     device: str = "auto",
+    masked: bool = True,
 ) -> SaProtLogitsResult:
     """Per-position log-probs over the 20-AA marginal.
 
     SaProt's vocabulary is 20 AAs × 21 3Di tokens (= 420) plus 5 special
-    tokens, so the raw logits are over 446 columns. We marginalize: the
-    log-prob of an AA at a position is logsumexp of the 21 ``Aa, Ac, ..., A#``
-    rows for that AA.
+    tokens, so the raw logits are over 446 columns. We marginalize over
+    3Di columns to obtain p(aa_i | …): for each AA, logsumexp the 21
+    ``Aa, Ac, ..., A#`` rows for that AA, then normalize across the 20
+    AAs.
+
+    Args:
+        masked: when True (default), mask each SA token in turn and read
+            the AA-marginal at the mask position (proper masked-LM
+            marginal, L forward passes). When False, single unmasked
+            pass — leaks both AA and 3Di at every position.
     """
-    import torch
     sa_str = sa_tokens_from_pdb(pdb_path, chain=chain)
-    return _saprot_logits_from_sa_string(sa_str, model_name=model_name, device=device)
+    return _saprot_logits_from_sa_string(
+        sa_str, model_name=model_name, device=device, masked=masked,
+    )
 
 
 def _saprot_logits_from_sa_string(
     sa_str: str,
     model_name: str = "saprot_35m",
     device: str = "auto",
+    masked: bool = True,
 ) -> SaProtLogitsResult:
     import torch
+
+    if len(sa_str) % 2 != 0:
+        raise ValueError(f"odd-length SA-token string: {len(sa_str)}")
+
     tokenizer, model, dev = _load_saprot(model_name=model_name, device=device)
-    spaced = " ".join(sa_str[i:i + 2] for i in range(0, len(sa_str), 2))
-    inputs = tokenizer(spaced, return_tensors="pt").to(dev)
+    sa_tokens = [sa_str[i:i + 2] for i in range(0, len(sa_str), 2)]
+    L = len(sa_tokens)
+
+    aa_to_ids = _build_saprot_aa_token_map(tokenizer)
+    aa_id_lists = [aa_to_ids.get(aa, []) for aa in SAPROT_AA_ALPHABET]
+
+    if not masked:
+        spaced = " ".join(sa_tokens)
+        inputs = tokenizer(spaced, return_tensors="pt").to(dev)
+        with torch.no_grad():
+            out = model(**inputs)
+        logits = out.logits.squeeze(0).float().cpu().numpy()
+        body = logits[1:-1]
+        log_p = _marginalize_aa(body, aa_id_lists)
+        return SaProtLogitsResult(
+            sa_string=sa_str,
+            log_probs=log_p,
+            raw_logits=logits,
+            model_name=model_name,
+        )
+
+    # Masked-LM marginals: replace each SA token with <mask> and read the
+    # AA-marginal at the masked position. SaProt's <mask> erases both
+    # AA and 3Di at the position; this is the canonical MLM conditional.
+    # (Documented limitation: when the goal is "p(aa_i | structure_full,
+    # seq_-i)", we'd want to keep 3Di_i — but the SaProt vocab has no
+    # AA-only mask token, so masking the whole SA token is the closest
+    # we can do without fine-tuning.)
+    mask_token = tokenizer.mask_token
+
+    # Pre-tokenize the unmodified sequence to learn body length.
+    base_ids = tokenizer(" ".join(sa_tokens), return_tensors="pt").input_ids[0].tolist()
+    # Body is base_ids[1:-1] of length L (CLS + L body tokens + SEP).
+    if len(base_ids) - 2 != L:
+        raise RuntimeError(
+            f"SaProt tokenizer body length {len(base_ids) - 2} != number of "
+            f"SA tokens {L}; cannot align mask positions"
+        )
+
+    log_p = np.zeros((L, 20), dtype=np.float64)
     with torch.no_grad():
-        out = model(**inputs)
-    logits = out.logits.squeeze(0).float().cpu().numpy()  # (L+2, 446)
+        for i in range(L):
+            tokens_i = list(sa_tokens)
+            tokens_i[i] = mask_token
+            ids = tokenizer(" ".join(tokens_i), return_tensors="pt").input_ids.to(dev)
+            row = model(input_ids=ids).logits[0, i + 1].float().cpu().numpy()
+            log_p[i] = _marginalize_aa(row[None, :], aa_id_lists)[0]
 
-    # Build map AA -> list of token ids whose vocab token is "Aa", "Ac", ...
-    vocab = tokenizer.get_vocab()
-    aa_to_ids: dict[str, list[int]] = {}
-    for tok, idx in vocab.items():
-        if len(tok) != 2:
-            continue
-        aa, di = tok[0], tok[1]
-        if aa not in SAPROT_AA_ALPHABET:
-            continue
-        # 3Di can be a..t letter or '#' for unknown
-        if di not in (SAPROT_3DI_ALPHABET + "#"):
-            continue
-        aa_to_ids.setdefault(aa, []).append(idx)
-
-    # Body positions are logits[1:-1] (skip BOS/EOS or [CLS]/[SEP])
-    body = logits[1:-1]
-    L = body.shape[0]
-    log_p_aa = np.zeros((L, 20), dtype=np.float64)
-    for j, aa in enumerate(SAPROT_AA_ALPHABET):
-        ids = aa_to_ids.get(aa, [])
-        if not ids:
-            log_p_aa[:, j] = -1e9
-            continue
-        sub = body[:, ids]  # (L, 21ish)
-        # Marginalize over 3Di: log sum exp over those columns
-        m = sub.max(axis=-1, keepdims=True)
-        log_p_aa[:, j] = (np.log(np.exp(sub - m).sum(axis=-1)) + m.squeeze(-1))
-
-    # Normalize across 20 AAs so rows are proper log-probabilities
-    m = log_p_aa.max(axis=-1, keepdims=True)
-    log_p_aa = log_p_aa - (m + np.log(np.exp(log_p_aa - m).sum(axis=-1, keepdims=True)))
-
+    # Synthetic raw_logits for API stability; callers that want unmasked
+    # raw logits should pass `masked=False`.
+    raw = np.zeros((L + 2, len(tokenizer.get_vocab())), dtype=np.float32)
     return SaProtLogitsResult(
         sa_string=sa_str,
-        log_probs=log_p_aa,
-        raw_logits=logits,
+        log_probs=log_p,
+        raw_logits=raw,
         model_name=model_name,
     )
+
+
+def _marginalize_aa(body: np.ndarray, aa_id_lists: list[list[int]]) -> np.ndarray:
+    """Marginalize a (L, vocab) logit row(s) over each AA's 3Di columns.
+
+    Returns (L, 20) log-probabilities (rows sum to 1).
+    """
+    L = body.shape[0]
+    log_p = np.zeros((L, 20), dtype=np.float64)
+    for j, ids in enumerate(aa_id_lists):
+        if not ids:
+            log_p[:, j] = -1e9
+            continue
+        sub = body[:, ids]
+        m = sub.max(axis=-1, keepdims=True)
+        log_p[:, j] = (np.log(np.exp(sub - m).sum(axis=-1)) + m.squeeze(-1))
+    m = log_p.max(axis=-1, keepdims=True)
+    log_p = log_p - (m + np.log(np.exp(log_p - m).sum(axis=-1, keepdims=True)))
+    return log_p
 
 
 # ---------------------------------------------------------------------------

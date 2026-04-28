@@ -78,8 +78,10 @@ def test_comprehensive_metrics_single_pdb(tmp_path: Path):
     assert "protparam__pi" in df.columns
     assert "protparam__charge_at_pH7_no_HIS" in df.columns
 
-    # PositionTable saved per pose
-    pos_table = result.per_pose_outputs["design"]["position_table"]
+    # PositionTable saved per pose. per_pose_outputs is keyed by
+    # f"{sequence_id}__conf{conformer_index}" so multi-conformer runs don't
+    # overwrite each other.
+    pos_table = result.per_pose_outputs["design__conf0"]["position_table"]
     assert pos_table.exists() or pos_table.with_suffix(".tsv").exists()
 
     # Manifest exists

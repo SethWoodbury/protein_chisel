@@ -115,13 +115,30 @@ def ca_ca_consecutive_distances(pose, chain_id: Optional[str] = None) -> list[fl
     """Sequential CA-CA distances along a chain (length L-1).
 
     Used for chainbreak detection — a clean backbone has all values
-    near 3.8 Å.
+    near 3.8 Å. When ``chain_id`` is None, computes per chain and
+    concatenates the results — boundaries between chains are NOT included
+    (so two-chain inputs don't get a fake chainbreak between them).
     """
-    coords = ca_coords(pose, chain_id=chain_id)
-    if len(coords) < 2:
-        return []
-    diffs = np.diff(coords, axis=0)
-    return [float(d) for d in np.linalg.norm(diffs, axis=1)]
+    if chain_id is not None:
+        coords = ca_coords(pose, chain_id=chain_id)
+        if len(coords) < 2:
+            return []
+        diffs = np.diff(coords, axis=0)
+        return [float(d) for d in np.linalg.norm(diffs, axis=1)]
+    pdb_info = pose.pdb_info()
+    chains: list[str] = []
+    seen: set[str] = set()
+    for r in pose.residues:
+        if not r.is_protein():
+            continue
+        c = pdb_info.chain(r.seqpos()) if pdb_info else " "
+        if c not in seen:
+            seen.add(c)
+            chains.append(c)
+    out: list[float] = []
+    for c in chains:
+        out.extend(ca_ca_consecutive_distances(pose, chain_id=c))
+    return out
 
 
 def gyration_tensor(coords: np.ndarray) -> np.ndarray:

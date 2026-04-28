@@ -308,8 +308,9 @@ def get_hbond_set(pose, scorefxn=None):
 def hbonds_as_dicts(pose, hbset=None) -> list[dict]:
     """Return a list of dicts describing each hbond.
 
-    Each dict: donor_res, donor_name3, donor_atom, acceptor_res,
-    acceptor_name3, acceptor_atom, energy.
+    Each dict carries:
+        donor_res, donor_name3, donor_h_atom (the polar H), donor_heavy_atom
+        (parent of the H), acceptor_res, acceptor_name3, acceptor_atom, energy.
     """
     _ensure_pyrosetta_imported()
     if hbset is None:
@@ -319,10 +320,20 @@ def hbonds_as_dicts(pose, hbset=None) -> list[dict]:
         hb = hbset.hbond(i)
         d_res = hb.don_res()
         a_res = hb.acc_res()
+        donor_residue = pose.residue(d_res)
+        donor_h_idx = hb.don_hatm()
+        donor_h_name = donor_residue.atom_name(donor_h_idx).strip()
+        donor_heavy_name = donor_h_name
+        try:
+            donor_heavy_idx = donor_residue.atom_base(donor_h_idx)
+            donor_heavy_name = donor_residue.atom_name(donor_heavy_idx).strip()
+        except Exception:
+            pass
         out.append({
             "donor_res": d_res,
-            "donor_name3": pose.residue(d_res).name3(),
-            "donor_atom": pose.residue(d_res).atom_name(hb.don_hatm()).strip(),
+            "donor_name3": donor_residue.name3(),
+            "donor_h_atom": donor_h_name,
+            "donor_heavy_atom": donor_heavy_name,
             "acceptor_res": a_res,
             "acceptor_name3": pose.residue(a_res).name3(),
             "acceptor_atom": pose.residue(a_res).atom_name(hb.acc_atm()).strip(),

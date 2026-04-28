@@ -163,7 +163,9 @@ class Manifest:
         config: dict[str, Any],
         tool_versions: Optional[dict[str, str]] = None,
     ) -> "Manifest":
-        inputs = {str(Path(p).name): sha256_file(p) for p in input_paths}
+        # Key inputs by absolute path so two files with the same basename
+        # in different directories don't collide.
+        inputs = {str(Path(p).resolve()): sha256_file(p) for p in input_paths}
         return cls(
             stage=stage,
             inputs=inputs,
@@ -176,14 +178,20 @@ class Manifest:
 def _collect_versions() -> dict[str, str]:
     """Snapshot a few common dependencies. Cheap; never raises."""
     versions: dict[str, str] = {}
-    for pkg in ("numpy", "pandas", "torch", "transformers", "esm", "biotite", "biopython"):
+    # (import_name, label) — biopython's import is "Bio".
+    pkgs = [
+        ("numpy", "numpy"), ("pandas", "pandas"), ("torch", "torch"),
+        ("transformers", "transformers"), ("esm", "esm"), ("biotite", "biotite"),
+        ("Bio", "biopython"), ("pyrosetta", "pyrosetta"),
+    ]
+    for import_name, label in pkgs:
         try:
-            mod = __import__(pkg)
+            mod = __import__(import_name)
         except Exception:
             continue
         v = getattr(mod, "__version__", None) or getattr(mod, "VERSION", None)
         if v is not None:
-            versions[pkg] = str(v)
+            versions[label] = str(v)
     return versions
 
 
@@ -383,12 +391,34 @@ class MetricTable:
         if missing:
             raise ValueError(f"MetricTable missing required columns: {missing}")
 
-    def merge(self, other: "MetricTable", how: str = "outer") -> "MetricTable":
-        """Combine metric tables on (sequence_id, conformer_index)."""
-        merged = self.df.merge(other.df, on=list(self.REQUIRED), how=how, suffixes=("", "__dup"))
-        dup_cols = [c for c in merged.columns if c.endswith("__dup")]
-        if dup_cols:
-            merged = merged.drop(columns=dup_cols)
+    def merge(self, other: "MetricTable", how: str = "outer", on_collision: str = "raise") -> "MetricTable":
+        """Combine metric tables on (sequence_id, conformer_index).
+
+        Args:
+            on_collision: "raise" (default) errors out on overlapping non-id
+                columns; "left" keeps self's value; "right" keeps other's.
+                Silent dropping is intentionally not available — column
+                collisions hide bugs (codex review feedback).
+        """
+        id_cols = list(self.REQUIRED)
+        a_cols = set(self.df.columns) - set(id_cols)
+        b_cols = set(other.df.columns) - set(id_cols)
+        overlap = sorted(a_cols & b_cols)
+        if overlap and on_collision == "raise":
+            raise ValueError(
+                f"MetricTable.merge: {len(overlap)} colliding columns "
+                f"(showing first 5: {overlap[:5]}). Pass on_collision='left' "
+                f"or 'right' to resolve, or rename one side first."
+            )
+        # left/right: drop the loser, then merge clean.
+        if overlap:
+            drop_from = other if on_collision == "left" else self
+            keep_from = self if on_collision == "left" else other
+            other_df = other.df.drop(columns=overlap) if on_collision == "left" else other.df
+            self_df = self.df.drop(columns=overlap) if on_collision == "right" else self.df
+            merged = self_df.merge(other_df, on=id_cols, how=how)
+        else:
+            merged = self.df.merge(other.df, on=id_cols, how=how)
         return MetricTable(df=merged)
 
     def to_parquet(self, path: str | Path) -> Path:

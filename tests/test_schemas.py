@@ -98,6 +98,18 @@ def test_manifest_matches_returns_false_for_missing_file(tmp_path: Path):
     assert manifest_matches(m, tmp_path / "nope.json") is False
 
 
+def test_manifest_distinguishes_same_basename_in_different_dirs(tmp_path: Path):
+    """Two files with the same name but in different directories must hash distinctly."""
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    a.mkdir(); b.mkdir()
+    (a / "design.pdb").write_text("ATOM 1\n")
+    (b / "design.pdb").write_text("ATOM 2\n")
+    m1 = Manifest.for_stage("x", [a / "design.pdb"], {}, {})
+    m2 = Manifest.for_stage("x", [b / "design.pdb"], {}, {})
+    assert m1.hash() != m2.hash()
+
+
 # ---- PoseSet --------------------------------------------------------------
 
 
@@ -226,3 +238,33 @@ def test_metric_table_merge():
 def test_metric_table_rejects_missing_id_columns():
     with pytest.raises(ValueError):
         MetricTable(df=pd.DataFrame({"x": [1, 2]}))
+
+
+def test_metric_table_merge_raises_on_collision():
+    a = MetricTable(df=pd.DataFrame({
+        "sequence_id": ["s1"], "conformer_index": [0],
+        "rosetta__total_score": [-100.0],
+    }))
+    b = MetricTable(df=pd.DataFrame({
+        "sequence_id": ["s1"], "conformer_index": [0],
+        "rosetta__total_score": [-90.0],   # collision
+    }))
+    with pytest.raises(ValueError, match="colliding"):
+        a.merge(b)
+
+
+def test_metric_table_merge_left_collision_strategy():
+    a = MetricTable(df=pd.DataFrame({
+        "sequence_id": ["s1"], "conformer_index": [0],
+        "rosetta__total_score": [-100.0],
+    }))
+    b = MetricTable(df=pd.DataFrame({
+        "sequence_id": ["s1"], "conformer_index": [0],
+        "rosetta__total_score": [-90.0],
+        "esmc__pseudo_perplexity": [3.5],
+    }))
+    merged = a.merge(b, on_collision="left")
+    # Self ("a") wins
+    assert merged.df["rosetta__total_score"].iloc[0] == -100.0
+    # Non-colliding column still merged
+    assert "esmc__pseudo_perplexity" in merged.df.columns

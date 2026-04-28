@@ -72,15 +72,24 @@ class CatalyticResidue:
         return f"{body[:80]:<80}\n"
 
 
-def parse_remark_666(pdb_path: str | Path) -> dict[int, CatalyticResidue]:
+def parse_remark_666(
+    pdb_path: str | Path,
+    key_by: str = "resno",
+) -> dict:
     """Parse all REMARK 666 lines from a PDB.
 
-    Returns a dict keyed by motif (catalytic) residue number.
+    Args:
+        key_by: how to key the returned dict.
+            * ``"resno"`` (default, back-compat): ``{int_resno: CatalyticResidue}``.
+                Collapses entries with the same residue number across chains
+                or insertion codes.
+            * ``"chain_resno"``: ``{(chain: str, resno: int): CatalyticResidue}``.
+                Always unique; use this for multi-chain inputs.
 
-    Tolerant: skips malformed lines (e.g. comment lines, truncated records).
-    Stops scanning at the first ATOM record.
+    Tolerant: skips malformed lines (comment lines, truncated records).
+    Stops scanning at the first ATOM/HETATM/MODEL/TER record.
     """
-    out: dict[int, CatalyticResidue] = {}
+    out: dict = {}
     with open(pdb_path, "r") as fh:
         for line in fh:
             if line.startswith(("ATOM", "HETATM", "MODEL", "TER")):
@@ -105,7 +114,10 @@ def parse_remark_666(pdb_path: str | Path) -> dict[int, CatalyticResidue]:
                 )
             except (ValueError, IndexError):
                 continue
-            out[catres.resno] = catres
+            if key_by == "chain_resno":
+                out[(catres.chain, catres.resno)] = catres
+            else:
+                out[catres.resno] = catres
     return out
 
 

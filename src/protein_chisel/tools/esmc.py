@@ -73,6 +73,7 @@ def esmc_logits(
     sequence: str,
     model_name: str = "esmc_300m",
     device: str = "auto",
+    masked: bool = True,
 ) -> ESMCLogitsResult:
     """Per-position log-probs over the 20-AA alphabet for one sequence.
 
@@ -80,25 +81,61 @@ def esmc_logits(
         sequence: 1-letter AA string.
         model_name: "esmc_300m" or "esmc_600m".
         device: "auto" / "cuda" / "cpu".
+        masked: when True (default), compute the masked-LM marginal
+            ``p(aa_i | seq_-i)`` by masking each position one at a time
+            (L forward passes). When False, do a single unmasked forward
+            pass — the model sees the true AA at each position, which is
+            *not* the marginal but is useful for diagnostic embedding
+            extraction. Use ``masked=True`` for fusion.
 
     Returns ESMCLogitsResult — `log_probs` has shape (L, 20).
     """
     import torch
-    from esm.sdk.api import ESMProtein, LogitsConfig
+    from esm.sdk.api import ESMProtein, LogitsConfig, ESMProteinTensor
 
     model, dev = _load_esmc(model_name=model_name, device=device)
     aa_ids = _get_aa_token_ids(model)
 
     protein = ESMProtein(sequence=sequence)
     p_t = model.encode(protein)
-    with torch.no_grad():
-        out = model.logits(p_t, LogitsConfig(sequence=True, return_embeddings=False))
-    raw = out.logits.sequence.squeeze(0).float().cpu().numpy()  # (L+2, vocab)
+    base_tokens = p_t.sequence  # (L+2,) on dev
 
-    # Skip the first and last special tokens; index AA columns to (L, 20)
-    body = raw[1:-1]
-    body_aa = body[:, aa_ids]  # (L, 20)
-    log_p = body_aa - _logsumexp(body_aa, axis=-1, keepdims=True)
+    if not masked:
+        # Single unmasked forward pass — fast but leaks the true AA at each
+        # position. For diagnostic / embedding use only.
+        with torch.no_grad():
+            out = model.logits(p_t, LogitsConfig(sequence=True, return_embeddings=False))
+        raw = out.logits.sequence.squeeze(0).float().cpu().numpy()
+        body_aa = raw[1:-1][:, aa_ids]
+        log_p = body_aa - _logsumexp(body_aa, axis=-1, keepdims=True)
+        return ESMCLogitsResult(
+            sequence=sequence,
+            log_probs=log_p,
+            raw_logits=raw,
+            aa_token_ids=aa_ids,
+            model_name=model_name,
+        )
+
+    # Masked-LM marginals: build L masked variants and gather the row at the
+    # masked position from each. This is the proper p(aa_i | seq_-i).
+    L = len(sequence)
+    mask_id = int(model.tokenizer.mask_token_id)
+    log_p = np.zeros((L, 20), dtype=np.float64)
+
+    with torch.no_grad():
+        for i in range(L):
+            tokens = base_tokens.clone()
+            tokens[i + 1] = mask_id  # +1 for BOS offset
+            ept = ESMProteinTensor(sequence=tokens)
+            out = model.logits(ept, LogitsConfig(sequence=True, return_embeddings=False))
+            row = out.logits.sequence.squeeze(0)[i + 1].float().cpu().numpy()
+            row_aa = row[aa_ids]
+            log_p[i] = row_aa - _logsumexp(row_aa, axis=-1, keepdims=True)
+
+    # No good "raw_logits" to expose for masked mode (each position has its
+    # own row); we expose a synthetic (L+2, vocab) zero matrix to keep the
+    # API shape stable. Most callers only use log_probs anyway.
+    raw = np.zeros((L + 2, log_p.shape[1]), dtype=np.float32)
     return ESMCLogitsResult(
         sequence=sequence,
         log_probs=log_p,

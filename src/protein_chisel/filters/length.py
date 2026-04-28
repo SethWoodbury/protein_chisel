@@ -23,7 +23,11 @@ def passes_length_filter(sequence: str, cfg: LengthFilterConfig) -> tuple[bool, 
         return False, f"length {n} < min_length {cfg.min_length}"
     if cfg.max_length is not None and n > cfg.max_length:
         return False, f"length {n} > max_length {cfg.max_length}"
+    # Empty sequence with terminal constraints fails — those constraints
+    # by definition can't be satisfied.
     if not sequence:
+        if cfg.must_start_with or cfg.must_end_with:
+            return False, "empty sequence cannot satisfy terminal constraints"
         return True, ""
 
     nt = sequence[0].upper()
