@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+
+# Editable install
+*.egg-link
+
+# Environments
+.venv/
+venv/
+env/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Outputs / scratch
+*.log
+slurm_logs/
+slurm-*.out
+*.out
+*.err
+runs/
+outputs/
+results/
+
+# Large artifacts that should never be committed
+*.pdb
+*.cif
+*.sif
+*.pt
+*.bin
+*.safetensors
+*.h5
+*.npz
+# (override per-test in tests/data/.gitignore if we want a tiny fixture committed)
+
+# Notebook noise
+.ipynb_checkpoints/
+*.nbconvert.ipynb
