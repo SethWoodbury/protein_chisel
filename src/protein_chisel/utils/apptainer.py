@@ -250,6 +250,12 @@ def universal_call(nv: bool = False) -> ApptainerCall:
     return ApptainerCall(sif=UNIVERSAL_SIF, nv=nv)
 
 
+def mlfold_call(nv: bool = True) -> ApptainerCall:
+    """mlfold.sif — used to run LigandMPNN."""
+    from protein_chisel.paths import MLFOLD_SIF
+    return ApptainerCall(sif=MLFOLD_SIF, nv=nv)
+
+
 # ---------------------------------------------------------------------------
 # Convenience: detect whether we're already inside a container
 # ---------------------------------------------------------------------------

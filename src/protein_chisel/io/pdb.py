@@ -57,13 +57,19 @@ class CatalyticResidue:
     cst_no_var: int
 
     def to_remark_line(self) -> str:
-        """Serialize back to a REMARK 666 line (with trailing space padding to col 80)."""
+        """Serialize back to a REMARK 666 line.
+
+        PDB lines are 80 characters of content + a single newline (so 81
+        bytes total on disk). We pad the content to exactly 80 columns,
+        then append the newline.
+        """
         body = (
             f"REMARK 666 MATCH TEMPLATE {self.target_chain} {self.target_name3:>3} "
             f"{self.target_resno:>4} MATCH MOTIF {self.chain} {self.name3:>3} "
             f"{self.resno:>4}  {self.cst_no}  {self.cst_no_var}"
         )
-        return body.ljust(80) + "\n"
+        # Truncate (shouldn't happen with sane inputs) or pad to 80.
+        return f"{body[:80]:<80}\n"
 
 
 def parse_remark_666(pdb_path: str | Path) -> dict[int, CatalyticResidue]:

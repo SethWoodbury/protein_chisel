@@ -158,7 +158,10 @@ def classify_positions(
             sr = "L"
             phi = float("nan")
             psi = float("nan")
-            d_l = 0.0  # ligand is the ligand
+            # Distances are meaningless for ligand-self rows.
+            # Use NaN to avoid downstream filters mistaking the ligand for a
+            # first-shell residue at distance 0.
+            d_l = float("nan")
             d_c = float("nan")
 
         rows.append({

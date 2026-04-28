@@ -22,6 +22,8 @@ UNIVERSAL_SIF = Path("/net/software/containers/universal.sif")
 ESMFOLD_SIF = Path("/net/software/containers/esmfold.sif")
 AF3_SIF = Path("/net/software/containers/af3.sif")  # final filter only
 METAL3D_SIF = Path("/net/software/containers/pipelines/metal3d.sif")
+MLFOLD_SIF = Path("/net/software/containers/mlfold.sif")  # used for LigandMPNN
+MPNN_BINDER_DESIGN_SIF = Path("/net/software/containers/mpnn_binder_design.sif")
 
 
 # ---- HuggingFace caches ----------------------------------------------------
@@ -33,6 +35,8 @@ HF_CACHE_SAPROT = Path("/net/databases/huggingface/saprot")
 # ---- Source-installed model checkouts -------------------------------------
 
 LIGAND_MPNN_DIR = Path("/net/software/lab/mpnn/proteinmpnn/ligandMPNN")
+LIGAND_MPNN_RUN = LIGAND_MPNN_DIR / "protein_mpnn_run.py"
+LIGAND_MPNN_WEIGHTS = Path("/net/databases/mpnn/ligand_model_weights")
 PROTEIN_MPNN_DIR = Path("/net/software/lab/mpnn/proteinmpnn")
 FAMPNN_DIR = Path("/net/software/lab/fampnn")
 

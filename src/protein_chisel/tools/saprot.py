@@ -236,6 +236,11 @@ def saprot_score(
     import torch
 
     sa_str = sa_tokens_from_pdb(pdb_path, chain=chain)
+    if len(sa_str) % 2 != 0:
+        raise ValueError(
+            f"SaProt SA-token string has odd length {len(sa_str)}; expected "
+            "even (each residue contributes one AA letter + one 3Di letter)"
+        )
     tokenizer, model, dev = _load_saprot(model_name=model_name, device=device)
 
     L = len(sa_str) // 2

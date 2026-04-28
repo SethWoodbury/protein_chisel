@@ -73,11 +73,44 @@ def test_entropy_match_returns_unity_for_same_dists():
 
 
 def test_entropy_match_compensates_difference():
-    """Higher-entropy model gets τ > 1, sharper model gets τ < 1."""
+    """Higher-entropy model gets multiplier > 1, sharper model gets < 1."""
     high = _uniform_log_probs(5)              # H = log 20
     low = _peak_log_probs(5, aa_index=0)       # H ≈ 0
-    tau_high, tau_low = entropy_match_temperature(high, low)
-    assert tau_high > tau_low
+    m_high, m_low = entropy_match_temperature(high, low)
+    assert m_high > m_low
+    # The high-entropy model should get a multiplier > 1 (sharpen via |x| ↑)
+    assert m_high > 1.0
+    # The peaked model is already sharper than target → multiplier < 1
+    assert m_low < 1.0
+
+
+def test_entropy_match_reduces_entropy_gap_after_apply():
+    """After applying multipliers, the two models' entropies should be closer."""
+    high = _uniform_log_probs(8)
+    # Generate a moderately peaked second distribution (not a delta)
+    p_low = np.full((8, 20), 0.01)
+    p_low[:, 5] = 0.81  # ~0.81 mass on one AA, ~0.01 on each other
+    p_low = p_low / p_low.sum(axis=-1, keepdims=True)
+    low = np.log(p_low)
+    h_high0 = per_position_entropy(high).mean()
+    h_low0 = per_position_entropy(low).mean()
+    initial_gap = abs(h_high0 - h_low0)
+
+    m_high, m_low = entropy_match_temperature(high, low)
+    # Apply multipliers as the fuse code does (log-odds path; same shape op)
+    high_scaled = high * m_high
+    low_scaled = low * m_low
+    # Re-normalize rows because scaled log-probs aren't probabilities anymore;
+    # we want to compare entropies of the implied distributions.
+    high_scaled = high_scaled - np.log(np.exp(high_scaled).sum(-1, keepdims=True))
+    low_scaled = low_scaled - np.log(np.exp(low_scaled).sum(-1, keepdims=True))
+    h_high1 = per_position_entropy(high_scaled).mean()
+    h_low1 = per_position_entropy(low_scaled).mean()
+    final_gap = abs(h_high1 - h_low1)
+    assert final_gap < initial_gap, (
+        f"entropy gap should shrink after match; was {initial_gap:.3f}, "
+        f"now {final_gap:.3f}"
+    )
 
 
 # ---- cosine similarity ----------------------------------------------------

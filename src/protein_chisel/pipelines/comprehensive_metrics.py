@@ -216,8 +216,12 @@ def _run_one_pose(
             pdb, params=params, target_atoms=cfg.ligand_target_atoms,
         )
         if results:
-            # Put the first ligand under the canonical "ligand__" prefix
+            # First ligand under the canonical "ligand__" prefix; subsequent
+            # ligands (rare; multi-ligand designs) under ligand_<i>__ prefixes.
             row.update(results[0].to_dict())
+            for i, extra in enumerate(results[1:], start=1):
+                row.update(extra.to_dict(prefix=f"ligand_{i}__"))
+            row["ligand__n_ligands"] = len(results)
 
     # Chemical interactions
     if cfg.run_chemical_interactions:

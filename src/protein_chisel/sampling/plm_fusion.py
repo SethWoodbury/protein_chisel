@@ -99,21 +99,25 @@ def per_position_entropy(log_probs: np.ndarray) -> np.ndarray:
 def entropy_match_temperature(
     log_probs_a: np.ndarray, log_probs_b: np.ndarray
 ) -> tuple[float, float]:
-    """Return scalar (τ_a, τ_b) that equalize the two models' median entropies.
+    """Return multipliers (m_a, m_b) for each model's log-odds that
+    equalize their median entropies.
 
-    We rescale by the geometric mean of medians: each model gets a
-    multiplier so its rescaled median entropy equals the geometric mean.
-    Returns multipliers to apply to each model's *log-odds* (or log-probs).
+    Standard temperature scaling: with logits x, applying temperature T
+    gives ``softmax(x/T)``. T > 1 softens (raises entropy), T < 1 sharpens
+    (lowers entropy). To pull a high-entropy model toward a target lower
+    entropy, we want T < 1 i.e. multiply the logits by ``m = 1/T > 1``.
+
+    With ``m_a = h_a / h_target``: if h_a > h_target (model A too soft),
+    m_a > 1 and multiplying its logits by m_a sharpens it. Symmetric for
+    model B. Apply with ``log_odds * m_a``.
     """
-    h_a = np.median(per_position_entropy(log_probs_a))
-    h_b = np.median(per_position_entropy(log_probs_b))
-    # Geometric-mean target
+    h_a = float(np.median(per_position_entropy(log_probs_a)))
+    h_b = float(np.median(per_position_entropy(log_probs_b)))
+    # Geometric-mean target (between the two models).
     h_target = np.sqrt(h_a * h_b) if h_a > 0 and h_b > 0 else 1.0
-    # Higher entropy => softer => want to scale up the logits to sharpen.
-    # Scaling logits by τ scales entropy roughly inversely.
-    tau_a = h_a / h_target if h_a > 0 else 1.0
-    tau_b = h_b / h_target if h_b > 0 else 1.0
-    return float(tau_a), float(tau_b)
+    m_a = h_a / h_target if h_a > 0 else 1.0
+    m_b = h_b / h_target if h_b > 0 else 1.0
+    return float(m_a), float(m_b)
 
 
 def cosine_similarity_per_position(
@@ -170,14 +174,14 @@ def fuse_plm_logits(
 
     # 2. Entropy-match (rescale to equalize median entropy)
     if cfg.entropy_match:
-        tau_e, tau_s = entropy_match_temperature(log_probs_esmc, log_probs_saprot)
-        # If tau > 1, that model has higher entropy; we *divide* by tau to sharpen.
-        # We apply the rescaling to the log-odds rather than log-probs because
-        # the scale is what matters for additive bias.
-        if tau_e > 0:
-            lo_esmc = lo_esmc / tau_e
-        if tau_s > 0:
-            lo_saprot = lo_saprot / tau_s
+        m_e, m_s = entropy_match_temperature(log_probs_esmc, log_probs_saprot)
+        # m > 1 means that model is softer than the target → multiply logits
+        # by m to sharpen. m < 1 means already too sharp → multiply by m
+        # (< 1) to soften.
+        if m_e > 0:
+            lo_esmc = lo_esmc * m_e
+        if m_s > 0:
+            lo_saprot = lo_saprot * m_s
 
     # 3. Per-position class weights
     base_weights = np.array([
