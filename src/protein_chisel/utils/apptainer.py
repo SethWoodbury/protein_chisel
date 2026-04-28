@@ -47,6 +47,22 @@ class ApptainerResult:
     command: list[str]
 
 
+def _user_site_for_python() -> Optional[str]:
+    """Return the host's per-user site-packages dir for the *outer* python.
+
+    The cluster's pyrosetta.sif sets ``PYTHONNOUSERSITE=1`` and ships only a
+    minimal interpreter, so things like pytest installed at user-site are
+    invisible. We expose them explicitly via PYTHONPATH when a caller asks.
+    """
+    import sys
+
+    candidate = Path(
+        f"/home/{os.environ.get('USER', 'woodbuse')}/.local/lib/"
+        f"python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
+    )
+    return str(candidate) if candidate.is_dir() else None
+
+
 @dataclass
 class ApptainerCall:
     """One configured call into a container.
@@ -54,7 +70,10 @@ class ApptainerCall:
     Construct once, call repeatedly. The default builder injects:
     - bind for the protein_chisel checkout,
     - PYTHONPATH so `import protein_chisel` works,
-    - --nv if `nv=True`.
+    - --nv if `nv=True`,
+    - host's user-site on PYTHONPATH if `with_user_site=True` (lets pytest
+      and other host-installed tools work inside containers that set
+      PYTHONNOUSERSITE=1).
     """
 
     sif: Path
@@ -62,6 +81,11 @@ class ApptainerCall:
     binds: list[tuple[str, str]] = field(default_factory=list)  # [(host, guest)]
     env: dict[str, str] = field(default_factory=dict)
     repo_bind_target: str = "/code"
+    with_user_site: bool = False
+    # Paths to PREPEND to the container's existing PYTHONPATH (preserved
+    # via APPTAINERENV_PYTHONPATH semantics — we wrap the python invocation
+    # with a shell that does the prepend).
+    container_pythonpath_keepers: tuple[str, ...] = ()
 
     def with_bind(self, host: str | Path, guest: Optional[str] = None) -> "ApptainerCall":
         """Add a bind. If `guest` is omitted, use the same path on both sides."""
@@ -73,6 +97,8 @@ class ApptainerCall:
             binds=self.binds + [(host, guest)],
             env=dict(self.env),
             repo_bind_target=self.repo_bind_target,
+            with_user_site=self.with_user_site,
+            container_pythonpath_keepers=self.container_pythonpath_keepers,
         )
 
     def with_env(self, **kw: str) -> "ApptainerCall":
@@ -84,6 +110,20 @@ class ApptainerCall:
             binds=list(self.binds),
             env=merged,
             repo_bind_target=self.repo_bind_target,
+            with_user_site=self.with_user_site,
+            container_pythonpath_keepers=self.container_pythonpath_keepers,
+        )
+
+    def with_pytest(self) -> "ApptainerCall":
+        """Enable host user-site on PYTHONPATH so pytest is importable."""
+        return ApptainerCall(
+            sif=self.sif,
+            nv=self.nv,
+            binds=list(self.binds),
+            env=dict(self.env),
+            repo_bind_target=self.repo_bind_target,
+            with_user_site=True,
+            container_pythonpath_keepers=self.container_pythonpath_keepers,
         )
 
     def build_command(self, argv: Sequence[str]) -> list[str]:
@@ -97,8 +137,21 @@ class ApptainerCall:
         for host, guest in self.binds:
             cmd += ["--bind", f"{host}:{guest}"]
 
-        # Default PYTHONPATH unless the caller overrode it.
-        env = {"PYTHONPATH": f"{self.repo_bind_target}/src"}
+        # Default PYTHONPATH. Prepend our paths to whatever the container
+        # ships with (e.g. pyrosetta.sif sets PYTHONPATH=/pyrosetta) by
+        # using APPTAINERENV_PREPEND_PATH semantics — we just pre-build the
+        # value and pass it through, including any explicitly-listed
+        # `container_pythonpath_keepers` from sub-class configurations.
+        pythonpath_parts = [f"{self.repo_bind_target}/src"]
+        if self.with_user_site:
+            us = _user_site_for_python()
+            if us:
+                pythonpath_parts.append(us)
+        pythonpath_parts.extend(self.container_pythonpath_keepers)
+        env = {"PYTHONPATH": ":".join(pythonpath_parts)}
+        if self.with_user_site:
+            # Some sifs set PYTHONNOUSERSITE=1; clear it so user-site picks up.
+            env["PYTHONNOUSERSITE"] = ""
         env.update(self.env)
         for k, v in env.items():
             cmd += ["--env", f"{k}={v}"]
@@ -177,7 +230,12 @@ def esmc_call(nv: bool = True) -> ApptainerCall:
 
 
 def pyrosetta_call() -> ApptainerCall:
-    return ApptainerCall(sif=PYROSETTA_SIF, nv=False)
+    # pyrosetta.sif ships PYTHONPATH=/pyrosetta in its %environment. Preserve it.
+    return ApptainerCall(
+        sif=PYROSETTA_SIF,
+        nv=False,
+        container_pythonpath_keepers=("/pyrosetta",),
+    )
 
 
 def rosetta_call() -> ApptainerCall:
