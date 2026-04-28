@@ -15,6 +15,30 @@ Structure / geometry:
 - secondary_structure    # DSSP per-residue (H/E/L), reduced + full alphabet
 - fpocket_run            # pocket volume / bottleneck / hydrophobicity / charge
 
+Backbone / scaffold quality (modernized from process_diffusion3):
+- backbone_sanity        # chainbreak (max sequential CA-CA), rCA_nonadj
+                         #   (min non-adjacent CA-CA), term_mindist
+                         #   (terminus to ligand)
+- shape_metrics          # radius of gyration (proper sqrt-mean-square def),
+                         #   Rg / sqrt(N) (length-normalized), gyration tensor
+                         #   eigenvalues -> asphericity, acylindricity,
+                         #   relative shape anisotropy, globularity
+- ss_summary             # loop_frac, longest_helix, longest_sheet,
+                         #   helix_count, sheet_count, loop_at_motif
+                         #   (boolean: catalytic residue in loop region)
+
+Catalytic geometry:
+- catalytic_residues     # parse REMARK 666 -> {resno: {chain, name3,
+                         #   target_chain, target_name3, target_resno,
+                         #   cst_no, cst_no_var}}
+- catres_quality         # per-catalytic-residue cart_bonded + fa_dun (rotamer
+                         #   strain), and sidechain bond-length deviation vs.
+                         #   ideal (broken-motif detector). From process_diff
+                         #   `sidechain_connectivity` and `get_rosetta_scores`.
+- ligand_environment     # min backbone-ligand distance, ligand SASA, ligand
+                         #   SASA_rel (vs. free ligand), per-atom ligand SASA
+                         #   for user-specified atoms (Coventry recipe).
+
 Energy / stability:
 - pyrosetta_repack       # sidechain repack on fixed backbone + Rosetta score Δ
 - rosetta_ligand_ddg     # holo vs apo binding ΔΔG (no per-mutation; whole-design)

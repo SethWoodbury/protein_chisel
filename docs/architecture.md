@@ -108,6 +108,33 @@ Done once per design. Per residue, record:
 
 Output is a single JSON consumed by every downstream tool. Secondary-structure labels can drive sampling priors directly (e.g., disallow proline in helix interiors except at known helix breaks).
 
+## Multi-pose inputs (single PDB or many)
+
+Tools and pipelines accept either a single PDB or a `pose_set` — a list of poses with metadata. Common scenarios:
+
+| Scenario | Composition | Aggregation strategy |
+|---|---|---|
+| Single design | one PDB | per-pose metrics, no aggregation |
+| Design + AF3 conformers | designed model + N AF3 predictions of the same sequence | per-conformer metrics + agreement metrics: mean ± std of Rosetta total, ligand ddG, pocket volume; **conformational consistency** = how stable the metric is across conformers (low std → robust). |
+| Family of designs | M sequences on the same backbone, each maybe with K conformers | nested aggregation: per-sequence (mean across its K conformers) → ranked across M; or "robust to conformer" = sequences whose worst conformer still passes filters. |
+| Apo + holo | ligand-bound and ligand-free poses of the same sequence | apo-vs-holo metrics: ligand binding ΔΔG (the user's target), pocket geometry change, induced fit. |
+
+`io/pose_set.py` carries metadata per pose: `sequence_id`, `fold_source` (designed | AF3_seedN | Boltz | RFdiffusion), `conformer_index`, `parent_design_id`, `is_apo`. `scoring/aggregate.py` provides per-design rollups (mean / std / min / max / vote) over conformers.
+
+This abstraction lets you pick **conformation-robust** designs in addition to **single-pose-good** ones — important because a design that scores well only on its idealized model but poorly on every AF3 conformer is probably a brittle design.
+
+## Catalytic residues from REMARK 666
+
+Theozyme matcher output writes lines like:
+
+```
+REMARK 666 MATCH TEMPLATE B YYE  209 MATCH MOTIF A HIS  188  1  1
+```
+
+Fields (left to right): ligand chain, ligand name3, ligand resno; catalytic chain, catalytic name3, catalytic resno; constraint number, constraint variant. `io/pdb.py` parses these into a `{resno: catres_info}` dict and the position classifier consumes it directly — every REMARK 666 residue is force-classed `active_site` with identity locked.
+
+If REMARK 666 isn't present, fall back to a user-supplied `--catres "A94-96 B101"` spec (legacy `parse_ref_catres` pattern). One of the two is required.
+
 ## Chemical interactions and biophysics
 
 Beyond the basic Rosetta metrics (`fa_elec`, `hbond_sc`, `hbond_bb_*`), planned tools cover:
