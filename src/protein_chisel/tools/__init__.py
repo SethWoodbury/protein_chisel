@@ -45,9 +45,18 @@ Catalytic geometry & active-site quality:
 - ligand_environment     # min backbone-ligand distance, ligand SASA, ligand
                          #   SASA_rel (vs. free ligand), per-atom ligand SASA
                          #   for user-specified atoms (Coventry recipe).
-- buns                   # buried unsatisfied polar atoms / hbonds (Rosetta
-                         #   BuriedUnsatisfiedHbondsFilter). Critical metric;
-                         #   buried unsats are a major failure signal.
+- buns                   # buried unsatisfied polar atoms / hbonds. Critical
+                         #   metric; buried unsats are a major failure signal.
+                         #   Two flavors:
+                         #     a) Rosetta BuriedUnsatisfiedHbondsFilter (XML)
+                         #     b) **Whitelist-aware BUNS** following bcov
+                         #        parse_target_buns_recalculate_white.py:
+                         #        accept that some catalytic atoms are
+                         #        intentionally unsat (e.g. nucleophile lone
+                         #        pairs poised for attack). Whitelist =
+                         #        list of (resno, atom_name) tolerated unsat.
+                         #   The whitelist-aware variant is essential for
+                         #   theozyme-bearing designs.
 - packing_quality        # Rosetta packstat score, buried cavity volume.
                          #   Distinct from holes (which is a Rosetta filter
                          #   targeting voids); packstat is a continuous
@@ -68,11 +77,36 @@ Energy / stability:
 - pyrosetta_repack       # sidechain repack on fixed backbone + Rosetta score Δ
 - rosetta_ligand_ddg     # holo vs apo binding ΔΔG (no per-mutation; whole-design)
 - thermompnn             # ML-based stability ddG (faster than Rosetta ddG)
+- per_residue_ddg        # per-residue ddG suite, modes from bcov ddg_per_res.py:
+                         #   - basic per-residue contribution
+                         #   - ala_scan (alanine substitution)
+                         #   - with_repack (more accurate, more expensive)
+                         #   - buried_elec (focused on buried electrostatics)
+                         # Uses the canonical fix_scorefxn pattern (decomposed
+                         # bb hbonds, proper double-bb check) so the per-residue
+                         # contributions sum correctly.
 
 Interactions:
 - chemical_interactions  # hbonds (with energies), salt bridges, π-π, π-cation,
-                         # ligand-protein contacts, per-atom ligand SASA
+                         # ligand-protein contacts, per-atom ligand SASA.
+                         # Use the canonical bcov fix_scorefxn pattern (set
+                         # decompose_bb_hb_into_pair_energies + double-bb
+                         # check) for proper hbond enumeration. Pattern from
+                         # /home/bcov/util/dump_hbset.py.
+- contact_ms             # **Distance-weighted contact molecular surface**
+                         # via py_contact_ms (https://github.com/bcov77/
+                         # py_contact_ms). Formula: area · exp(-0.5 d²).
+                         # NumPy-only, PyRosetta-free, per-atom CMS output.
+                         # Strictly better than Rosetta's
+                         # ContactMolecularSurface filter for ranking
+                         # interface quality. Use this in addition to or
+                         # instead of the legacy filter.
 - metal3d_score          # metal-binding suitability (metal3d.sif)
+- surface_composition    # polars per SASA (polar atoms / unit SASA),
+                         # hydrophobics per SASA, etc. From bcov
+                         # polars_per_sasa.py — surface-chemistry signal
+                         # complementary to SAP. Optional raytrace variant
+                         # for more accurate SASA (uses npose).
 
 Comprehensive metric assemblers:
 - rosetta_metrics_xml    # the legacy ~25-metric RosettaScripts protocol from

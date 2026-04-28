@@ -81,6 +81,9 @@ These weights are the **`fair-esm`** format and are loaded inside `esmfold.sif` 
 | ProLIF | (not installed yet — TBD) | https://github.com/chemosim-lab/ProLIF — protein-ligand interaction fingerprints (hbonds, salt bridges, π-stacks, hydrophobic, etc). Useful for *characterizing* a design's interaction pattern with the ligand. |
 | PLIP | (not installed yet — TBD) | https://github.com/pharmai/plip — alternative interaction profiler. Pick one of ProLIF or PLIP, not both. |
 | APBS | (not installed yet — TBD) | https://www.poissonboltzmann.org/ — electrostatic potential maps. Heavy; reserve for late-stage characterization. |
+| py_contact_ms | external pip / vendored | https://github.com/bcov77/py_contact_ms — distance-weighted contact molecular surface, NumPy-only, per-atom CMS. Strictly better than Rosetta's `ContactMolecularSurface` filter for interface ranking. Used by `tools/contact_ms`. MIT license. |
+| npose | optional, in `/home/bcov/sc/random/npose` | Brian's lightweight pose abstraction (pure NumPy, faster than PyRosetta for pure geometry). Used by some `polars_per_sasa_raytrace` and other bcov scripts. We can either vendor a slice or rely on the cluster path; treat as optional. |
+| PROPKA | (not installed yet — TBD) | https://github.com/jensengroup/propka — pKa estimator for catalytic ionizables. Used by `tools/catalytic_pka`. |
 
 ---
 
@@ -119,3 +122,22 @@ Living in `~/special_scripts/`. These contain patterns and metric definitions we
 | `ESM/ESM_score_sequences.py` | ESM-2 pseudo-perplexity scoring of sequences in a fasta. | `tools/esmc_score` (perplexity mode). |
 | `upgraded_fastMPNNdesign/run_pipeline.py` + `pipeline_constants.py` | A more polished pipeline runner with `PipelineRunner` class, structured StepOutputs dataclass, hash-based internal basenames, container/script registry. | Reference for `pipelines/` orchestrator structure. The `PipelineRunner` + step-defaults + arg-mapping pattern is solid; adopt the spirit, not the exact code. |
 | `/net/software/lab/scripts/enzyme_design/SETH_TEMP_UTILS/process_diffusion3_outputs__REORG.py` | Post-processes diffusion outputs: REMARK 666 parsing, motif/template re-mapping, scaffold quality (chainbreak / rCA_nonadj / loop_frac / longest_helix / Rg / loop_at_motif), ligand environment (lig_dist, SASA, SASA_rel, term_mindist), motif geometry (bondlen_dev, cart_bonded_avg, fa_dun_avg), Rosetta scorefile output, multiprocessing over many designs. | Several modules here. `io/pdb.get_matcher_residues` + `add_matcher_line_to_pose` ports directly. `tools/backbone_sanity` (chainbreak, rCA_nonadj, term_mindist), `tools/shape_metrics` (replace its non-standard `get_ROG` with proper Rg + asphericity), `tools/ss_summary` (loop_frac, longest_helix, loop_at_motif), `tools/catres_quality` (sidechain bondlen + cart_bonded + fa_dun), `tools/ligand_environment` (lig_dist, ligand SASA, SASA_rel). The Rosetta-scorefile writer is a useful output format we may keep alongside TSV. |
+
+### Brian Coventry (`/home/bcov/util/`) — patterns and metric definitions
+
+Brian's util directory is 271 scripts of battle-tested PyRosetta + NumPy patterns. The ones we adapt:
+
+| Script | Pattern / metric | Where it lands |
+|---|---|---|
+| `dump_hbset.py` | Canonical `fix_scorefxn` (decompose_bb_hb_into_pair_energies + bb_donor_acceptor_check) before `fill_hbond_set`. Required for proper hbond enumeration; without it, bb-bb hbonds collapse strangely. | `utils/pose.fix_scorefxn`; used by `tools/chemical_interactions`, `tools/per_residue_ddg`, others. |
+| `per_atom_sasa.py` | Per-atom SASA via `core.scoring.packing.get_surf_vol(pose, atoms, probe)`. **Probe radius 2.8 Å** for contact-region calcs (vs. 1.4 Å for solvent). | `utils/pose.get_per_atom_sasa(pose, probe=2.8)`. |
+| `parse_target_buns_recalculate_white.py` | BUNS computed with a **whitelist** of allowed unsats (resno+atom name pairs). | `tools/buns` whitelist-aware mode. Critical for theozyme designs. |
+| `polars_per_sasa.py`, `polars_per_sasa_raytrace.py` | Polar atom count per SASA — surface-chemistry signal complementary to SAP. Raytrace variant uses npose for accurate SASA. | `tools/surface_composition` (basic and raytrace modes). |
+| `ddg_per_res.py`, `ddg_per_res_ala_scan.py`, `ddg_per_res_repack.py`, `ddg_per_res_buried_elec.py` | Per-residue ddG suite: basic, alanine scan, with repack, buried-electrostatics-focused. | `tools/per_residue_ddg` with `--mode {basic,ala_scan,repack,buried_elec}`. |
+| `boltzmann_grid_sampler.py` (Adam Moyer / Brian) | Boltzmann-weighted grid sampling for hyperparameter tuning. Continuous bounds, update-with-results loop. | `utils/hyperparam_search` for fusion-weight / MH-τ / threshold sweeps. |
+| `find_full_pose_buried_atoms_near_interface_chainB.py` | Buried-atom detection at protein/ligand interface (the "chain B = ligand" assumption maps cleanly). | `tools/buns` companion. |
+| `cage_max_sphere.py` | Max inscribed sphere — alternative pocket size measure. | `tools/fpocket_run` companion / cross-check. |
+| `bfactor_lddt.py` | Map B-factor ↔ pLDDT (useful for AF prediction interpretation). | `utils/pose` helper. |
+| `cluster_interface_sidechains.py` | Sidechain clustering at interfaces. | Reference for `scoring/diversity` if mutable-position-Hamming proves insufficient. |
+| `dump_hbset.py` (the `fix_scorefxn` pattern itself) | Setting `decompose_bb_hb_into_pair_energies(True)` is mandatory for any per-residue energy decomposition — without it `pose.energies().residue_total_energies()` mixes bb energies between paired residues. | Consumed everywhere we score per-residue. Gets a comment in `utils/pose` explaining why. |
+| `net_charge_sequences.py` | Net charge from sequence (no pH; just counts D, E, K, R, H). | Already covered by `filters/protparam.charge_at_pH` and `charge_at_pH7_no_HIS`. Keep bcov version as a fast sequence-only fallback. |
