@@ -129,12 +129,15 @@ def biased_sample(
         L, len(fixed_resnos), float(np.abs(fusion.bias).mean()),
     )
 
+    protein_resnos = protein_rows["resno"].astype(int).tolist()
+
     lmpnn = sample_with_ligand_mpnn(
         pdb_path=pdb_path,
-        ligand_params=ligand_params,
+        ligand_params=ligand_params,  # accepted for API parity; modern runner ignores
         chain=cfg.chain,
         fixed_resnos=sorted(fixed_resnos),
         bias_per_residue=fusion.bias,
+        protein_resnos=protein_resnos,
         n_samples=cfg.n_samples,
         config=cfg.ligand_mpnn,
         out_dir=out_dir,

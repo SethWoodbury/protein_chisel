@@ -179,6 +179,7 @@ def stage_sample(
     ligand_params: Path,
     bias: np.ndarray,
     fixed_resnos: list[int],
+    protein_resnos: list[int],
     out_dir: Path,
     cfg: SequenceDesignV1Config,
 ) -> CandidateSet:
@@ -191,13 +192,14 @@ def stage_sample(
     if fasta_path.exists() and meta_path.exists():
         return CandidateSet.from_disk(meta_path)
 
-    lmpnn_cfg = LigandMPNNConfig(sampling_temp=cfg.sampling_temp)
+    lmpnn_cfg = LigandMPNNConfig(temperature=cfg.sampling_temp)
     res = sample_with_ligand_mpnn(
         pdb_path=pdb,
         ligand_params=ligand_params,
         chain=cfg.chain,
         fixed_resnos=fixed_resnos,
         bias_per_residue=bias,
+        protein_resnos=protein_resnos,
         n_samples=cfg.n_samples,
         config=lmpnn_cfg,
         out_dir=out_dir / "_lmpnn",
@@ -349,8 +351,10 @@ def run_sequence_design_v1(
     # 3. Sample
     catres = parse_remark_666(pdb)
     fixed_resnos = list(catres.keys())
+    protein_rows = pt.df[pt.df["is_protein"]].sort_values("resno")
+    protein_resnos = protein_rows["resno"].astype(int).tolist()
     raw = stage_sample(
-        pdb, ligand, bias, fixed_resnos, s3, cfg,
+        pdb, ligand, bias, fixed_resnos, protein_resnos, s3, cfg,
     )
 
     # 4. Filter

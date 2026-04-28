@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Iterable
+from typing import Iterable, Optional
 
 
 # Default blacklist patterns (regex; non-anchored).
@@ -65,17 +65,26 @@ def find_protease_sites(
     sequence: str,
     extra_patterns: Iterable[tuple[str, str]] = (),
     skip_default: bool = False,
+    host: Optional[str] = None,
 ) -> ProteaseSitesResult:
     """Find every blacklist motif occurrence in `sequence`.
 
     Args:
         sequence: protein sequence (1-letter, uppercase).
         extra_patterns: extra (name, regex) pairs beyond the default list.
-        skip_default: if True, only `extra_patterns` are checked.
+        skip_default: if True, only ``extra_patterns`` are checked.
+        host: optionally include a host-specific pattern set. Currently
+            ``"ecoli"`` (default for our designs) or ``"yeast"``. When
+            given, the host pattern list is merged into the default
+            blacklist (or replaces it if ``skip_default=True``).
     """
     patterns: list[tuple[str, str]] = []
     if not skip_default:
         patterns.extend(DEFAULT_BLACKLIST)
+    if host is not None:
+        from protein_chisel.filters.expression_host import get_host_patterns
+
+        patterns.extend(get_host_patterns(host))
     patterns.extend(extra_patterns)
 
     seq = sequence.upper()

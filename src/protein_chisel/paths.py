@@ -37,6 +37,12 @@ HF_CACHE_SAPROT = Path("/net/databases/huggingface/saprot")
 LIGAND_MPNN_DIR = Path("/net/software/lab/mpnn/proteinmpnn/ligandMPNN")
 LIGAND_MPNN_RUN = LIGAND_MPNN_DIR / "protein_mpnn_run.py"
 LIGAND_MPNN_WEIGHTS = Path("/net/databases/mpnn/ligand_model_weights")
+# Modern fused_mpnn runner (lab default for production design):
+# correctly honors --repack_everything 0, supports --fixed_residues_multi
+# JSON, supports --bias_AA_per_residue JSON, supports the --enhance flag
+# for plddt-enhanced checkpoints. Runs in universal.sif.
+FUSED_MPNN_DIR = Path("/net/software/lab/fused_mpnn/seth_temp")
+FUSED_MPNN_RUN = FUSED_MPNN_DIR / "run.py"
 PROTEIN_MPNN_DIR = Path("/net/software/lab/mpnn/proteinmpnn")
 FAMPNN_DIR = Path("/net/software/lab/fampnn")
 

@@ -1,88 +1,74 @@
-"""LigandMPNN wrapper — ligand-aware sequence sampler with PLM bias.
+"""LigandMPNN wrapper — uses the fused_mpnn lab build (seth_temp/run.py).
 
-Wraps the lab's ``/net/software/lab/mpnn/proteinmpnn/ligandMPNN/protein_mpnn_run.py``
-behind a clean Python API:
+This wraps ``/net/software/lab/fused_mpnn/seth_temp/run.py`` which is the
+modern lab default. Compared to the older ``protein_mpnn_run.py`` in
+``proteinmpnn/ligandMPNN``, this version:
 
-    sample_with_ligand_mpnn(
-        pdb_path, ligand_params, fixed_resnos=[...],
-        bias_per_residue=fusion.bias,  # (L, 20) from sampling/plm_fusion
-        n_samples=200, sampling_temp=0.1,
-    ) -> CandidateSet
+- Honors ``--repack_everything 0`` correctly (does NOT repack residues
+  passed in ``--fixed_residues``).
+- Accepts ``--fixed_residues_multi`` JSON of ``{pdb_path: [chain+resno
+  strings]}`` (e.g. ``["A92", "A136"]``).
+- Accepts a different ``--bias_AA_per_residue`` format: a JSON mapping of
+  ``{"<chain><resno>": {AA: bias_in_nats}}`` keyed by residue, NOT the
+  array-shaped per-position dict used by the older runner.
+- Supports ``--enhance plddt_residpo_alpha_*`` for plddt-enhanced checkpoints.
+- Supports ``--ligand_mpnn_use_side_chain_context 1`` so the model sees
+  the catalytic side-chain rotamers (important — without this the model
+  often samples residues that clash with the catalytic ones).
 
-Internally:
-- Writes a temp ``bias_by_res.jsonl`` ({pdb_name: {chain: (L, 21) array}})
-  with the AA columns matching MPNN's ``ACDEFGHIKLMNPQRSTVWYX`` alphabet.
-  Our plm_fusion gives 20 cols (no X); we pad column 21 with 0.
-- Writes a temp ``fixed_positions.jsonl`` for active-site residues (so
-  MPNN keeps their wild-type identity).
-- Calls ``protein_mpnn_run.py`` inside ``mlfold.sif`` via apptainer.
-- Parses the output FASTA into a ``CandidateSet`` with sampler metadata.
-
-Run inside mlfold.sif (or any sif that has the LigandMPNN deps); the
-wrapper invokes it via apptainer if `via_apptainer=True` (default).
+Runs inside ``universal.sif``. The wrapper writes input JSONs, calls
+``run.py`` via apptainer exec, and parses the output FASTA into a
+``CandidateSet`` with sampler metadata.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Sequence
 
 import numpy as np
 import pandas as pd
 
 from protein_chisel.io.schemas import CandidateSet
-from protein_chisel.paths import (
-    LIGAND_MPNN_DIR, LIGAND_MPNN_RUN, LIGAND_MPNN_WEIGHTS, MLFOLD_SIF,
-)
+from protein_chisel.paths import FUSED_MPNN_RUN, UNIVERSAL_SIF
 from protein_chisel.sampling.plm_fusion import AA_ORDER as PLM_AA_ORDER
 
 
 LOGGER = logging.getLogger("protein_chisel.ligand_mpnn")
 
 
-# LigandMPNN's vocabulary order; X (unknown) is the 21st column.
+# fused_mpnn's internal AA alphabet maps. The 20 canonical AAs are the
+# columns we care about for our (L, 20) bias matrices; X (UNK) is index
+# 20 and we always set its bias to 0.
 MPNN_AA_ORDER = "ACDEFGHIKLMNPQRSTVWYX"
 MPNN_AA_TO_IDX = {aa: i for i, aa in enumerate(MPNN_AA_ORDER)}
-
-
-def _bias_to_mpnn_format(bias_20: np.ndarray) -> np.ndarray:
-    """Convert a (L, 20) bias matrix in PLM_AA_ORDER to (L, 21) in MPNN_AA_ORDER.
-
-    plm_fusion.AA_ORDER = "ACDEFGHIKLMNPQRSTVWY" (same as MPNN minus X), so
-    we just pad column 20 (X) with zeros.
-    """
-    if PLM_AA_ORDER != "ACDEFGHIKLMNPQRSTVWY":
-        raise RuntimeError(
-            f"PLM_AA_ORDER changed unexpectedly: {PLM_AA_ORDER!r}; please update "
-            "_bias_to_mpnn_format to align with MPNN_AA_ORDER"
-        )
-    if bias_20.shape[-1] != 20:
-        raise ValueError(f"expected (L, 20) bias matrix, got {bias_20.shape}")
-    L = bias_20.shape[0]
-    out = np.zeros((L, 21), dtype=np.float64)
-    out[:, :20] = bias_20
-    return out
+assert PLM_AA_ORDER == "ACDEFGHIKLMNPQRSTVWY", "alignment with plm_fusion changed"
 
 
 @dataclass
 class LigandMPNNConfig:
-    model_name: str = "v_32_020"        # backbone-noise variant (most-used)
-    sampling_temp: float = 0.1
+    model_type: str = "ligand_mpnn"        # ligand_mpnn / protein_mpnn / soluble_mpnn
+    temperature: float = 0.1
     batch_size: int = 1
-    backbone_noise: float = 0.0
-    pack_side_chains: int = 0
-    use_ligand: int = 1
-    use_DNA_RNA: int = 0
-    seed: int = 0  # 0 = random
-    weights_dir: Optional[Path] = None  # defaults to LIGAND_MPNN_WEIGHTS
+    number_of_batches: int = 10            # total = batch_size * number_of_batches
+    pack_side_chains: int = 1
+    sc_num_denoising_steps: int = 3
+    repack_everything: int = 0             # critical: 0 keeps fixed_residues frozen
+    ligand_mpnn_use_side_chain_context: int = 1
+    ligand_mpnn_use_atom_context: int = 1
+    omit_AA: str = "CX"                    # don't sample C or X by default
+    bias_AA: str = ""                      # global e.g. "K:-0.5,R:-0.75,E:0.75,D:0.75"
+    enhance: Optional[str] = None          # e.g. "plddt_residpo_alpha_20250116-aec4d0c4"
+    seed: int = 0                          # 0 = random
+    file_ending: str = ""
     extra_flags: tuple[str, ...] = ()
 
 
@@ -94,51 +80,66 @@ class LigandMPNNResult:
     config: LigandMPNNConfig
 
 
-def _build_bias_by_res_jsonl(
-    pdb_name: str, chain: str, bias_20: np.ndarray
-) -> str:
-    """Serialize a (L, 20) bias matrix into LigandMPNN's bias_by_res JSONL."""
-    bias_21 = _bias_to_mpnn_format(bias_20)
-    payload = {pdb_name: {chain: bias_21.tolist()}}
-    return json.dumps(payload)
+# ---------------------------------------------------------------------------
+# Helpers — build the JSON inputs the runner expects
+# ---------------------------------------------------------------------------
 
 
-def _build_fixed_positions_jsonl(
-    pdb_name: str, chain: str, fixed_resnos: Iterable[int]
-) -> str:
-    """LigandMPNN's fixed_positions JSONL: dict[pdb][chain] = [resnos]."""
-    payload = {pdb_name: {chain: sorted(set(int(r) for r in fixed_resnos))}}
-    return json.dumps(payload)
+def _residue_label(chain: str, resno: int) -> str:
+    """fused_mpnn residue label format: ``A92`` (chain + resno, no separator)."""
+    return f"{chain}{int(resno)}"
 
 
-def _parse_output_fasta(fasta_path: Path) -> list[tuple[str, str, dict]]:
-    """Parse LigandMPNN's output FASTA.
+def _build_fixed_residues_multi(
+    pdb_path: str | Path, fixed_resnos: Iterable[int], chain: str
+) -> dict[str, list[str]]:
+    return {str(Path(pdb_path).resolve()): [_residue_label(chain, r) for r in sorted(set(fixed_resnos))]}
 
-    Each design has a header like:
-        ``>T=0.1, sample=1, score=1.234, seq_recovery=0.85``
-    followed by the sequence (one chain per line, separated by '/').
 
-    Returns a list of (header, sequence, metadata) tuples.
+def _build_bias_per_residue_multi(
+    pdb_path: str | Path,
+    bias_per_residue: np.ndarray,
+    chain: str,
+    protein_resnos: Sequence[int],
+) -> dict[str, dict[str, dict[str, float]]]:
+    """Convert a (L, 20) bias matrix to the fused_mpnn JSON layout.
+
+    ``bias_per_residue[i, j]`` = bias for AA ``PLM_AA_ORDER[j]`` at the i-th
+    protein residue. ``protein_resnos[i]`` is the pose-resno of that
+    residue.
+
+    Returns ``{pdb_path: {<chain><resno>: {AA: bias}}}``.
     """
-    out: list[tuple[str, str, dict]] = []
-    if not fasta_path.exists():
-        return out
-    text = fasta_path.read_text()
-    blocks = [b for b in text.split(">") if b.strip()]
-    for b in blocks:
-        lines = b.strip().splitlines()
-        header = lines[0]
-        seq = "".join(lines[1:]).strip()
-        meta = _parse_header(header)
-        out.append((header, seq, meta))
-    return out
+    if bias_per_residue.shape[0] != len(protein_resnos):
+        raise ValueError(
+            f"bias rows ({bias_per_residue.shape[0]}) != protein_resnos "
+            f"({len(protein_resnos)})"
+        )
+    if bias_per_residue.shape[1] != 20:
+        raise ValueError(f"bias must have 20 AA columns, got {bias_per_residue.shape[1]}")
+    out: dict[str, dict[str, float]] = {}
+    for i, resno in enumerate(protein_resnos):
+        label = _residue_label(chain, resno)
+        per_aa = {
+            aa: float(bias_per_residue[i, j]) for j, aa in enumerate(PLM_AA_ORDER)
+        }
+        # Drop trivial-zero rows to keep the JSON small.
+        if all(abs(v) < 1e-12 for v in per_aa.values()):
+            continue
+        out[label] = per_aa
+    return {str(Path(pdb_path).resolve()): out}
+
+
+# ---------------------------------------------------------------------------
+# Output FASTA parsing
+# ---------------------------------------------------------------------------
 
 
 _RE_KV = re.compile(r"([A-Za-z_]+)\s*=\s*([+-]?[\d.eE+-]+)")
 
 
 def _parse_header(header: str) -> dict:
-    """Extract numeric fields from a LigandMPNN FASTA header."""
+    """Numeric fields from a fused_mpnn header (T=, seed=, seq_rec= ...)."""
     out: dict[str, float] = {}
     for m in _RE_KV.finditer(header):
         key = m.group(1).strip().lower()
@@ -149,35 +150,58 @@ def _parse_header(header: str) -> dict:
     return out
 
 
+def _parse_output_fasta(fasta_path: Path) -> list[tuple[str, str, dict]]:
+    """Parse fused_mpnn's output FASTA (one entry per design + an input header)."""
+    if not fasta_path.exists():
+        return []
+    text = fasta_path.read_text()
+    blocks = [b for b in text.split(">") if b.strip()]
+    out: list[tuple[str, str, dict]] = []
+    for b in blocks:
+        lines = b.strip().splitlines()
+        header = lines[0]
+        seq = "".join(lines[1:]).strip()
+        out.append((header, seq, _parse_header(header)))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Main entrypoint
+# ---------------------------------------------------------------------------
+
+
 def sample_with_ligand_mpnn(
     pdb_path: str | Path,
-    ligand_params: str | Path,
     chain: str = "A",
     fixed_resnos: Iterable[int] = (),
     bias_per_residue: Optional[np.ndarray] = None,
+    protein_resnos: Optional[Sequence[int]] = None,
     n_samples: int = 100,
     config: Optional[LigandMPNNConfig] = None,
     out_dir: Optional[str | Path] = None,
     parent_design_id: Optional[str] = None,
     via_apptainer: bool = True,
+    ligand_params: Optional[str | Path] = None,  # accepted for API parity; not used
 ) -> LigandMPNNResult:
-    """Run LigandMPNN and return parsed designed sequences.
+    """Sample sequences with LigandMPNN (fused_mpnn build).
 
     Args:
-        pdb_path: input PDB.
-        ligand_params: ligand .params file.
+        pdb_path: input PDB. Ligand atoms must be HETATM in the same file.
         chain: protein chain to design.
-        fixed_resnos: 1-indexed residue numbers to keep fixed (typically
-            the active-site residues from REMARK 666).
-        bias_per_residue: optional (L, 20) bias matrix from sampling/plm_fusion.
-            Each row is added to MPNN's per-position logits. Use this to
-            inject ESM-C / SaProt naturalness signal.
-        n_samples: total number of sequences to sample.
+        fixed_resnos: 1-indexed pose residue numbers to keep fixed (catalytic
+            residues from REMARK 666). When ``repack_everything=0`` (the
+            default), fused_mpnn correctly leaves these residues' identities
+            and rotamers untouched.
+        bias_per_residue: (L, 20) bias matrix in PLM_AA_ORDER. If provided,
+            ``protein_resnos`` must be passed too so we know which pose
+            resno each row corresponds to.
+        protein_resnos: pose residue numbers (1-indexed) for the protein
+            residues *in row order* of bias_per_residue.
+        n_samples: total sequences = ``batch_size * number_of_batches``;
+            ``n_samples`` adjusts ``number_of_batches`` for convenience.
         config: LigandMPNNConfig.
-        out_dir: where to write outputs. Defaults to a tempdir.
-        parent_design_id: id stored on every CandidateSet row.
-        via_apptainer: run inside mlfold.sif. Set False if you've
-            entered the right env yourself.
+        ligand_params: ignored (the modern runner reads ligand atoms from
+            HETATMs); kept in the signature so the older callsite still works.
     """
     cfg = config or LigandMPNNConfig()
     pdb = Path(pdb_path).resolve()
@@ -186,90 +210,99 @@ def sample_with_ligand_mpnn(
         out_dir = Path(tempfile.mkdtemp(prefix="chisel_lmpnn_"))
     out_dir = Path(out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    weights = Path(cfg.weights_dir) if cfg.weights_dir else LIGAND_MPNN_WEIGHTS
 
-    # Bias JSONL
-    bias_path = None
-    if bias_per_residue is not None:
-        bias_path = out_dir / "bias_by_res.jsonl"
-        bias_path.write_text(
-            _build_bias_by_res_jsonl(pdb_name, chain, bias_per_residue) + "\n"
-        )
+    # n_samples → number_of_batches given the configured batch_size
+    n_batches = max(1, int(np.ceil(n_samples / max(1, cfg.batch_size))))
 
-    # Fixed positions JSONL
+    # Build JSON inputs
     fixed_path = None
     if fixed_resnos:
-        fixed_path = out_dir / "fixed_positions.jsonl"
-        fixed_path.write_text(
-            _build_fixed_positions_jsonl(pdb_name, chain, fixed_resnos) + "\n"
-        )
+        fixed_path = out_dir / "fixed_residues.json"
+        fixed_path.write_text(json.dumps(
+            _build_fixed_residues_multi(pdb, fixed_resnos, chain), indent=2,
+        ))
 
-    # Build the LigandMPNN command
+    bias_path = None
+    if bias_per_residue is not None:
+        if protein_resnos is None:
+            raise ValueError(
+                "bias_per_residue requires protein_resnos so we can label rows "
+                "with the correct pose residue numbers"
+            )
+        bias_path = out_dir / "bias_per_residue.json"
+        bias_path.write_text(json.dumps(
+            _build_bias_per_residue_multi(pdb, bias_per_residue, chain, protein_resnos),
+            indent=2,
+        ))
+
+    # Build CLI
     cmd = [
-        "python", str(LIGAND_MPNN_RUN),
+        "python", str(FUSED_MPNN_RUN),
+        "--model_type", cfg.model_type,
         "--pdb_path", str(pdb),
-        "--ligand_params_path", str(Path(ligand_params).resolve()),
         "--out_folder", str(out_dir),
-        "--num_seq_per_target", str(int(n_samples)),
-        "--sampling_temp", str(float(cfg.sampling_temp)),
+        "--temperature", str(float(cfg.temperature)),
         "--batch_size", str(int(cfg.batch_size)),
-        "--model_name", cfg.model_name,
-        "--path_to_model_weights", str(weights),
-        "--use_ligand", str(int(cfg.use_ligand)),
-        "--use_DNA_RNA", str(int(cfg.use_DNA_RNA)),
+        "--number_of_batches", str(n_batches),
         "--pack_side_chains", str(int(cfg.pack_side_chains)),
-        "--backbone_noise", str(float(cfg.backbone_noise)),
+        "--sc_num_denoising_steps", str(int(cfg.sc_num_denoising_steps)),
+        "--repack_everything", str(int(cfg.repack_everything)),
+        "--ligand_mpnn_use_side_chain_context", str(int(cfg.ligand_mpnn_use_side_chain_context)),
+        "--ligand_mpnn_use_atom_context", str(int(cfg.ligand_mpnn_use_atom_context)),
+        "--omit_AA", cfg.omit_AA,
         "--seed", str(int(cfg.seed)),
-        "--pdb_path_chains", chain,
+        "--packed_suffix", "_packed",
+        "--file_ending", cfg.file_ending,
     ]
-    if bias_path:
-        cmd += ["--bias_by_res_jsonl", str(bias_path)]
+    if cfg.bias_AA:
+        cmd += ["--bias_AA", cfg.bias_AA]
+    if cfg.enhance:
+        cmd += ["--enhance", cfg.enhance]
     if fixed_path:
-        cmd += ["--fixed_positions_jsonl", str(fixed_path)]
+        cmd += ["--fixed_residues_multi", str(fixed_path)]
+    if bias_path:
+        cmd += ["--bias_AA_per_residue_multi", str(bias_path)]
     cmd.extend(cfg.extra_flags)
 
-    LOGGER.info("running LigandMPNN: %s", " ".join(cmd))
+    LOGGER.info("running fused_mpnn: %s", " ".join(cmd))
 
     if via_apptainer:
-        from protein_chisel.utils.apptainer import mlfold_call
+        from protein_chisel.utils.apptainer import universal_call
 
-        result = mlfold_call(nv=True).run(cmd, check=True, timeout=3600)
+        result = universal_call(nv=True).run(cmd, check=True, timeout=7200)
     else:
         proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
         from protein_chisel.utils.apptainer import ApptainerResult
         result = ApptainerResult(
-            returncode=proc.returncode,
-            stdout=proc.stdout,
-            stderr=proc.stderr,
-            command=cmd,
+            returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr, command=cmd,
         )
 
-    fasta = out_dir / "seqs" / f"{pdb_name}.fa"
+    # fused_mpnn writes seqs/<name>.fa<file_ending>
+    fasta = out_dir / "seqs" / f"{pdb_name}.fa{cfg.file_ending}"
     parsed = _parse_output_fasta(fasta)
     if not parsed:
         raise RuntimeError(
-            f"LigandMPNN produced no sequences. Output dir: {out_dir}\n"
+            f"fused_mpnn produced no sequences. Expected {fasta}\n"
+            f"stdout tail: {result.stdout[-1000:]}\n"
             f"stderr tail: {result.stderr[-1000:]}"
         )
 
-    # First entry of LigandMPNN output is usually the input ("score=...,
-    # input_pdb_path=...") — keep it but flag separately.
+    # First entry is the input ("input_pdb_path=...") header; others are samples.
     rows: list[dict] = []
     for i, (header, seq, meta) in enumerate(parsed):
         rows.append({
             "id": f"{pdb_name}_lmpnn_{i:03d}",
             "sequence": seq.replace("/", ""),
             "parent_design_id": parent_design_id or pdb_name,
-            "sampler": "ligand_mpnn",
+            "sampler": "fused_mpnn",
             "sampler_params_hash": _config_hash(cfg, n_samples, fixed_resnos, bool(bias_path)),
             "is_input": (i == 0),
             "header": header,
             **{f"mpnn_{k}": v for k, v in meta.items()},
         })
-    cs = CandidateSet(df=pd.DataFrame(rows))
 
     return LigandMPNNResult(
-        candidate_set=cs,
+        candidate_set=CandidateSet(df=pd.DataFrame(rows)),
         out_dir=out_dir,
         raw_fasta=fasta,
         config=cfg,
@@ -277,14 +310,18 @@ def sample_with_ligand_mpnn(
 
 
 def _config_hash(cfg: LigandMPNNConfig, n: int, fixed: Iterable[int], biased: bool) -> str:
-    import hashlib
     payload = {
-        "model_name": cfg.model_name,
-        "sampling_temp": cfg.sampling_temp,
+        "model_type": cfg.model_type,
+        "temperature": cfg.temperature,
         "n_samples": n,
         "fixed": sorted(set(int(r) for r in fixed)),
         "biased": biased,
-        "backbone_noise": cfg.backbone_noise,
+        "pack_side_chains": cfg.pack_side_chains,
+        "repack_everything": cfg.repack_everything,
+        "side_chain_context": cfg.ligand_mpnn_use_side_chain_context,
+        "enhance": cfg.enhance,
+        "omit_AA": cfg.omit_AA,
+        "bias_AA": cfg.bias_AA,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:12]
 
