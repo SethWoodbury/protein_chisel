@@ -24,6 +24,25 @@ Each pipeline stage reads inputs from disk and writes outputs to disk. This mean
 
 Cost: a little I/O overhead. Worth it for any pipeline >2 stages.
 
+### Artifact contracts and provenance (avoid stale-TSV glue)
+
+File handoffs are only safe if the receiving stage can verify what it's reading. `io/schemas.py` defines typed objects for the canonical artifacts:
+
+| Artifact | Carried by | Contents |
+|---|---|---|
+| `PoseSet` | one or more pickled poses + sidecar `.json` | list of `Pose + metadata(sequence_id, fold_source, conformer_index, parent_design_id, is_apo)` |
+| `PositionTable` | `position_table.parquet` | per-residue: class, sasa, dist_ligand, dist_catalytic, ss, ss_reduced, phi, psi, in_pocket, original_aa, chain |
+| `CandidateSet` | `candidates.fasta` + sidecar `.parquet` | per-sequence: id, sequence, parent_design_id, sampler (mpnn|esmif|iterative), sampler_params_hash |
+| `MetricTable` | `metrics.parquet` | one row per (sequence, conformer); columns prefixed by source (`rosetta__`, `fpocket__`, `esmc__`, ...). Pareto / ranking operates on this. |
+
+**Provenance hashing**: every stage writes a `_manifest.json` next to its output containing:
+- input file SHA-256s
+- tool / model checkpoint version (e.g. esm 3.2.3, LigandMPNN commit, sif file mtime+inode)
+- hashed CLI args / config
+- python package versions
+
+Restart logic checks the manifest hash, not just file existence. Mismatched manifest → re-run. This prevents the silent-reuse bug where a stage's output was written under different parameters than the current run.
+
 ## Inner-loop philosophy
 
 This codebase is explicitly built to **avoid AF2/AF3/Boltz in the inner loop**. Use:
@@ -61,33 +80,78 @@ Per position class:
 
 **Pure-PLM pseudo-logits as a fallback.** When LigandMPNN isn't an option (e.g. the iterative walk pipeline below, where you need a per-position conditional and MPNN's autoregressive ordering would have to be re-run for each position), use just `log p_ESM-C + log p_SaProt` — both are masked-LM marginals, so they fuse cleanly.
 
-## Iterative single-mutation walk (Gibbs / MH pipeline)
+### Calibration of fused logits
 
-A separate pipeline alongside the batch `enzyme_optimize_v1`. Useful when you start from an already-good sequence and want to refine it one residue at a time, with each step seeing all previous steps.
+Don't add raw log-probs naively. Apply, in order:
+
+1. **Subtract the AA background** to convert per-position log-probs to log-odds:
+   `log p(aa | ctx) − log p_background(aa)` where `p_background` is the marginal AA frequency in the training corpus (or UniRef, or a uniform 1/20 prior). This decouples "this AA is rare everywhere" from "this AA is wrong here."
+2. **Entropy-match models**: each model has a different per-position entropy distribution. Rescale each model's logits by `τ_model` such that the median per-position entropy matches across models. Otherwise the high-entropy model dominates after summation.
+3. **Position-class–dependent weights** (β, γ): low at first-shell / pocket-lining, higher at surface; zero at active-site (which is frozen anyway).
+4. **Shrinkage at disagreement**: where models disagree strongly (low cosine similarity of their per-position distributions), shrink both contributions toward zero — let MPNN dominate. The PLMs are signaling low confidence; don't bias on disputed positions.
+
+### Why a static PLM bias can drift, and three remedies
+
+Computing the PLM marginals once on the seed sequence and freezing them as MPNN samples is fast but gets stale: as MPNN drifts the sequence away from the seed, the bias matrix encodes a context the new sequence no longer has. Three options, in order of complexity:
+
+1. **Refresh on top samples** — sample N candidates, recompute PLM logits on the median-by-naturalness candidate, re-bias, re-sample. Two or three rounds typically suffice.
+2. **PLM as reranker, not bias** — let MPNN sample freely, then rerank candidates by ESM-C / SaProt scores. Cleanest when you don't trust the bias calibration.
+3. **PLM as allowed-set restrictor** — at each position, restrict MPNN's allowed AAs to the top-k under PLM marginals (e.g. k=5). Strong restriction; use only at non-active, non-pocket positions, and only when speed matters.
+
+**Overconfidence warning**: a static PLM bias actively pushes toward natural-protein priors. For *de novo* enzymes whose function depends on intentionally unusual residues at pocket-adjacent positions, this can erase the design. Use refresh, reranker, or position-class–zero PLM weight at the pocket.
+
+## Iterative walk pipeline — two flavors
+
+Two related but distinct algorithms, useful when you start from an already-good sequence and want to refine it residue by residue, with each step seeing all previous steps. Both run as `pipelines/iterative_optimize.py` with a `--mode {constrained_local_search, mh}` flag.
+
+### Mode 1: constrained local search (cheap; default)
 
 ```
 s ← starting sequence
 for t in 1..T:
-    pick a position i (uniform / round-robin / weighted by uncertainty)
-    skip if i is frozen (active site / first-shell-locked)
-    compute p(aa | s_{-i}) from fused PLM marginals (ESM-C + SaProt)
-    propose aa* ~ p (with temperature)
-    accept aa* iff cheap filters still pass on s' = s with i ← aa*
-        (regex / ProtParam / quick PyRosetta repack-and-score Δ)
+    pick position i (uniform / round-robin / weighted by uncertainty)
+    skip if i ∈ frozen (active site / first-shell-locked)
+    p(aa | s_{-i}) ← fused PLM marginals (ESM-C + SaProt, calibrated)
+    aa* ~ p with temperature τ
+    s' ← s with i ← aa*
+    accept iff hard filters pass on s' (regex / ProtParam range / repack Δ < threshold)
     update s ← s' on accept
-loop until convergence (no accepted moves in N consecutive sweeps)
 ```
 
-Properties:
-- **Honors structural epistasis implicitly**: each mutation is evaluated in the context of all previous mutations.
-- **PLM-only** (no MPNN per step) keeps the inner loop cheap.
-- **MH acceptance** with cheap filters as the energy function lets you steer toward target charge / SAP / ddG without a single weighted scoring formula.
-- Use **temperature schedule** (anneal high → low) for simulated annealing variant.
-- Output is one walked sequence; run many parallel chains from the same start to get a diverse library.
+This is **constrained local search**, not Metropolis-Hastings. There is no proposal-correction term and no scalar target energy — accept depends only on whether filters pass. It works for polishing a small mutable set, but it's biased: any path through "bad single-mutant intermediate to good double-mutant" is forbidden, so you cannot find compensatory mutation pairs. It can also stall in dense regions where every neighbor fails.
 
-When to prefer this pipeline vs. batch MPNN:
-- Batch MPNN: better for "redesign large fraction of the protein at once."
-- Iterative walk: better for "polish a sequence with a small number of carefully chosen mutations" — closer to what directed evolution does.
+### Mode 2: Metropolis-Hastings (when compensatory moves matter)
+
+Define a scalar score `E(s) = − log P_combined(s)` from a small fixed set of objectives (e.g. 0.5·E_rosetta + 1.0·log_perplexity + 0.5·max(0, charge_target − charge(s))²). For mutation `s → s'` proposed under `q(s'|s)`:
+
+```
+α = min(1,  exp(−ΔE) · q(s|s') / q(s'|s))
+accept with probability α
+```
+
+Use a **temperature schedule** for simulated annealing (high τ early to traverse barriers, low τ late). Use **block moves** occasionally — propose two or more positions at once at known interaction networks (hbond partners, salt bridges, hydrophobic core clusters) — to allow coordinated changes. **Parallel tempering** runs N chains at different τ; periodically swap configurations between adjacent chains to escape local minima.
+
+### Convergence diagnostics (not "no accepts in N sweeps")
+
+That naive criterion catches stalled chains, not converged ones. Use:
+- **Multiple chains from different seeds**; check **R-hat** (Gelman-Rubin) on objectives or top-cluster compositions.
+- **Acceptance-rate trend**: collapsing to <5% near end suggests cooled enough; rising late means temperature too high.
+- **Objective autocorrelation**: integrated autocorrelation time τ_int; report effective sample size = T / τ_int per chain.
+- **Stability of top sequence clusters**: cluster sequences from late-iteration samples; pipeline considers "converged" when the top-cluster composition stops shifting between windowed slices.
+
+### When this pipeline pathologically fails
+
+- Compensatory multi-site moves (constrained-LS only): can't traverse a worse single-mutant intermediate.
+- Charge-pair swaps: ditto.
+- Backbone-coupled core mutations: PLMs see neither backbone nor your repacked sidechains.
+- Catalytic-water-mediated networks: not modeled at all.
+- Designs that need a residue PLMs heavily disfavor (the "intentionally weird" problem).
+
+### When to prefer this vs. batch MPNN
+
+- **Batch MPNN** (enzyme_optimize_v1): redesign large fraction of the protein at once.
+- **Constrained local search**: polish a small set of mutable positions toward charge / pI / SAP / ddG targets.
+- **MH with parallel tempering**: same use case but when compensatory moves are needed.
 
 ## Position classification (extended)
 
@@ -108,6 +172,28 @@ Done once per design. Per residue, record:
 
 Output is a single JSON consumed by every downstream tool. Secondary-structure labels can drive sampling priors directly (e.g., disallow proline in helix interiors except at known helix breaks).
 
+## Theozyme satisfaction & active-site quality (separate from naturalness)
+
+When the input PDB carries REMARK 666 catalytic geometry, treat the catalytic motif as a **specific geometric target**, not just "frozen residues." Per design / per conformer, compute:
+
+- **Motif RMSD** vs. theozyme reference (catalytic residue heavy atoms only).
+- **Catalytic distances**: each REMARK 666 motif atom pair (e.g. His Nε — ligand attack atom). Compare to the constraint definition.
+- **Catalytic angles & dihedrals**: again from REMARK 666 / cstfile semantics.
+- **Attack geometry**: for the substrate's reactive atom, the angle of approach to the nucleophile / proton donor.
+- **Catalytic-residue rotamer strain**: cart_bonded + fa_dun on each motif residue.
+
+These are sharper signals than total-pose Rosetta score for whether the active site is preserved.
+
+## Active-site preorganization & flexibility
+
+Static structures undersell active-site quality. A well-preorganized pocket has small geometric variance under perturbation. Use one of:
+
+- **Restrained repack ensembles**: with the REMARK 666 constraints active, run N short repack-and-min trajectories. Compute variance of catalytic distances/angles across the ensemble. Low variance = preorganized.
+- **Backrub ensembles**: PyRosetta `BackrubMover` for limited backbone perturbation; same variance metric.
+- **AF3 conformer agreement**: when you do reach the final AF3 step, the per-conformer agreement on catalytic geometry is a free preorganization signal.
+
+This is one of the few enzyme-quality metrics you can compute cheaply that captures something AF3 wouldn't catch in a single pass.
+
 ## Multi-pose inputs (single PDB or many)
 
 Tools and pipelines accept either a single PDB or a `pose_set` — a list of poses with metadata. Common scenarios:
@@ -119,7 +205,22 @@ Tools and pipelines accept either a single PDB or a `pose_set` — a list of pos
 | Family of designs | M sequences on the same backbone, each maybe with K conformers | nested aggregation: per-sequence (mean across its K conformers) → ranked across M; or "robust to conformer" = sequences whose worst conformer still passes filters. |
 | Apo + holo | ligand-bound and ligand-free poses of the same sequence | apo-vs-holo metrics: ligand binding ΔΔG (the user's target), pocket geometry change, induced fit. |
 
-`io/pose_set.py` carries metadata per pose: `sequence_id`, `fold_source` (designed | AF3_seedN | Boltz | RFdiffusion), `conformer_index`, `parent_design_id`, `is_apo`. `scoring/aggregate.py` provides per-design rollups (mean / std / min / max / vote) over conformers.
+`io/pose_set.py` carries metadata per pose: `sequence_id`, `fold_source` (designed | AF3_seedN | Boltz | RFdiffusion), `conformer_index`, `parent_design_id`, `is_apo`. **Internally, every tool operates on a `PoseSet`; a single PDB just becomes a `PoseSet` of size 1.** No separate codepath.
+
+### Aggregation must be metric-specific
+
+Don't just average everything. Different metrics need different aggregation strategies:
+
+| Metric type | Aggregation across a PoseSet |
+|---|---|
+| Failure / clash / unsatisfiable | **worst-case** (max / 95th percentile). One bad conformer = the design fails. |
+| Mean descriptive (Rg, SASA totals) | mean ± std. Std is itself informative — high std = conformationally unstable. |
+| Pocket geometry | mean ± std, with a "min volume / max bottleneck" gate. |
+| Catalytic geometry | mean ± std (preorganization signal). High std = brittle. |
+| Apo vs holo paired | explicit paired delta (e.g. `ddG = E_holo − E_apo − E_ligand_alone`). Don't average across the two. |
+| Fold-source agreement | compare *across sources* (designed-model vs. AF3 mean): low agreement → designed model probably overfit. |
+
+**Don't average designed-model and AF3-conformer scores as exchangeable samples** — they come from different generative processes and reflect different things. Keep `source_model` in the metadata and report agreement separately from per-conformer aggregates.
 
 This abstraction lets you pick **conformation-robust** designs in addition to **single-pose-good** ones — important because a design that scores well only on its idealized model but poorly on every AF3 conformer is probably a brittle design.
 
@@ -161,7 +262,39 @@ Output is a single JSON consumed by every downstream tool.
 
 ## Multi-objective ranking
 
-**Hard filters first, then Pareto on what survives.** No weighted-sum scoring across incommensurable metrics — that path leads to elaborate weight tuning that doesn't generalize. Use Pareto fronts on (Rosetta ΔΔG, ligand binding ΔΔG, ESM-C/SaProt naturalness, pocket geometry preservation, charge-target match), then apply a sequence-identity diversity cap when picking the top N.
+**Hard filters first, then Pareto on what survives.** No weighted-sum scoring across incommensurable metrics — that path leads to elaborate weight tuning that doesn't generalize.
+
+But Pareto has its own failure mode: with too many correlated objectives, almost everything is non-dominated and the front becomes the whole set. To prevent this:
+
+1. **Cap at 3-5 *real* objectives.** Pick the ones with weakly correlated signal. Good candidate set:
+   - Rosetta total-score Δ (or ligand interface ddG)
+   - PLM naturalness (single fused score, not ESM-C and SaProt separately)
+   - Pocket geometry preservation (single fpocket-derived score, not separate volume/bottleneck/hydrophobicity)
+   - Catalytic preorganization (variance under repack ensembles, see below)
+   - One design-objective metric (target charge match, target pI, target SAP)
+2. **Hard constraints first**: charge in range, no protease sites, repack Δ within tolerance, BUNS below threshold. These reduce the set; Pareto then ranks within the survivors.
+3. **ε-dominance** instead of strict dominance: bin objectives at meaningful resolution before comparing. Prevents trivial floating-point differences from creating spurious non-dominated points.
+4. **Diversity selection on mutable / pocket positions only.** Hamming distance over full-length sequence is dominated by surface variation that doesn't matter for function. Compute identity over the union of (mutable positions ∪ pocket positions) — this gives you genuinely distinct designs.
+5. **Calibration set required.** Without a benchmark of known-good and known-bad designs to set thresholds and weights, your filters are folklore. Maintain a small held-out set of past designs with known experimental outcomes; periodically check the filter stack reproduces expected pass/fail labels.
+
+## Cheap filters: veto vs. ranker
+
+Fixed-backbone PyRosetta repacking + ligand ddG + fpocket geometry + SAP / charge / protease filters are **a veto layer**, not a ranker. They reliably catch:
+- Steric clashes
+- Gross desolvation
+- Pocket destruction
+- Ligand-incompatible substitutions
+- Obviously bad chemistry (excess net charge, exposed hydrophobics, runs of cysteines)
+
+They are **not** reliably informative for:
+- Foldability — backbone is fixed; you're not seeing whether the new sequence still folds to that backbone.
+- Loop gating / conformational dynamics — you have one rotamer state per residue.
+- Water-mediated catalysis — explicit waters absent.
+- Protonation-sensitive networks — pKa estimation is a separate task.
+- Induced-fit pockets — backbone movement isn't allowed.
+- Multiple alternate ligand poses — only the docked pose is scored.
+
+So: use cheap filters to *kill* obviously bad sequences, but treat near-tied survivors as equivalent. AF3 (the final filter outside the inner loop) is what tells you which of the survivors actually *work*.
 
 ## Synthetic-MSA caveats
 

@@ -23,4 +23,12 @@ Planned:
 - catres_spec       # parse user-provided catalytic-residue strings like
                     # ["A94-96", "B101"] (from process_diffusion3). Used
                     # when REMARK 666 isn't present.
+- schemas           # **typed artifact contracts** for stage handoffs:
+                    #   PoseSet, PositionTable, CandidateSet, MetricTable.
+                    # Each carries a manifest sidecar with input file
+                    # SHA-256s, tool/checkpoint versions, hashed CLI args
+                    # / config, and python package versions. Restart logic
+                    # checks the manifest hash, not just file existence —
+                    # prevents silent reuse when params changed but files
+                    # already exist.
 """
