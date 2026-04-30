@@ -8,6 +8,17 @@ acceptor / donor.
 For a single PDB it returns a per-(residue × interaction-type) boolean
 table; we expose this directly + per-type and per-residue rollups.
 
+**Limitation — non-canonical ligands.** ProLIF's MDAnalysis → RDKit path
+guesses bonds from heavy-atom coordinates. For chemistry that PDB heavy
+atoms can't disambiguate (carbamylated lysines, tautomers, formal
+charges, metal coordination), RDKit raises ``AtomValenceException``.
+For our YYE ligand (Zn₂ carbamylated cap) this happens. The wrapper
+catches it, logs a warning, and returns an empty fingerprint with
+``rdkit_failure=True`` set on the result so callers can route around.
+The proper fix is to pass an RDKit-perceived Mol object (from a mol2
+template / SMILES) — left as a TODO until we ship a template-loading
+path.
+
 Run inside esmc.sif (where prolif is installed). RDKit + MDAnalysis are
 ProLIF deps — also in esmc.sif.
 
@@ -40,11 +51,14 @@ class ProLIFResult:
     per_type_counts: pd.Series              # by interaction type
     n_interactions: int = 0
     n_residues_with_interactions: int = 0
+    rdkit_failure: bool = False             # True iff bond-perception failed
+    rdkit_failure_reason: Optional[str] = None
 
     def to_dict(self, prefix: str = "prolif__") -> dict[str, float | int]:
         out: dict[str, float | int] = {
             f"{prefix}n_interactions": self.n_interactions,
             f"{prefix}n_residues_with_interactions": self.n_residues_with_interactions,
+            f"{prefix}rdkit_failure": int(bool(self.rdkit_failure)),
         }
         for typ, n in self.per_type_counts.items():
             out[f"{prefix}{typ}__count"] = int(n)
@@ -103,8 +117,30 @@ def prolif_fingerprint(
             f"no atoms match `{sel_str}` in {pdb_path} — verify chain/resno"
         )
 
-    protein_mol = plf.Molecule.from_mda(protein_sel)
-    ligand_mol = plf.Molecule.from_mda(ligand_sel)
+    # ProLIF's MDAnalysis→RDKit conversion can fail on non-canonical ligands
+    # (RDKit AtomValenceException) when bond-from-coords inference produces an
+    # invalid valence. Catch and return a meaningful empty result so callers
+    # can route around.
+    import logging
+    logger = logging.getLogger("protein_chisel.prolif_fingerprint")
+    try:
+        protein_mol = plf.Molecule.from_mda(protein_sel)
+        ligand_mol = plf.Molecule.from_mda(ligand_sel)
+    except Exception as e:
+        logger.warning(
+            "ProLIF: RDKit failed on %s ligand (%s, %s, %s): %s",
+            pdb_path, ligand_chain, ligand_resname, ligand_resno, e,
+        )
+        empty = pd.DataFrame()
+        return ProLIFResult(
+            boolean_df=empty,
+            per_residue_counts=pd.Series(dtype=int),
+            per_type_counts=pd.Series(dtype=int),
+            n_interactions=0,
+            n_residues_with_interactions=0,
+            rdkit_failure=True,
+            rdkit_failure_reason=str(e),
+        )
 
     fp = plf.Fingerprint(interactions=interactions) if interactions else plf.Fingerprint()
     fp.run_from_iterable([ligand_mol], protein_mol, n_jobs=1, progress=False)
