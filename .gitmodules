@@ -1,0 +1,3 @@
+[submodule "external/fpocket"]
+	path = external/fpocket
+	url = https://github.com/Discngine/fpocket
