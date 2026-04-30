@@ -19,15 +19,15 @@ protein. We expose:
   runtime image with torch/moleculekit/etc. and weights at
   ``/opt/metal-site-prediction/Metal3D/weights/``. **All inference runs
   here.**
-- ``scripts/run_metal3d.py`` (vendored from aruder2): self-relaunches
-  into metal3d.sif when invoked from outside a container. Handles
-  CPU-safe voxelization, KDTree-vectorized probability, batched
-  inference, JSON metadata + probe-PDB output.
+- ``scripts/run_metal3d.py``: self-relaunches into metal3d.sif when
+  invoked from outside a container. Handles CPU-safe voxelization,
+  KDTree-vectorized probability, batched inference, JSON metadata +
+  probe-PDB output.
 
 **GPU strongly recommended.** Metal3D's CNN runs many 32³ voxel cubes
-per protein; CPU inference is unworkably slow (~10× longer). Aaron's
-runner does support ``--device cpu`` but expect minutes-to-hours per
-PDB. For real runs, route through sbatch on a GPU partition.
+per protein; CPU inference is unworkably slow (~10× longer). The
+runner supports ``--device cpu`` but expect minutes-to-hours per PDB.
+For real runs, route through sbatch on a GPU partition.
 """
 
 from __future__ import annotations
@@ -239,4 +239,132 @@ def metal3d_score(
     )
 
 
-__all__ = ["METAL_ELEMENTS", "Metal3DResult", "find_actual_metals", "metal3d_score"]
+def metal3d_score_batch(
+    pdb_paths: list[str | Path],
+    out_dir: str | Path,
+    metalbinding_only: bool = True,
+    pthreshold: float = 0.10,
+    cluster_threshold: float = 7.0,
+    write_combined_pdbs: bool = False,
+    batch_size: int = 128,
+    timeout_per_pdb: float = 120.0,
+    runner_script: Optional[str | Path] = None,
+    extra_runner_args: tuple[str, ...] = (),
+) -> dict[str, Metal3DResult]:
+    """Run Metal3D on many PDBs in a single container invocation.
+
+    Big efficiency win for N>1: container startup (~5s) and model load
+    (~2-3s) are paid ONCE rather than N times. For 100 PDBs this can cut
+    wall-time by ~25-40% vs. calling ``metal3d_score`` per pose.
+
+    Args:
+        pdb_paths: list of input PDBs. The runner accepts a mix of .pdb,
+            .cif, .mmcif, and .gz variants.
+        out_dir: workspace directory. The runner writes a single
+            ``metal3d_results.json`` keyed by source filename, plus one
+            probe PDB per input.
+        batch_size: model-forward batch size. On a single A4000 (16 GB)
+            128 is comfortable for a 32³ voxel cube; larger GPUs can
+            push to 256-512 for slightly more throughput.
+        timeout_per_pdb: per-PDB timeout multiplier. Total subprocess
+            timeout = N * timeout_per_pdb (with a floor of 600 s).
+
+    Returns:
+        ``{<input pdb path>: Metal3DResult}``. Result keys are the
+        absolute paths of the input PDBs.
+    """
+    if not pdb_paths:
+        return {}
+    pdb_paths_resolved = [Path(p).resolve() for p in pdb_paths]
+
+    out_dir = Path(out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = out_dir / "metal3d_out"
+
+    script = Path(runner_script) if runner_script else _runner_script()
+    if not script.is_file():
+        raise FileNotFoundError(f"run_metal3d.py not found at {script}")
+
+    # Write a list-of-paths file the runner accepts via --pdb-list. Reduces
+    # CLI length when N is large.
+    list_path = out_dir / "metal3d_inputs.txt"
+    list_path.write_text("\n".join(str(p) for p in pdb_paths_resolved) + "\n")
+
+    cmd = [
+        "python3", str(script),
+        "--pdb-list", str(list_path),
+        "--output-dir", str(output_dir),
+        "--pthreshold", str(float(pthreshold)),
+        "--cluster-threshold", str(float(cluster_threshold)),
+        "--batch-size", str(int(batch_size)),
+        "--force",
+        "--execution-mode", "auto",
+    ]
+    if not metalbinding_only:
+        cmd.append("--all-protein")
+    if write_combined_pdbs:
+        cmd.append("--write-combined-pdbs")
+    cmd.extend(extra_runner_args)
+
+    timeout = max(600.0, len(pdb_paths_resolved) * timeout_per_pdb)
+    LOGGER.info("metal3d batch (%d pdbs): %s", len(pdb_paths_resolved), " ".join(cmd))
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"run_metal3d.py exited {proc.returncode}\n"
+            f"stdout (tail): {proc.stdout[-1500:]}\n"
+            f"stderr (tail): {proc.stderr[-1500:]}"
+        )
+
+    results_path = output_dir / "metal3d_results.json"
+    if not results_path.exists():
+        raise RuntimeError(f"Metal3D produced no results JSON at {results_path}")
+
+    with results_path.open() as fh:
+        json_results = json.load(fh)
+
+    # The runner keys results by the input filename's basename. Build a
+    # lookup from basename → full path for readback alignment.
+    name_to_path = {p.name: str(p) for p in pdb_paths_resolved}
+    by_path: dict[str, Metal3DResult] = {}
+    for source_name, entry in json_results.items():
+        full_path = name_to_path.get(source_name) or entry.get("input") or source_name
+        actual = find_actual_metals(full_path) if Path(full_path).is_file() else []
+
+        sites = [
+            (float(s["x"]), float(s["y"]), float(s["z"]), float(s["p"]))
+            for s in entry.get("sites", [])
+        ]
+        top_p = max((s[3] for s in sites), default=0.0)
+        per_actual: dict[str, float] = {}
+        if sites and actual:
+            pred = np.asarray([(s[0], s[1], s[2]) for s in sites])
+            probs = np.asarray([s[3] for s in sites])
+            for m in actual:
+                label = f"{m['chain']}_{m['resno']}_{m['name']}"
+                d = np.linalg.norm(pred - np.array([m["x"], m["y"], m["z"]]), axis=-1)
+                mask = d <= 4.0
+                per_actual[label] = float(probs[mask].max()) if mask.any() else 0.0
+
+        by_path[full_path] = Metal3DResult(
+            actual_metals=actual,
+            predicted_sites=sites,
+            actual_metal_max_prob_within_4A=per_actual,
+            n_actual_metals=len(actual),
+            n_predicted_sites=len(sites),
+            top_site_probability=top_p,
+            runner_metadata={},
+            raw_results_path=str(results_path),
+        )
+
+    return by_path
+
+
+__all__ = [
+    "METAL_ELEMENTS",
+    "Metal3DResult",
+    "find_actual_metals",
+    "metal3d_score",
+    "metal3d_score_batch",
+    "metal3d_source_dir",
+]

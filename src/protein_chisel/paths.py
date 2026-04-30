@@ -78,7 +78,18 @@ FPOCKET_CLUSTER_BIN = Path("/net/software/lab/fpocket/bin/fpocket")
 # (above src/). NB: parents is 0-indexed and includes the file's own dir.
 _REPO_ROOT_FROM_PATHS = Path(__file__).resolve().parents[2]
 METAL3D_SOURCE_DIR = _REPO_ROOT_FROM_PATHS / "external" / "metal-site-prediction"
-METAL3D_RUNNER_SCRIPT = _REPO_ROOT_FROM_PATHS / "scripts" / "run_metal3d.py"
+# Resolution for the runner script:
+#   1. local checkout at scripts/run_metal3d.py (preferred when developing
+#      from a clone of protein_chisel)
+#   2. cluster-wide install at /net/software/lab/metal3d/run_metal3d.py
+#      (so users who don't clone the repo can still call it)
+METAL3D_RUNNER_SCRIPT_LOCAL = _REPO_ROOT_FROM_PATHS / "scripts" / "run_metal3d.py"
+METAL3D_RUNNER_SCRIPT_CLUSTER = Path("/net/software/lab/metal3d/run_metal3d.py")
+METAL3D_RUNNER_SCRIPT = (
+    METAL3D_RUNNER_SCRIPT_LOCAL
+    if METAL3D_RUNNER_SCRIPT_LOCAL.is_file()
+    else METAL3D_RUNNER_SCRIPT_CLUSTER
+)
 
 
 # ---- Cluster scratch / outputs --------------------------------------------
