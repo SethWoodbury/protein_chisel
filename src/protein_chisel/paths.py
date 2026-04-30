@@ -68,6 +68,18 @@ FOLDSEEK_BIN_IN_SIF = "foldseek"
 #   in order: --fpocket_exe, $FPOCKET, shutil.which, this fallback.
 FPOCKET_CLUSTER_BIN = Path("/net/software/lab/fpocket/bin/fpocket")
 
+# Metal3D — vendored source under external/metal-site-prediction (git
+# submodule). The actual runtime (CNN weights + torch + moleculekit)
+# lives inside metal3d.sif at /opt/metal-site-prediction; the local
+# copy is for introspection, patching, and reproducibility (pinned commit).
+# Aaron's scripts/run_metal3d.py auto-launches metal3d.sif when invoked
+# from outside any container.
+# __file__ is src/protein_chisel/paths.py. parents[2] is the repo root
+# (above src/). NB: parents is 0-indexed and includes the file's own dir.
+_REPO_ROOT_FROM_PATHS = Path(__file__).resolve().parents[2]
+METAL3D_SOURCE_DIR = _REPO_ROOT_FROM_PATHS / "external" / "metal-site-prediction"
+METAL3D_RUNNER_SCRIPT = _REPO_ROOT_FROM_PATHS / "scripts" / "run_metal3d.py"
+
 
 # ---- Cluster scratch / outputs --------------------------------------------
 

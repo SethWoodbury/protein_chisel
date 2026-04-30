@@ -43,5 +43,6 @@ testpaths = ["tests"]
 markers = [
     "cluster: tests that require cluster sif containers (skipped by default)",
     "gpu: tests that require a GPU (run via sbatch only)",
+    "slow: tests that take more than ~30s (skipped by default)",
 ]
-addopts = "-m 'not cluster and not gpu'"
+addopts = "-m 'not cluster and not gpu and not slow'"
