@@ -65,7 +65,7 @@ def find_arpeggio_executable() -> str:
 
 
 def arpeggio_interactions(
-    pdb_path: str | Path,
+    cif_path: str | Path,
     selection: Optional[str] = None,
     out_dir: Optional[str | Path] = None,
     keep_outputs: bool = False,
@@ -74,22 +74,30 @@ def arpeggio_interactions(
     """Run pdbe-arpeggio and return the parsed contact list.
 
     Args:
-        pdb_path: input PDB. Should already have hydrogens (arpeggio
-            issues warnings without them but still runs).
+        cif_path: input mmCIF file. **pdbe-arpeggio requires mmCIF**, not
+            PDB. Convert with PyRosetta or biotite if you only have PDBs:
+                from biotite.structure.io import pdb, pdbx
+                pdb_struct = pdb.PDBFile.read(pdb_path).get_structure()
+                pdbx.CIFFile.from_structure(pdb_struct).write(cif_path)
         selection: optional arpeggio selection string (e.g. "/A/64/").
             When None, the full structure is analyzed.
         out_dir: workspace directory; defaults to a tempdir.
         keep_outputs: if True, the workspace is preserved.
     """
-    pdb_path = Path(pdb_path).resolve()
+    cif_path = Path(cif_path).resolve()
+    if cif_path.suffix.lower() not in (".cif", ".mmcif"):
+        raise ValueError(
+            f"pdbe-arpeggio requires mmCIF input; got {cif_path.suffix}. "
+            "Convert your PDB to mmCIF first (see docstring)."
+        )
     exe = find_arpeggio_executable()
 
     workspace = Path(out_dir).resolve() if out_dir else Path(tempfile.mkdtemp(prefix="chisel_arpeggio_"))
     workspace.mkdir(parents=True, exist_ok=True)
-    local_pdb = workspace / pdb_path.name
-    local_pdb.write_bytes(pdb_path.read_bytes())
+    local_cif = workspace / cif_path.name
+    local_cif.write_bytes(cif_path.read_bytes())
 
-    cmd = [exe, str(local_pdb), "-o", str(workspace)]
+    cmd = [exe, str(local_cif), "-o", str(workspace)]
     if selection:
         cmd += ["-s", selection]
     LOGGER.info("running arpeggio: %s", " ".join(cmd))
@@ -104,22 +112,26 @@ def arpeggio_interactions(
         )
 
     # Outputs land in workspace as <stem>.json
-    out_json = workspace / f"{local_pdb.stem}.json"
+    out_json = workspace / f"{local_cif.stem}.json"
     contacts: list[dict] = []
     if out_json.exists():
         contacts = _parse_arpeggio_json(out_json)
     else:
         # Some versions emit a contacts file with a different extension.
-        candidates = list(workspace.glob(f"{local_pdb.stem}*.json"))
+        candidates = list(workspace.glob(f"{local_cif.stem}*.json"))
         if candidates:
             contacts = _parse_arpeggio_json(candidates[0])
             out_json = candidates[0]
         else:
             LOGGER.warning("arpeggio produced no JSON in %s", workspace)
 
+    # PDBe-Arpeggio's per-record schema: ``contact`` is the LIST of interaction
+    # flags (the interaction set we actually want); ``type`` is geometry
+    # metadata ("atom-atom", "atom-plane", ...) — NOT an interaction flag.
+    # Don't fall back to "type".
     by_type: dict[str, int] = {}
     for c in contacts:
-        types = c.get("contact", []) or c.get("type", [])
+        types = c.get("contact") or []
         if isinstance(types, str):
             types = [types]
         for t in types:

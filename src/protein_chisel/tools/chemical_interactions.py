@@ -257,8 +257,10 @@ def _detect_pi_cation(pose, rings: list[dict], cutoff: float) -> list[dict]:
 # of a detected interaction at distance d is ``exp(-(d - d0)^2 / (2 σ^2))``.
 # σ values are deliberately permissive (~ half the canonical cutoff) so the
 # decay is gentle rather than a step.
+#
+# Note: hbond strength uses an *energy* proxy (Rosetta hbond_sc) rather than
+# distance, so there is no hbond entry here.
 INTERACTION_GEOMETRY = {
-    "hbond":         {"d0": 2.9, "sigma": 0.35},  # H...A distance
     "salt_bridge":   {"d0": 3.0, "sigma": 0.50},  # N...O distance
     "pi_pi":         {"d0": 4.0, "sigma": 0.80},  # ring centroid distance
     "pi_cation":     {"d0": 4.0, "sigma": 0.80},  # centroid...cation
@@ -302,15 +304,27 @@ def interaction_strengths(
 
     Args:
         interactions: result from ``chemical_interactions(pdb)``.
-        geometry: override default ``INTERACTION_GEOMETRY``.
+        geometry: per-interaction-type overrides. Deep-merged with the
+            default ``INTERACTION_GEOMETRY``: ``{"salt_bridge": {"sigma": 0.7}}``
+            keeps the default ``d0`` and only overrides ``sigma``.
         pi_pi_angle_factor: when True, multiplies π-π strength by an
             angle factor that down-weights "tilted" geometries (peaks at
             stacked 0° and t-shape 90°, half-strength at 45°).
     """
-    geom = {**INTERACTION_GEOMETRY, **(geometry or {})}
+    # Deep merge so callers can partially override per-type parameters
+    # without dropping the rest of that type's defaults.
+    geom: dict[str, dict[str, float]] = {
+        k: dict(v) for k, v in INTERACTION_GEOMETRY.items()
+    }
+    if geometry:
+        for typ, overrides in geometry.items():
+            geom.setdefault(typ, {}).update(overrides)
 
-    by_type_sum: dict[str, float] = {k: 0.0 for k in geom}
-    by_type_count: dict[str, int] = {k: 0 for k in geom}
+    # Always include hbond in the type tallies even though it doesn't have
+    # a geometry entry (it uses an energy proxy).
+    type_keys = list(geom.keys()) + ["hbond"]
+    by_type_sum: dict[str, float] = {k: 0.0 for k in type_keys}
+    by_type_count: dict[str, int] = {k: 0 for k in type_keys}
     per_residue_sum: dict[int, float] = {}
     per_residue_by_type: dict[int, dict[str, float]] = {}
     rows: list[dict] = []
@@ -329,11 +343,17 @@ def interaction_strengths(
         # Map Rosetta hbond energy (kcal/mol, typically -2..0) to (0, 1].
         # 1 / (1 + exp(2 + 4*e)) — at e = -2: ≈ 0.5; at e = -3: ≈ 0.99.
         e = float(h.get("energy", 0.0))
-        s = 1.0 / (1.0 + np.exp(2.0 + 4.0 * e))
-        s = float(s)
+        # Guard NaN/non-finite (would poison the entire aggregate sum).
+        # Also clamp positive energies (repulsive hbonds — unphysical for
+        # detected hbonds but seen in mis-parsed input) to zero strength.
+        if not np.isfinite(e) or e >= 0.0:
+            s = 0.0
+        else:
+            s = float(1.0 / (1.0 + np.exp(2.0 + 4.0 * e)))
         by_type_sum["hbond"] += s
         by_type_count["hbond"] += 1
-        weighted_hbond_e += -e * s  # bigger absolute energy → bigger weighted total
+        if np.isfinite(e):
+            weighted_hbond_e += -e * s  # bigger |energy| → bigger weighted total
         for resno in (h["donor_res"], h["acceptor_res"]):
             _add_per_residue(resno, "hbond", s)
         rows.append({"type": "hbond", "strength": s, **h})
@@ -356,9 +376,12 @@ def interaction_strengths(
         if pi_pi_angle_factor:
             # Aromatic stacking peaks at 0° (face-to-face) and 90° (T-shape);
             # the bad geometry is the in-between 45° tilted case. Use
-            # 0.5 + 0.5·|cos(2θ)|: 1 at 0°/90°, 0.5 at 45°.
-            ang_factor = 0.5 + 0.5 * abs(np.cos(2.0 * np.deg2rad(ang)))
-            s *= float(ang_factor)
+            # 0.5 + 0.5·|cos(2θ)|: 1 at 0°/90°, 0.5 at 45°. Guard NaN angles.
+            if np.isfinite(ang):
+                ang_factor = 0.5 + 0.5 * abs(np.cos(2.0 * np.deg2rad(ang)))
+                s *= float(ang_factor)
+            else:
+                s = 0.0
         by_type_sum["pi_pi"] += s
         by_type_count["pi_pi"] += 1
         for resno in (pp["res_a"], pp["res_b"]):

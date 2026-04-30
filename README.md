@@ -38,6 +38,26 @@ scored.tsv                  (per-sequence metrics)
 final_library.fasta         (50–100 sequences for AF3)
 ```
 
+## Documentation
+
+Full docs in [`docs/`](docs/):
+
+| File | What's inside |
+|---|---|
+| [`docs/capabilities.md`](docs/capabilities.md) | Quick "what can I do today?" bullets |
+| [`docs/setup.md`](docs/setup.md) | Install, sif paths, what-runs-where, slurm gotchas |
+| [`docs/architecture.md`](docs/architecture.md) | Three-layer design, logit-fusion math, multi-pose abstraction, ranking philosophy |
+| [`docs/dependencies.md`](docs/dependencies.md) | Every external dep + per-tool installation status |
+| [`docs/tools.md`](docs/tools.md) | Per-tool reference (inputs / outputs / sif / tests) |
+| [`docs/filters.md`](docs/filters.md) | Sequence-only filters |
+| [`docs/scoring.md`](docs/scoring.md) | Aggregate / Pareto / diversity, with code examples |
+| [`docs/sampling.md`](docs/sampling.md) | PLM fusion calibration, biased MPNN, ligand_mpnn wrapper |
+| [`docs/pipelines.md`](docs/pipelines.md) | Per-pipeline I/O, sbatch invocation, restart behavior |
+| [`docs/io_and_schemas.md`](docs/io_and_schemas.md) | Manifest hashing, PoseSet / PositionTable / CandidateSet / MetricTable, sample JSONs |
+| [`docs/testing.md`](docs/testing.md) | Host vs cluster vs gpu test markers, current coverage |
+| [`docs/future_plans.md`](docs/future_plans.md) | Stubs, untested wrappers, sampling/scoring TODO, pending sif additions |
+| [`docs/codex_review_2026-04-28.md`](docs/codex_review_2026-04-28.md) | Codex's prior critique (already addressed) |
+
 ## Cluster dependencies
 
 All external models, containers, and weights are documented in [`docs/dependencies.md`](docs/dependencies.md) with their cluster paths. The Python module `protein_chisel.paths` centralizes those paths so everything else can import them.
@@ -72,25 +92,32 @@ Implemented and tested:
 - **PLM tools**: esmc_logits/_score, saprot_logits/_score with proper
   masked-LM marginals (L forward passes per call).
 - **Sampling**: plm_fusion (log-odds calibration + entropy-match +
-  shrinkage), biased_mpnn (orchestrator), ligand_mpnn (wraps
-  protein_mpnn_run.py via apptainer mlfold.sif).
+  shrinkage), biased_mpnn (orchestrator), ligand_mpnn (wraps the
+  fused_mpnn lab build at `/net/software/lab/fused_mpnn/seth_temp/`
+  via `universal.sif`).
 - **Scoring**: aggregate (metric-specific rollups across PoseSet),
   pareto (ε-dominance), diversity (Hamming over mutable positions).
+- **Catalysis**: theozyme_satisfaction (Kabsch motif RMSD + per-residue +
+  per-atom-to-ligand distances), catalytic_pka (PROPKA wrapper).
 - **Pipelines**: comprehensive_metrics (descriptive structural battery),
   naturalness_metrics (PLM scoring + fusion-bias artifacts),
-  sequence_design_v1 (5-stage pipeline that actually designs sequences).
+  sequence_design_v1 (5-stage pipeline), iterative_optimize (constrained
+  local search + real Metropolis-Hastings).
 
 Test coverage:
-- 95 host tests
-- 29 cluster tests in pyrosetta.sif (real design.pdb + apo + holo)
-- 9 cluster tests in esmc.sif (PLM + contact_ms)
+- 141 host tests
+- 30 cluster tests in pyrosetta.sif (real design.pdb + apo + holo)
+- 12 cluster tests in esmc.sif (PLM + contact_ms + PROPKA)
 
-What's stubbed but not yet wired:
-- theozyme_satisfaction (motif RMSD + catalytic distance/angle/dihedral)
-- preorganization (variance under repack ensembles)
-- catalytic_pka (PROPKA wrapper)
-- iterative_optimize pipeline (Gibbs / MH walk)
+What's stubbed / pending (see [`docs/future_plans.md`](docs/future_plans.md)):
+- preorganization (implemented; **untested**)
+- fpocket_run (wrapper functional; **binary install pending**)
+- metal3d_score (HETATM scan only; **inference path stubbed**)
+- ProLIF / pdbe-arpeggio / CAVER wrappers (no source files yet; awaiting new sif)
 - comprehensive_metrics × naturalness_metrics merge pipeline
+- iterative_optimize block moves / parallel tempering
+- scoring/calibration benchmark loop
+- repo CI
 
 ## Quick start
 

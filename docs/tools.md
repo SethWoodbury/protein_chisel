@@ -14,6 +14,7 @@ Single-purpose primitives in `src/protein_chisel/tools/`. Each tool exposes a Py
 | `secondary_structure` / `ss_summary` | [tools/secondary_structure.py](../src/protein_chisel/tools/secondary_structure.py) | `pyrosetta.sif` | `SecondaryStructureResult`, `SSSummaryResult` (`ss__*`) | [tests/test_structural_tools.py](../tests/test_structural_tools.py) (cluster) |
 | `ligand_environment` | [tools/ligand_environment.py](../src/protein_chisel/tools/ligand_environment.py) | `pyrosetta.sif` | `list[LigandEnvResult]` (`ligand__*`) | [tests/test_structural_tools.py](../tests/test_structural_tools.py) (cluster) |
 | `chemical_interactions` | [tools/chemical_interactions.py](../src/protein_chisel/tools/chemical_interactions.py) | `pyrosetta.sif` | `InteractionsResult` (`interact__*`) | [tests/test_chemistry_tools.py](../tests/test_chemistry_tools.py) (cluster) |
+| `interaction_strengths` | [tools/chemical_interactions.py:298](../src/protein_chisel/tools/chemical_interactions.py#L298) | host (numpy only — uses output of above) | `InteractionStrengthResult` (`interact_strength__*`) | [tests/test_interaction_strengths.py](../tests/test_interaction_strengths.py) (host) |
 | `buns` | [tools/buns.py](../src/protein_chisel/tools/buns.py) | `pyrosetta.sif` | `BUNSResult` (`buns__*`) | [tests/test_chemistry_tools.py](../tests/test_chemistry_tools.py) (cluster) |
 | `catres_quality` | [tools/catres_quality.py](../src/protein_chisel/tools/catres_quality.py) | `pyrosetta.sif` | `CatresQualityResult` (`catres__*`) | [tests/test_chemistry_tools.py](../tests/test_chemistry_tools.py) (cluster) |
 | `theozyme_satisfaction` | [tools/theozyme_satisfaction.py](../src/protein_chisel/tools/theozyme_satisfaction.py) | host (numpy only) | `TheozymeSatisfactionResult` (`theozyme__*`) | [tests/test_theozyme_satisfaction.py](../tests/test_theozyme_satisfaction.py) (host) |
@@ -74,14 +75,16 @@ Per-ligand metrics: min backbone-ligand distance (`lig_dist`), residues within 5
 - **Outputs**: `list[LigandEnvResult]`. First ligand under prefix `ligand__`; subsequent under `ligand_<i>__`. The pipeline ([pipelines/comprehensive_metrics.py:230](../src/protein_chisel/pipelines/comprehensive_metrics.py#L230)) sets `ligand__n_ligands`.
 - **Limitations**: Multi-ligand designs work but the prefix scheme stays per-ligand; aggregation downstream is the caller's responsibility.
 
-### `chemical_interactions`
-[src/protein_chisel/tools/chemical_interactions.py:73](../src/protein_chisel/tools/chemical_interactions.py#L73)
+### `chemical_interactions` + `interaction_strengths`
+[src/protein_chisel/tools/chemical_interactions.py:73](../src/protein_chisel/tools/chemical_interactions.py#L73), [chemical_interactions.py:298](../src/protein_chisel/tools/chemical_interactions.py#L298)
 
-Detects (binary, with energies/distances/angles): hbonds (PyRosetta `HBondSet`), salt bridges (charged-N to carboxylate-O within cutoff), π-π (centroid distance + plane angle, classified `stacked`/`tilted`/`t_shape`), π-cation (aromatic centroid to positive-N).
+Detects (binary, with energies/distances/angles): hbonds (PyRosetta `HBondSet`), salt bridges (charged-N to carboxylate-O within cutoff), π-π (centroid distance + plane angle, classified `stacked`/`tilted`/`t_shape`), π-cation (aromatic centroid to positive-N). Plus a separate `interaction_strengths()` function that turns binary detections into soft Gaussian-weighted strengths.
 
 - **hbond row**: `donor_res`, `donor_name3`, `donor_h_atom`, `donor_heavy_atom`, `acceptor_res`, `acceptor_name3`, `acceptor_atom`, `energy`. Uses bcov canonical `fix_scorefxn(allow_double_bb=True)` ([utils/pose.py:104](../src/protein_chisel/utils/pose.py#L104)).
-- **Outputs summary**: `interact__n_hbonds`, `interact__n_salt_bridges`, `interact__n_pi_pi`, `interact__n_pi_cation`, `interact__sum_hbond_energy`.
-- **Limitations**: π-π plane angle uses absolute-value cosine (so 0° and 180° are both "stacked"). No protein-ligand-specific subset; the result includes intra-protein interactions.
+- **Binary outputs summary**: `interact__n_hbonds`, `interact__n_salt_bridges`, `interact__n_pi_pi`, `interact__n_pi_cation`, `interact__sum_hbond_energy`.
+- **Strength outputs** (`interact_strength__*` prefix): per-type sums, per-type counts, per-residue strength rollup, weighted hbond energy. `INTERACTION_GEOMETRY` declares Gaussian (d0, σ) per type for salt bridges (3.0, 0.5), π-π (4.0, 0.8), π-cation (4.0, 0.8). Hbonds use a softplus on Rosetta hbond_sc energy as the strength proxy. π-π gets an angle factor `0.5 + 0.5·|cos(2θ)|` that peaks at 0° (stacked) and 90° (T-shape) and dips to 0.5 at 45° (tilted).
+- **Limitations**: π-π plane-angle classification uses absolute-value cosine. No protein-ligand-specific subset; the result includes intra-protein interactions.
+- **Tested**: binary detection in [tests/test_chemistry_tools.py](../tests/test_chemistry_tools.py) (cluster); strength layer in [tests/test_interaction_strengths.py](../tests/test_interaction_strengths.py) (host, no PyRosetta).
 
 ### `buns`
 [src/protein_chisel/tools/buns.py:72](../src/protein_chisel/tools/buns.py#L72)

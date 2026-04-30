@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-import numpy as np
+import math
+
 import pytest
 
 from protein_chisel.tools.chemical_interactions import (
@@ -133,3 +134,77 @@ def test_strength_to_dict_keys():
     assert "interact_strength__salt_bridge__sum" in d
     assert "interact_strength__salt_bridge__count" in d
     assert "interact_strength__weighted_hbond_energy" in d
+
+
+# ---- Codex review: NaN / edge-case regression tests --------------------
+
+
+def test_strength_nan_hbond_energy_is_zero():
+    """A NaN hbond energy must NOT poison the aggregate sum (codex review)."""
+    nan_hb = {"donor_res": 10, "donor_h_atom": "HD1", "donor_heavy_atom": "ND1",
+              "donor_name3": "HIS", "acceptor_res": 25, "acceptor_atom": "OD1",
+              "acceptor_name3": "ASP", "energy": float("nan")}
+    res = interaction_strengths(_make_interactions(hbonds=[nan_hb]))
+    assert math.isfinite(res.by_type_strength_sum["hbond"])
+    assert res.by_type_strength_sum["hbond"] == 0.0
+    assert math.isfinite(res.weighted_hbond_energy)
+    # the energy is NaN so it shouldn't add to the weighted sum either
+    assert res.weighted_hbond_energy == 0.0
+
+
+def test_strength_positive_hbond_energy_is_zero():
+    """Repulsive (positive) hbond energy → 0 strength."""
+    pos_hb = {"donor_res": 1, "donor_h_atom": "HD1", "donor_heavy_atom": "ND1",
+              "donor_name3": "HIS", "acceptor_res": 2, "acceptor_atom": "OD1",
+              "acceptor_name3": "ASP", "energy": +0.5}
+    res = interaction_strengths(_make_interactions(hbonds=[pos_hb]))
+    assert res.by_type_strength_sum["hbond"] == 0.0
+
+
+def test_strength_nan_pi_pi_angle_is_zero():
+    """NaN π-π plane angle must NOT poison the aggregate."""
+    nan_pp = {"res_a": 1, "res_b": 2, "centroid_distance": 4.0,
+              "name3_a": "F", "name3_b": "Y",
+              "plane_angle_deg": float("nan"), "geometry": "stacked"}
+    res = interaction_strengths(_make_interactions(pi_pi=[nan_pp]))
+    assert math.isfinite(res.by_type_strength_sum["pi_pi"])
+    assert res.by_type_strength_sum["pi_pi"] == 0.0
+
+
+def test_strength_negative_pi_pi_angle_works():
+    """Negative angle (rotation in either direction) gives same strength as positive."""
+    pp_pos = {"res_a": 1, "res_b": 2, "centroid_distance": 4.0,
+              "name3_a": "F", "name3_b": "Y",
+              "plane_angle_deg": 30.0, "geometry": "tilted"}
+    pp_neg = {**pp_pos, "res_a": 3, "res_b": 4, "plane_angle_deg": -30.0}
+    res = interaction_strengths(_make_interactions(pi_pi=[pp_pos, pp_neg]))
+    s_pos = res.per_residue_strength_by_type[1]["pi_pi"]
+    s_neg = res.per_residue_strength_by_type[3]["pi_pi"]
+    assert s_pos == pytest.approx(s_neg, rel=1e-6)
+
+
+def test_strength_partial_geometry_override_keeps_d0():
+    """Codex review: shallow merge dropped d0 when caller overrode only sigma."""
+    sb = {"pos_res": 1, "neg_res": 2, "distance": 3.0,
+          "pos_name3": "K", "pos_atom": "NZ",
+          "neg_name3": "E", "neg_atom": "OE1"}
+    res_default = interaction_strengths(_make_interactions(salt_bridges=[sb]))
+    # Override sigma only — d0 should stay at 3.0 (the default), so distance
+    # 3.0 still scores 1.0 even with a tighter sigma.
+    res_overridden = interaction_strengths(
+        _make_interactions(salt_bridges=[sb]),
+        geometry={"salt_bridge": {"sigma": 0.2}},
+    )
+    assert res_default.by_type_strength_sum["salt_bridge"] == pytest.approx(1.0)
+    assert res_overridden.by_type_strength_sum["salt_bridge"] == pytest.approx(1.0)
+
+
+def test_strength_distance_zero_salt_bridge():
+    """Zero-distance is finite and scores below 1 (further from d0=3.0)."""
+    sb = {"pos_res": 1, "neg_res": 2, "distance": 0.0,
+          "pos_name3": "K", "pos_atom": "NZ",
+          "neg_name3": "E", "neg_atom": "OE1"}
+    res = interaction_strengths(_make_interactions(salt_bridges=[sb]))
+    s = res.by_type_strength_sum["salt_bridge"]
+    assert math.isfinite(s)
+    assert 0.0 < s < 1.0  # distance 0 is far from d0=3 in (d-d0)/sigma terms
