@@ -1,7 +1,18 @@
-"""Chemical interaction detection: hbonds, salt bridges, pi-pi, pi-cation.
+"""Chemical interaction detection + strength-weighted scoring.
 
-All metrics are derived from a single pose; no scorefile dependence.
-Output is a list of dicts (one row per interaction) plus aggregate counts.
+Detects (binary):
+- hbonds (PyRosetta HBondSet, with energies in kcal/mol).
+- salt bridges (positive sidechain N within cutoff of negative carboxylate O).
+- π-π (aromatic ring centroid distance + plane angle: stacked / tilted / t_shape).
+- π-cation (aromatic ring centroid within cutoff of cation atom).
+
+Strength layer (``interaction_strengths()``):
+- Per detected interaction, compute a soft strength using
+  ``exp(-(d - d0)^2 / (2 σ^2))`` with type-specific d0 and σ
+  (chosen so a typical optimal interaction scores ≈ 1.0 and weak
+  interactions decay smoothly to ~0).
+- Aggregate to per-residue and per-type rollups, suitable as
+  Pareto objectives, MH energy components, or ML features.
 
 PyRosetta-bound; run inside pyrosetta.sif.
 """
@@ -10,7 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 import numpy as np
 
@@ -236,4 +247,148 @@ def _detect_pi_cation(pose, rings: list[dict], cutoff: float) -> list[dict]:
     return out
 
 
-__all__ = ["InteractionsResult", "chemical_interactions"]
+# ---------------------------------------------------------------------------
+# Strength-weighted layer (no extra deps)
+# ---------------------------------------------------------------------------
+
+
+# Canonical (mean, sigma) per interaction type, in Å, picked so a typical
+# optimal interaction scores ≈ 1.0 (Gaussian centered on d0). The "strength"
+# of a detected interaction at distance d is ``exp(-(d - d0)^2 / (2 σ^2))``.
+# σ values are deliberately permissive (~ half the canonical cutoff) so the
+# decay is gentle rather than a step.
+INTERACTION_GEOMETRY = {
+    "hbond":         {"d0": 2.9, "sigma": 0.35},  # H...A distance
+    "salt_bridge":   {"d0": 3.0, "sigma": 0.50},  # N...O distance
+    "pi_pi":         {"d0": 4.0, "sigma": 0.80},  # ring centroid distance
+    "pi_cation":     {"d0": 4.0, "sigma": 0.80},  # centroid...cation
+}
+
+
+@dataclass
+class InteractionStrengthResult:
+    """Strength-weighted aggregation of an InteractionsResult."""
+
+    by_type_strength_sum: dict[str, float] = field(default_factory=dict)
+    by_type_count: dict[str, int] = field(default_factory=dict)
+    per_residue_strength: dict[int, float] = field(default_factory=dict)
+    per_residue_strength_by_type: dict[int, dict[str, float]] = field(default_factory=dict)
+    weighted_hbond_energy: float = 0.0  # Σ -energy_i × strength_i
+    rows: list[dict] = field(default_factory=list)  # per-interaction with strength
+
+    def to_dict(self, prefix: str = "interact_strength__") -> dict[str, float | int]:
+        out: dict[str, float | int] = {}
+        for typ, s in self.by_type_strength_sum.items():
+            out[f"{prefix}{typ}__sum"] = s
+        for typ, n in self.by_type_count.items():
+            out[f"{prefix}{typ}__count"] = n
+        out[f"{prefix}weighted_hbond_energy"] = self.weighted_hbond_energy
+        return out
+
+
+def _gauss_strength(d: float, d0: float, sigma: float) -> float:
+    if not np.isfinite(d):
+        return 0.0
+    z = (d - d0) / max(sigma, 1e-6)
+    return float(np.exp(-0.5 * z * z))
+
+
+def interaction_strengths(
+    interactions: "InteractionsResult",
+    geometry: Optional[dict] = None,
+    pi_pi_angle_factor: bool = True,
+) -> InteractionStrengthResult:
+    """Compute strength-weighted scores from binary detection results.
+
+    Args:
+        interactions: result from ``chemical_interactions(pdb)``.
+        geometry: override default ``INTERACTION_GEOMETRY``.
+        pi_pi_angle_factor: when True, multiplies π-π strength by an
+            angle factor that down-weights "tilted" geometries (peaks at
+            stacked 0° and t-shape 90°, half-strength at 45°).
+    """
+    geom = {**INTERACTION_GEOMETRY, **(geometry or {})}
+
+    by_type_sum: dict[str, float] = {k: 0.0 for k in geom}
+    by_type_count: dict[str, int] = {k: 0 for k in geom}
+    per_residue_sum: dict[int, float] = {}
+    per_residue_by_type: dict[int, dict[str, float]] = {}
+    rows: list[dict] = []
+    weighted_hbond_e = 0.0
+
+    def _add_per_residue(resno: int, typ: str, strength: float) -> None:
+        per_residue_sum[resno] = per_residue_sum.get(resno, 0.0) + strength
+        per_residue_by_type.setdefault(resno, {}).setdefault(typ, 0.0)
+        per_residue_by_type[resno][typ] += strength
+
+    # Hbonds — distance from acceptor xyz to donor heavy atom xyz isn't
+    # available in the dict (we have indices but not coords); use the
+    # Rosetta hbond energy as a proxy when present, mapped through a
+    # softplus so very negative energies score ~1 and 0 → 0.
+    for h in interactions.hbonds:
+        # Map Rosetta hbond energy (kcal/mol, typically -2..0) to (0, 1].
+        # 1 / (1 + exp(2 + 4*e)) — at e = -2: ≈ 0.5; at e = -3: ≈ 0.99.
+        e = float(h.get("energy", 0.0))
+        s = 1.0 / (1.0 + np.exp(2.0 + 4.0 * e))
+        s = float(s)
+        by_type_sum["hbond"] += s
+        by_type_count["hbond"] += 1
+        weighted_hbond_e += -e * s  # bigger absolute energy → bigger weighted total
+        for resno in (h["donor_res"], h["acceptor_res"]):
+            _add_per_residue(resno, "hbond", s)
+        rows.append({"type": "hbond", "strength": s, **h})
+
+    # Salt bridges
+    for sb in interactions.salt_bridges:
+        d = float(sb["distance"])
+        s = _gauss_strength(d, **geom["salt_bridge"])
+        by_type_sum["salt_bridge"] += s
+        by_type_count["salt_bridge"] += 1
+        for resno in (sb["pos_res"], sb["neg_res"]):
+            _add_per_residue(resno, "salt_bridge", s)
+        rows.append({"type": "salt_bridge", "strength": s, **sb})
+
+    # π-π
+    for pp in interactions.pi_pi:
+        d = float(pp["centroid_distance"])
+        ang = float(pp.get("plane_angle_deg", 0.0))
+        s = _gauss_strength(d, **geom["pi_pi"])
+        if pi_pi_angle_factor:
+            # Aromatic stacking peaks at 0° (face-to-face) and 90° (T-shape);
+            # the bad geometry is the in-between 45° tilted case. Use
+            # 0.5 + 0.5·|cos(2θ)|: 1 at 0°/90°, 0.5 at 45°.
+            ang_factor = 0.5 + 0.5 * abs(np.cos(2.0 * np.deg2rad(ang)))
+            s *= float(ang_factor)
+        by_type_sum["pi_pi"] += s
+        by_type_count["pi_pi"] += 1
+        for resno in (pp["res_a"], pp["res_b"]):
+            _add_per_residue(resno, "pi_pi", s)
+        rows.append({"type": "pi_pi", "strength": s, **pp})
+
+    # π-cation
+    for pc in interactions.pi_cation:
+        d = float(pc["distance"])
+        s = _gauss_strength(d, **geom["pi_cation"])
+        by_type_sum["pi_cation"] += s
+        by_type_count["pi_cation"] += 1
+        for resno in (pc["ring_res"], pc["cation_res"]):
+            _add_per_residue(resno, "pi_cation", s)
+        rows.append({"type": "pi_cation", "strength": s, **pc})
+
+    return InteractionStrengthResult(
+        by_type_strength_sum=by_type_sum,
+        by_type_count=by_type_count,
+        per_residue_strength=per_residue_sum,
+        per_residue_strength_by_type=per_residue_by_type,
+        weighted_hbond_energy=weighted_hbond_e,
+        rows=rows,
+    )
+
+
+__all__ = [
+    "INTERACTION_GEOMETRY",
+    "InteractionsResult",
+    "InteractionStrengthResult",
+    "chemical_interactions",
+    "interaction_strengths",
+]
