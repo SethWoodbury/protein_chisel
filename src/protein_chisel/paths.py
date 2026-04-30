@@ -59,6 +59,15 @@ ESM2_WEIGHTS_DIR = Path("/net/databases/esmfold")  # ESM-2 + ESMFold checkpoints
 # work outside its host environment.
 FOLDSEEK_BIN_IN_SIF = "foldseek"
 
+# fpocket lives in two places, both built from the vendored
+# external/fpocket submodule:
+# - inside esmc.sif at /usr/local/bin/fpocket (auto-discovered via
+#   shutil.which when running inside the sif)
+# - cluster-wide at /net/software/lab/fpocket/bin/fpocket so any user
+#   running outside the sif can call it. tools/fpocket_run resolves
+#   in order: --fpocket_exe, $FPOCKET, shutil.which, this fallback.
+FPOCKET_CLUSTER_BIN = Path("/net/software/lab/fpocket/bin/fpocket")
+
 
 # ---- Cluster scratch / outputs --------------------------------------------
 

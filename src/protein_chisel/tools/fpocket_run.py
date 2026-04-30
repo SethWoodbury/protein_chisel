@@ -85,7 +85,9 @@ def find_fpocket_executable(explicit: Optional[str | Path] = None) -> str:
     Resolution order:
     1. Explicit argument.
     2. ``FPOCKET`` env var.
-    3. ``shutil.which("fpocket")`` on $PATH.
+    3. ``shutil.which("fpocket")`` on $PATH (e.g. inside esmc.sif which
+       has it at /usr/local/bin).
+    4. Cluster-wide install at ``/net/software/lab/fpocket/bin/fpocket``.
     """
     if explicit:
         p = str(Path(explicit).resolve())
@@ -97,10 +99,14 @@ def find_fpocket_executable(explicit: Optional[str | Path] = None) -> str:
     found = shutil.which("fpocket")
     if found:
         return found
+    # Cluster-wide fallback (built from external/fpocket).
+    from protein_chisel.paths import FPOCKET_CLUSTER_BIN
+    if FPOCKET_CLUSTER_BIN.is_file():
+        return str(FPOCKET_CLUSTER_BIN)
     raise RuntimeError(
-        "fpocket binary not found. Install it (apt install fpocket on Ubuntu, "
-        "or build from https://github.com/Discngine/fpocket) and either set "
-        "the FPOCKET env var or pass `fpocket_exe=` to fpocket_run()."
+        "fpocket binary not found. Looked in $FPOCKET, $PATH, and "
+        f"{FPOCKET_CLUSTER_BIN}. Install via "
+        "`cd external/fpocket && make` or use the esmc.sif which bundles it."
     )
 
 
