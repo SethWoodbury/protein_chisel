@@ -137,12 +137,22 @@ FLOWPACKER_GUEST_SOURCE_DIR = Path("/opt/flowpacker")
 FLOWPACKER_WEIGHTS_DIR = Path("/net/databases/lab/flowpacker")
 
 # --- OPUS-Rota5 (Xu 2024, GPL-3 — propagates downstream). README pins
-# python 3.7 + TF 2.4 — almost certainly needs its OWN sibling sif rather
-# than esmc.sif. Confirmed via opus_rota5_install_research.
+# python 3.7 + TF 2.4, but the actual code uses only stable TF 2.x APIs;
+# we run it on python 3.12 + TF 2.18+ inside esmc.sif with TF_USE_LEGACY_KERAS=1
+# for .h5 weight loading. The vendored Rota5/mkdssp/mkdssp ELF is built
+# against boost 1.53 and is unusable on Ubuntu 24.04 -- the wrapper
+# bind-mounts the cluster's modern mkdssp at /net/software/utils/mkdssp
+# and passes it via $OPUS_ROTA5_MKDSSP (run_opus_rota5.py is patched in
+# the sif to honor that env var; see esmc.spec).
 OPUS_ROTA5_SOURCE_DIR = _REPO_ROOT_FROM_PATHS / "external" / "opus_rota5"
-OPUS_ROTA5_SIF = Path("/net/software/containers/users/woodbuse/opus_rota5.sif")
+OPUS_ROTA5_SIF = ESMC_SIF
 OPUS_ROTA5_GUEST_SOURCE_DIR = Path("/opt/opus_rota5")
-OPUS_ROTA5_WEIGHTS_DIR = Path("/net/databases/lab/opus_rota5")
+# Standalone-zip layout: /net/databases/lab/opus_rota5/opus_rota5/Rota5/...
+OPUS_ROTA5_WEIGHTS_DIR = Path("/net/databases/lab/opus_rota5/opus_rota5")
+OPUS_ROTA5_ROTAFORMER_WEIGHTS = OPUS_ROTA5_WEIGHTS_DIR / "Rota5" / "models"
+OPUS_ROTA5_UNET3D_WEIGHTS = OPUS_ROTA5_WEIGHTS_DIR / "Rota5" / "unet3d" / "models"
+# Cluster mkdssp 4.5.5 (modern build, dynamically linked to system libs).
+MKDSSP_BIN = Path("/net/software/utils/mkdssp")
 
 # --- MolProbity rotalyze via cctbx-base — statistical Top8000 KDE scorer
 # complementary to Rosetta fa_dun. cctbx-base pip-installs into esmc.sif.
