@@ -250,8 +250,12 @@ def pippack_score(
         if pack_res.out_pdb_path != decoy_pdb:
             shutil.move(pack_res.out_pdb_path, decoy_pdb)
 
-        out_pkl = workdir / "assess.pkl"
-
+        # assess_packing.py ALWAYS writes its output pickle into
+        # `decoy_dir/<out_filename>.pkl` (positional) -- the path we pass
+        # via `--out_filename` is just the basename, not a full path.
+        # Use a basename here so `decoy_dir/packing_stats.pkl` is the
+        # expected output location.
+        out_basename = "chisel_assess"
         call = (
             esmc_call(nv=False)  # assess_packing is CPU-only
             .with_bind(str(workdir))
@@ -259,22 +263,19 @@ def pippack_score(
         argv = [
             "python", str(PIPPACK_GUEST_SOURCE_DIR / "assess_packing.py"),
             str(native_dir), str(decoy_dir),
-            "--out_filename", str(out_pkl.with_suffix("")),
-            "--per_aatype",
+            "--out_filename", out_basename,
         ]
         LOGGER.info("running assess_packing: %s", " ".join(argv))
         t0 = time.perf_counter()
         call.run(argv, timeout=timeout, check=True)
         runtime = time.perf_counter() - t0 + pack_res.runtime_seconds
 
-        # assess_packing writes <out_filename>.pkl with the per-residue
-        # metrics. Parse it.
+        out_pkl = decoy_dir / f"{out_basename}.pkl"
         if not out_pkl.is_file():
-            # Some versions write .pkl without our explicit suffix.
-            pkls = list(workdir.glob("assess*"))
+            pkls = list(decoy_dir.glob("*.pkl"))
             if not pkls:
                 raise RuntimeError(
-                    f"assess_packing wrote no pkl under {workdir}"
+                    f"assess_packing wrote no pkl under {decoy_dir}"
                 )
             out_pkl = pkls[0]
 
@@ -291,67 +292,79 @@ def _summarize_assess_payload(
 ) -> PIPPackScoreResult:
     """Convert assess_packing.py's pickle into a PIPPackScoreResult.
 
-    The pickle layout depends on PIPPack's commit, but typically contains
-    a per-tag dict with 'chi_mae' (per-residue per-chi tensor in degrees),
-    'rotamer_recovery' (per-residue 0/1), 'sidechain_rmsd' (per-residue),
-    'n_clashes' (scalar). We collapse the single-tag case here.
+    Without `--per_aatype`, assess_packing.py's `summarize()` produces::
+
+        {
+          "all": {           # whole-protein bucket
+              "chi_mae":      np.array([4]),    # per-chi, in degrees
+              "mean_rr":      float,            # rotamer recovery (frac)
+              "mean_rmsd":    float,            # sidechain RMSD (Angstrom)
+              "num_residues": int,
+              "num_rotamers": int,
+              "num_chi":      np.array([4]),
+              "num_sc":       int,
+          },
+          "core":    {... same shape, residues with high centrality ...},
+          "surface": {... same shape, residues with low centrality ...},
+          "clash_info": {tol: {"num_clashes": float, "loss_avg": float}},
+          "unclosed_pro_pct": float,
+        }
+
+    We surface the "all" bucket as the headline, plus clash counts.
     """
     import numpy as np
     import pandas as pd
 
-    # Some versions return {tag: {...}}; some flatten. Support both.
-    if isinstance(payload, dict) and any(
-        isinstance(v, dict) and "chi_mae" in v for v in payload.values()
-    ):
-        # Multi-tag: take the first tag (we only ever pass one decoy_dir).
-        only_tag = next(iter(payload.values()))
-        d = only_tag
+    if not isinstance(payload, dict):
+        return PIPPackScoreResult(
+            per_residue_df=pd.DataFrame(), runtime_seconds=runtime_seconds,
+        )
+
+    # The "all" key is always present (per_aatype=False puts it at top
+    # level; per_aatype=True puts it inside each aatype dict, but we
+    # don't pass --per_aatype so it's at top level).
+    all_bucket = payload.get("all")
+    if not isinstance(all_bucket, dict):
+        # Not the layout we expect; bail with empty result.
+        return PIPPackScoreResult(
+            per_residue_df=pd.DataFrame(), runtime_seconds=runtime_seconds,
+        )
+
+    chi_mae_per_chi = np.asarray(all_bucket.get("chi_mae", []), dtype=float)
+    if chi_mae_per_chi.size != 4:
+        chi_mae_per_chi = np.full(4, float("nan"))
+
+    n_residues = int(all_bucket.get("num_residues", 0) or 0)
+    rotamer_recovery = float(all_bucket.get("mean_rr", 0.0) or 0.0)
+    mean_rmsd = float(all_bucket.get("mean_rmsd", 0.0) or 0.0)
+
+    # Clash totals across all tolerances. Take the median tolerance (0.9)
+    # for the headline n_clashes; loss_avg is also useful but not surfaced.
+    clash_info = payload.get("clash_info", {}) or {}
+    if 0.9 in clash_info:
+        n_clashes = int(clash_info[0.9].get("num_clashes", 0) or 0)
+    elif clash_info:
+        # Pick the first entry deterministically.
+        first = next(iter(clash_info.values()))
+        n_clashes = int(first.get("num_clashes", 0) or 0)
     else:
-        d = payload
+        n_clashes = 0
 
-    # chi_mae is shape (N, 4) in degrees (NaN for residues with fewer chis).
-    chi_mae = np.asarray(d.get("chi_mae", []), dtype=float)
-    rotamer_recovery = np.asarray(d.get("rotamer_recovery", []), dtype=float)
-    sidechain_rmsd = np.asarray(d.get("sidechain_rmsd", []), dtype=float)
-    n_clashes = int(d.get("n_clashes", 0) or 0)
-
-    rows = []
-    n_res = chi_mae.shape[0] if chi_mae.ndim == 2 else 0
-    for i in range(n_res):
-        row = {"resseq": i + 1}  # assess_packing doesn't preserve resseq
-        for k in range(min(4, chi_mae.shape[1] if chi_mae.ndim == 2 else 0)):
-            row[f"chi{k+1}_mae"] = (
-                float(chi_mae[i, k]) if not np.isnan(chi_mae[i, k]) else None
-            )
-        if rotamer_recovery.size > i:
-            row["recovered"] = bool(rotamer_recovery[i])
-        if sidechain_rmsd.size > i:
-            row["sidechain_rmsd"] = float(sidechain_rmsd[i])
-        rows.append(row)
-    df = pd.DataFrame(rows)
-
-    def _safe_mean(arr):
-        if arr.size == 0:
-            return 0.0
-        m = float(np.nanmean(arr))
-        return m if not np.isnan(m) else 0.0
-
-    chi_mae_per_chi = []
-    if chi_mae.ndim == 2 and chi_mae.shape[1] == 4:
-        chi_mae_per_chi = [_safe_mean(chi_mae[:, k]) for k in range(4)]
-    else:
-        chi_mae_per_chi = [0.0] * 4
+    def _safe(v):
+        v = float(v) if v is not None else 0.0
+        return 0.0 if (v != v) else v  # NaN -> 0
 
     return PIPPackScoreResult(
-        per_residue_df=df,
-        n_residues_scored=int(n_res),
-        mean_chi_mae=_safe_mean(chi_mae),
-        chi1_mae=chi_mae_per_chi[0],
-        chi2_mae=chi_mae_per_chi[1],
-        chi3_mae=chi_mae_per_chi[2],
-        chi4_mae=chi_mae_per_chi[3],
-        rotamer_recovery=_safe_mean(rotamer_recovery),
-        mean_sidechain_rmsd=_safe_mean(sidechain_rmsd),
+        # No per-residue df from assess_packing's aggregated summary.
+        per_residue_df=pd.DataFrame(),
+        n_residues_scored=n_residues,
+        mean_chi_mae=_safe(np.nanmean(chi_mae_per_chi)),
+        chi1_mae=_safe(chi_mae_per_chi[0]),
+        chi2_mae=_safe(chi_mae_per_chi[1]),
+        chi3_mae=_safe(chi_mae_per_chi[2]),
+        chi4_mae=_safe(chi_mae_per_chi[3]),
+        rotamer_recovery=rotamer_recovery,
+        mean_sidechain_rmsd=mean_rmsd,
         n_clashes=n_clashes,
         runtime_seconds=runtime_seconds,
     )

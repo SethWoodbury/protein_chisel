@@ -134,7 +134,7 @@ ATTNPACKER_WEIGHTS_DIR = Path("/net/databases/lab/attnpacker")
 FLOWPACKER_SOURCE_DIR = _REPO_ROOT_FROM_PATHS / "external" / "flowpacker"
 FLOWPACKER_SIF = ESMC_SIF
 FLOWPACKER_GUEST_SOURCE_DIR = Path("/opt/flowpacker")
-FLOWPACKER_WEIGHTS_DIR = Path("/net/databases/lab/flowpacker")
+FLOWPACKER_WEIGHTS_DIR = Path("/net/databases/lab/flowpacker/checkpoints")
 
 # --- OPUS-Rota5 (Xu 2024, GPL-3 — propagates downstream). README pins
 # python 3.7 + TF 2.4, but the actual code uses only stable TF 2.x APIs;
@@ -151,8 +151,16 @@ OPUS_ROTA5_GUEST_SOURCE_DIR = Path("/opt/opus_rota5")
 OPUS_ROTA5_WEIGHTS_DIR = Path("/net/databases/lab/opus_rota5/opus_rota5")
 OPUS_ROTA5_ROTAFORMER_WEIGHTS = OPUS_ROTA5_WEIGHTS_DIR / "Rota5" / "models"
 OPUS_ROTA5_UNET3D_WEIGHTS = OPUS_ROTA5_WEIGHTS_DIR / "Rota5" / "unet3d" / "models"
+# library.pkl ships only with the standalone (not the github source).
+# Bind it as a single file over /opt/opus_rota5/Rota5/unet3d/library.pkl.
+OPUS_ROTA5_UNET3D_LIBRARY_PKL = OPUS_ROTA5_WEIGHTS_DIR / "Rota5" / "unet3d" / "library.pkl"
 # Cluster mkdssp 4.5.5 (modern build, dynamically linked to system libs).
 MKDSSP_BIN = Path("/net/software/utils/mkdssp")
+# OPUS-Rota5's mk_ss parser expects an older DSSP output layout (3-token
+# lines with the SS code at [2]); the modern mkdssp emits a different
+# preamble + column-aligned residue records. mkdssp_for_rota5.sh wraps
+# mkdssp 4.5.5 + reformats output to fit OPUS-Rota5's parser.
+MKDSSP_FOR_OPUS_ROTA5 = Path("/net/databases/lab/opus_rota5/mkdssp_for_rota5.sh")
 
 # --- MolProbity rotalyze via cctbx-base — statistical Top8000 KDE scorer
 # complementary to Rosetta fa_dun. cctbx-base pip-installs into esmc.sif.
@@ -165,6 +173,9 @@ MKDSSP_BIN = Path("/net/software/utils/mkdssp")
 MOLPROBITY_DIR = Path("/net/databases/lab/molprobity")
 MOLPROBITY_MONOMERS_DIR = MOLPROBITY_DIR / "monomers"
 MOLPROBITY_CHEM_DATA_DIR = MOLPROBITY_DIR / "chem_data"
+# libcifpp data: components.cif (CCD) + mmcif_pdbx.dic + mmcif_ma.dic.
+# Required by mkdssp 4.5.5 to validate residue compounds at parse time.
+MOLPROBITY_LIBCIFPP_DIR = MOLPROBITY_DIR / "libcifpp"
 # The guest path inside esmc.sif where chem_data must appear for cctbx
 # to find it via libtbx.env.find_in_repositories('chem_data/rotarama_data').
 MOLPROBITY_CHEM_DATA_GUEST = Path("/opt/esmc/chem_data")

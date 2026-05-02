@@ -72,8 +72,11 @@ def opus_rota5_pack(
 
     from protein_chisel.paths import (
         MKDSSP_BIN,
+        MKDSSP_FOR_OPUS_ROTA5,
+        MOLPROBITY_LIBCIFPP_DIR,
         OPUS_ROTA5_GUEST_SOURCE_DIR,
         OPUS_ROTA5_ROTAFORMER_WEIGHTS,
+        OPUS_ROTA5_UNET3D_LIBRARY_PKL,
         OPUS_ROTA5_UNET3D_WEIGHTS,
         OPUS_ROTA5_WEIGHTS_DIR,
     )
@@ -92,22 +95,27 @@ def opus_rota5_pack(
 
     workdir = Path(tempfile.mkdtemp(prefix="chisel_opus_rota5_"))
     try:
-        # OPUS-Rota5 reads .bb files (backbone-only PDB-format). The PDB
-        # parser tolerates a .pdb input fine, so we just symlink with a
-        # .bb extension to match the upstream's filename pattern (the
-        # output filename derives from the input stem).
+        # OPUS-Rota5 reads .bb files (backbone-only PDB-format). mkdssp
+        # 4.5.5 chokes on non-canonical HETATM ligands (e.g. YYE) when
+        # the libcifpp components.cif isn't available, so we strip
+        # HETATM records and any non-standard residues before staging
+        # -- OPUS-Rota5 only needs the protein backbone anyway.
         input_dir = workdir / "input"
         tmp_dir = workdir / "tmp_files"
         out_pred_dir = workdir / "predictions"
         for d in (input_dir, tmp_dir, out_pred_dir):
             d.mkdir()
 
-        bb_link = input_dir / f"{pdb_path.stem}.bb"
-        bb_link.symlink_to(pdb_path)
+        # mkdssp 4.5.5 autodetects input format from filename extension --
+        # ".bb" sends it down the mmCIF path, which fails. Use ".pdb" to
+        # force PDB-format input parsing. The downstream OPUS-Rota5 code
+        # uses splitext-style stem naming, so ".pdb" is safe.
+        bb_path = input_dir / f"{pdb_path.stem}.pdb"
+        _write_protein_only_pdb(pdb_path, bb_path)
 
         # bb_list: one absolute path per line.
         bb_list = workdir / "bb_list"
-        bb_list.write_text(f"{bb_link}\n")
+        bb_list.write_text(f"{bb_path}\n")
 
         # Bind weights over the empty model dirs in /opt/opus_rota5, plus
         # the cluster mkdssp + workdir + input.
@@ -117,18 +125,35 @@ def opus_rota5_pack(
             .with_bind(str(input_dir))
             # mkdssp 4.5.5 (modern, dynamically linked to system libs)
             .with_bind(str(MKDSSP_BIN.parent))
+            # mkdssp_for_rota5.sh wrapper (reformats mkdssp 4.5.5 output
+            # to the older DSSP layout that OPUS-Rota5's mk_ss parser
+            # expects).
+            .with_bind(str(MKDSSP_FOR_OPUS_ROTA5.parent))
             # 3D-UNet weights (3 models)
             .with_bind(
                 str(OPUS_ROTA5_UNET3D_WEIGHTS),
                 str(OPUS_ROTA5_GUEST_SOURCE_DIR / "Rota5" / "unet3d" / "models"),
+            )
+            # library.pkl is only in the standalone (not in the github source);
+            # bind as a single-file overlay so unet.py:_load_library finds it.
+            .with_bind(
+                str(OPUS_ROTA5_UNET3D_LIBRARY_PKL),
+                str(OPUS_ROTA5_GUEST_SOURCE_DIR / "Rota5" / "unet3d" / "library.pkl"),
             )
             # RotaFormer weights (3 models)
             .with_bind(
                 str(OPUS_ROTA5_ROTAFORMER_WEIGHTS),
                 str(OPUS_ROTA5_GUEST_SOURCE_DIR / "Rota5" / "models"),
             )
+            # libcifpp data dir (needed by mkdssp 4.5.5 to validate
+            # residue compounds against the CCD components.cif).
+            .with_bind(str(MOLPROBITY_LIBCIFPP_DIR))
             .with_env(
-                OPUS_ROTA5_MKDSSP=str(MKDSSP_BIN),
+                # Use the mkdssp_for_rota5.sh wrapper -- mk_ss expects
+                # the older DSSP layout (3-token rows with SS code at
+                # index [2]); the wrapper post-processes mkdssp 4.5.5
+                # output to fit that contract.
+                OPUS_ROTA5_MKDSSP=str(MKDSSP_FOR_OPUS_ROTA5),
                 OPUS_ROTA5_BB_LIST=str(bb_list),
                 OPUS_ROTA5_NUM_CPU=str(num_cpu),
                 OPUS_ROTA5_TMP_DIR=str(tmp_dir),
@@ -137,14 +162,31 @@ def opus_rota5_pack(
                 # need legacy Keras to load.
                 TF_USE_LEGACY_KERAS="1",
                 TF_CPP_MIN_LOG_LEVEL="2",  # silence INFO + WARN; show ERROR
+                LIBCIFPP_DATA_DIR=str(MOLPROBITY_LIBCIFPP_DIR),
             )
         )
 
-        # Run the patched run_opus_rota5.py.
-        argv = [
-            "python",
-            str(OPUS_ROTA5_GUEST_SOURCE_DIR / "run_opus_rota5.py"),
-        ]
+        # Run the patched run_opus_rota5.py. Two things to set up:
+        #   1. cd /opt/opus_rota5  -- the script uses relative paths like
+        #      ./Rota5/unet3d/models/model_1.h5 to load weights.
+        #   2. Stage libdevice.10.bc into the layout XLA expects
+        #      (<dir>/nvvm/libdevice/libdevice.10.bc). The cuda:12.8.1-runtime
+        #      base doesn't ship the CUDA toolkit, but Triton does -- we
+        #      symlink from there into a /tmp staging dir and tell XLA via
+        #      XLA_FLAGS=--xla_gpu_cuda_data_dir.
+        triton_libdevice = (
+            "/opt/esmc/lib/python3.12/site-packages/triton/backends/nvidia"
+            "/lib/libdevice.10.bc"
+        )
+        bash = (
+            f"set -e && "
+            f"mkdir -p /tmp/xla_cuda/nvvm/libdevice && "
+            f"ln -sf {triton_libdevice} /tmp/xla_cuda/nvvm/libdevice/libdevice.10.bc && "
+            f"export XLA_FLAGS='--xla_gpu_cuda_data_dir=/tmp/xla_cuda' && "
+            f"cd {OPUS_ROTA5_GUEST_SOURCE_DIR} && "
+            f"python run_opus_rota5.py"
+        )
+        argv = ["bash", "-c", bash]
         LOGGER.info("running OPUS-Rota5 on %s", pdb_path.name)
         t0 = time.perf_counter()
         result = call.run(argv, timeout=timeout, check=True)
@@ -184,6 +226,43 @@ def opus_rota5_pack(
         )
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+_STANDARD_AA_3 = {
+    "ALA", "CYS", "ASP", "GLU", "PHE", "GLY", "HIS", "ILE", "LYS", "LEU",
+    "MET", "ASN", "PRO", "GLN", "ARG", "SER", "THR", "VAL", "TRP", "TYR",
+}
+
+
+def _write_protein_only_pdb(src: Path, dst: Path) -> None:
+    """Strip HETATMs + non-standard residues from a PDB.
+
+    mkdssp 4.5.5 (the modern dynamically-linked binary at
+    /net/software/utils/mkdssp) consults a CCD components.cif at parse
+    time to validate non-standard residues like 'YYE' and bombs out
+    when it can't find them. OPUS-Rota5 only needs the protein backbone,
+    so we drop everything except canonical amino acid ATOM records.
+
+    We also prepend a synthetic ``HEADER`` line so mkdssp's libcifpp
+    auto-format-detection picks PDB rather than mmCIF (it sniffs file
+    contents, not just the .pdb extension).
+    """
+    with open(src, "r") as fh_in, open(dst, "w") as fh_out:
+        fh_out.write(
+            "HEADER    PROTEIN                                 "
+            "01-JAN-00   XXXX              \n"
+        )
+        for line in fh_in:
+            if line.startswith("ATOM  "):
+                resname = line[17:20].strip()
+                if resname in _STANDARD_AA_3:
+                    fh_out.write(line)
+            elif line.startswith("TER ") or line.startswith("TER\n"):
+                fh_out.write(line)
+            elif line.startswith("END"):
+                fh_out.write(line)
+            # Drop HETATM, REMARK, MODEL, etc. -- mkdssp doesn't need them
+            # and CONECT/REMARK lines can confuse the parser.
 
 
 __all__ = ["OpusRota5PackResult", "opus_rota5_pack"]

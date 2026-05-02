@@ -91,6 +91,51 @@ def _stage_pdb_for_flowpacker(
     return folder
 
 
+def _write_flowpacker_config(
+    out_path: Path,
+    *,
+    test_path: str,
+    ckpt: str,
+    conf_ckpt: Optional[str],
+) -> None:
+    """Write a base.yaml that FlowPacker's load_config will accept.
+
+    sampler_pdb.py / likelihood.py have argparse CLIs that don't accept
+    dotted overrides -- all configuration goes through the YAML. We
+    write a minimal config matching the upstream schema with our
+    overrides for test_path / ckpt / conf_ckpt.
+    """
+    conf_line = (
+        f"conf_ckpt: '{conf_ckpt}'\n" if conf_ckpt else "conf_ckpt:\n"
+    )
+    out_path.write_text(
+        "mode: vf\n"
+        "\n"
+        "data:\n"
+        "  data: bc40\n"
+        "  train_path:\n"
+        "  cluster_path:\n"
+        f"  test_path: '{test_path}'\n"
+        "  min_length: 40\n"
+        "  max_length: 512\n"
+        "  edge_type: knn\n"
+        "  max_radius: 16.0\n"
+        "  max_neighbors: 30\n"
+        "\n"
+        f"ckpt: '{ckpt}'\n"
+        f"{conf_line}"
+        "\n"
+        "sample:\n"
+        "  batch_size: 1\n"
+        "  n_samples: 1\n"
+        "  use_ema: True\n"
+        "  eps: 2.0e-3\n"
+        "  save_trajectory: False\n"
+        "  coeff: 5.0\n"
+        "  num_steps: 10\n"
+    )
+
+
 def flowpacker_pack(
     pdb_path: str | Path,
     out_dir: str | Path,
@@ -131,17 +176,24 @@ def flowpacker_pack(
         input_folder = _stage_pdb_for_flowpacker(pdb_path, workdir)
         run_name = f"chisel_run_{int(time.time())}"
 
-        # FlowPacker reads relative paths from `config/inference/base.yaml`,
-        # so we must run with cwd=/opt/flowpacker AND override the
-        # checkpoint paths via Hydra-style CLI overrides (likelihood.py
-        # and sampler_pdb.py both use OmegaConf via load_config).
-        # Bind /net/databases/lab/flowpacker/checkpoints over the empty
-        # /opt/flowpacker/checkpoints directory we created in %post.
-        ckpt_path = (
+        # sampler_pdb.py uses argparse with positional `config name` and
+        # flags `--save_traj/--seed/--use_gt_masks/--inpaint`. It does
+        # NOT accept dotted overrides. The data.test_path / ckpt /
+        # conf_ckpt all come from the YAML config file; we bind a
+        # patched copy of base.yaml over /opt/flowpacker/config/inference/
+        # base.yaml at runtime.
+        patched_yaml = workdir / "base.yaml"
+        ckpt_in_sif = (
             f"/opt/flowpacker/checkpoints/{checkpoint}.pth"
         )
-        conf_ckpt_path = (
-            "/opt/flowpacker/checkpoints/confidence.pth" if use_confidence else "null"
+        conf_ckpt_in_sif = (
+            "/opt/flowpacker/checkpoints/confidence.pth" if use_confidence else None
+        )
+        _write_flowpacker_config(
+            patched_yaml,
+            test_path=str(input_folder),
+            ckpt=ckpt_in_sif,
+            conf_ckpt=conf_ckpt_in_sif,
         )
 
         sif_workdir = "/tmp/flowpacker_run"   # writable scratch inside the sif
@@ -149,22 +201,32 @@ def flowpacker_pack(
             esmc_call(nv=True)
             .with_bind(str(workdir))
             .with_bind(str(FLOWPACKER_WEIGHTS_DIR), str(FLOWPACKER_GUEST_SOURCE_DIR / "checkpoints"))
+            # Override base.yaml with our patched version (file-level bind).
+            .with_bind(
+                str(patched_yaml),
+                str(FLOWPACKER_GUEST_SOURCE_DIR / "config" / "inference" / "base.yaml"),
+            )
         )
 
-        # Drive sampler_pdb.py from our scratch dir (it writes ./samples/)
-        # by symlinking /opt/flowpacker into the scratch and chdir-ing.
-        # Easier: use a tiny bash wrapper.
+        # Drive sampler_pdb.py from a scratch dir (it writes ./samples/
+        # and ./logs/ relative to cwd). Symlink /opt/flowpacker children
+        # into the scratch so the relative `./config/...` paths resolve.
+        # Replace the entry script symlinks with patched copies that pass
+        # weights_only=False to torch.load (PyTorch 2.6 changed the
+        # default to True; FlowPacker checkpoints have non-tensor metadata
+        # and would otherwise fail to load).
+        gt_flag = "--use_gt_masks True" if use_gt_masks else ""
         bash = (
             f"set -e; "
             f"mkdir -p {sif_workdir} && cd {sif_workdir} && "
             f"ln -sf {FLOWPACKER_GUEST_SOURCE_DIR}/* . && "
-            f"python sampler_pdb.py base {run_name} "
-            f"data.test_path={input_folder} "
-            f"ckpt={ckpt_path} "
-            f"{'conf_ckpt=' + conf_ckpt_path if use_confidence else ''} "
-            f"{'use_gt_masks=true' if use_gt_masks else ''} "
-            f"seed={seed}; "
-            # Copy the result PDB out
+            f"rm -f sampler_pdb.py likelihood.py && "
+            f"cp {FLOWPACKER_GUEST_SOURCE_DIR}/sampler_pdb.py . && "
+            f"cp {FLOWPACKER_GUEST_SOURCE_DIR}/likelihood.py . && "
+            f"sed -i 's|torch.load(self.config.ckpt)|torch.load(self.config.ckpt, weights_only=False)|g; "
+            f"s|torch.load(self.config.conf_ckpt)|torch.load(self.config.conf_ckpt, weights_only=False)|g' "
+            f"sampler_pdb.py likelihood.py && "
+            f"python sampler_pdb.py base {run_name} --seed {seed} {gt_flag}; "
             f"cp -r {sif_workdir}/samples/{run_name} {workdir}/output; "
         )
         argv = ["bash", "-c", bash]
@@ -239,23 +301,70 @@ def flowpacker_score(
         input_folder = _stage_pdb_for_flowpacker(pdb_path, workdir)
         run_name = f"chisel_score_{int(time.time())}"
 
+        # Same as flowpacker_pack: bind a patched base.yaml over the
+        # in-sif config so test_path + ckpt point at our paths.
+        patched_yaml = workdir / "base.yaml"
+        _write_flowpacker_config(
+            patched_yaml,
+            test_path=str(input_folder),
+            ckpt=f"/opt/flowpacker/checkpoints/{checkpoint}.pth",
+            conf_ckpt=None,  # likelihood doesn't need confidence model
+        )
+
         sif_workdir = "/tmp/flowpacker_run"
-        ckpt_path = f"/opt/flowpacker/checkpoints/{checkpoint}.pth"
 
         call = (
             esmc_call(nv=True)
             .with_bind(str(workdir))
             .with_bind(str(FLOWPACKER_WEIGHTS_DIR), str(FLOWPACKER_GUEST_SOURCE_DIR / "checkpoints"))
+            .with_bind(
+                str(patched_yaml),
+                str(FLOWPACKER_GUEST_SOURCE_DIR / "config" / "inference" / "base.yaml"),
+            )
         )
+        # After running likelihood.py we convert the torch-saved .pth to
+        # a stdlib-pickle-able dict of numpy arrays + scalars, so the
+        # host wrapper (which has no torch) can read it via pickle.load.
+        # The conversion script writes <workdir>/score.pkl which the
+        # wrapper then reads.
+        convert_py = workdir / "convert_score.py"
+        convert_py.write_text(
+            f"""\
+import pickle
+import sys
+import numpy as np
+import torch
+
+src = '{sif_workdir}/likelihood/{run_name}.pth'
+dst = '{workdir}/score.pkl'
+
+def to_pure(v):
+    if torch.is_tensor(v):
+        return v.detach().cpu().numpy()
+    if isinstance(v, dict):
+        return {{k: to_pure(vv) for k, vv in v.items()}}
+    if isinstance(v, (list, tuple)):
+        return type(v)(to_pure(vv) for vv in v)
+    return v
+
+d = torch.load(src, map_location='cpu', weights_only=False)
+with open(dst, 'wb') as f:
+    pickle.dump(to_pure(d), f)
+print('converted', src, '->', dst)
+""".strip() + "\n"
+        )
+
         bash = (
             f"set -e; "
             f"mkdir -p {sif_workdir} && cd {sif_workdir} && "
             f"ln -sf {FLOWPACKER_GUEST_SOURCE_DIR}/* . && "
-            f"python likelihood.py base {run_name} "
-            f"data.test_path={input_folder} "
-            f"ckpt={ckpt_path} "
-            f"seed={seed}; "
-            f"cp {sif_workdir}/likelihood/{run_name}.pth {workdir}/score.pth; "
+            f"rm -f sampler_pdb.py likelihood.py && "
+            f"cp {FLOWPACKER_GUEST_SOURCE_DIR}/likelihood.py . && "
+            f"sed -i 's|torch.load(self.config.ckpt)|torch.load(self.config.ckpt, weights_only=False)|g; "
+            f"s|torch.load(self.config.conf_ckpt)|torch.load(self.config.conf_ckpt, weights_only=False)|g' "
+            f"likelihood.py && "
+            f"python likelihood.py base {run_name} --seed {seed} && "
+            f"python {convert_py} "
         )
         argv = ["bash", "-c", bash]
 
@@ -264,8 +373,9 @@ def flowpacker_score(
         call.run(argv, timeout=timeout, check=True)
         runtime = time.perf_counter() - t0
 
-        # Parse the .pth (it's a pickle of per-PDB dicts; we only sent one).
-        score_path = workdir / "score.pth"
+        # The conversion script inside the sif wrote a stdlib-pickle file
+        # with all tensors converted to numpy arrays (host has no torch).
+        score_path = workdir / "score.pkl"
         if not score_path.is_file():
             raise RuntimeError(
                 f"FlowPacker likelihood produced no output at {score_path}"

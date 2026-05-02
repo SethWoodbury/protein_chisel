@@ -109,8 +109,11 @@ def _resolve_resource_root(weights_dir: Path) -> Path:
     return unzipped
 
 
-# Inline driver script run inside the sif. Reads pdb_path + RESOURCE_ROOT
-# + out_pdb_path from argv.
+# Inline driver script run inside the sif. Mirrors the
+# `protein_learning/examples/Inference.ipynb` flow: instantiate
+# Inference(model_n_config_root, ...), call infer(pdb_path, ...), then
+# build the predicted Protein via make_predicted_protein and write
+# with .to_pdb(beta=pLDDT).
 _ATTNPACKER_PACK_SCRIPT = r"""
 import os
 import sys
@@ -125,18 +128,27 @@ chunk_size = int(sys.argv[4]) if len(sys.argv) > 4 else 500
 # `protein_learning` package).
 sys.path.insert(0, "/opt/attnpacker")
 
-from protein_learning.models.inference_utils import Inference
+from protein_learning.models.inference_utils import (
+    Inference, make_predicted_protein,
+)
 
 t0 = time.perf_counter()
-runner = Inference(RESOURCE_ROOT=resource_root)
-runner.infer(
+# Inference's first positional arg is the resource root (named
+# `model_n_config_root` in the source). The path layout expected is
+# <root>/models/<name>.tar + <root>/params/<name>.npy.
+runner = Inference(resource_root, use_design_variant=False)
+prediction = runner.infer(
     pdb_path=in_pdb,
-    out_pdb_path=out_pdb,
     chunk_size=chunk_size,
     format=True,
 )
+predicted_protein = make_predicted_protein(
+    model_out=prediction["model_out"],
+    seq=prediction["seq"],
+)
+predicted_protein.to_pdb(out_pdb, beta=prediction["pred_plddt"].squeeze())
 elapsed = time.perf_counter() - t0
-print(f"ATTNPACKER_DONE seconds={elapsed:.2f}")
+print(f"ATTNPACKER_DONE seconds={elapsed:.2f} out={out_pdb}")
 """
 
 
@@ -177,12 +189,25 @@ def attnpacker_pack(
         Path(weights_dir) if weights_dir else ATTNPACKER_WEIGHTS_DIR
     )
 
-    # Resource_root path is on /net/databases/lab; bind-mount into the sif.
+    # AttnPacker's SE(3) transformer caches Clebsch-Gordan basis pickles
+    # at /opt/attnpacker/protein_learning/models/.basis_cache/<rxN>/ and
+    # acquires a `mutex` filelock on first access. /opt is read-only inside
+    # the sif, so we copy the cache to a writable scratch dir and bind
+    # it over the in-sif path.
+    cache_scratch = Path(tempfile.mkdtemp(prefix="chisel_attnpacker_cache_"))
+    src_cache = ATTNPACKER_GUEST_SOURCE_DIR / "protein_learning" / "models" / ".basis_cache"
+    # The host source dir mirrors /opt/attnpacker (vendored as submodule).
+    from protein_chisel.paths import ATTNPACKER_SOURCE_DIR
+    host_cache = ATTNPACKER_SOURCE_DIR / "protein_learning" / "models" / ".basis_cache"
+    if host_cache.is_dir():
+        shutil.copytree(host_cache, cache_scratch / ".basis_cache")
+
     call = (
         esmc_call(nv=True)
         .with_bind(str(pdb_path.parent))
         .with_bind(str(out_pdb_path.parent))
         .with_bind(str(resource_root.parent))
+        .with_bind(str(cache_scratch / ".basis_cache"), str(src_cache))
     )
 
     argv = [
@@ -193,21 +218,24 @@ def attnpacker_pack(
         str(chunk_size),
     ]
     LOGGER.info("running AttnPacker on %s", pdb_path.name)
-    t0 = time.perf_counter()
-    result = call.run(argv, timeout=timeout, check=True)
-    runtime = time.perf_counter() - t0
+    try:
+        t0 = time.perf_counter()
+        result = call.run(argv, timeout=timeout, check=True)
+        runtime = time.perf_counter() - t0
 
-    if not out_pdb_path.is_file():
-        raise RuntimeError(
-            f"AttnPacker exited 0 but didn't write {out_pdb_path}. "
-            f"stdout tail:\n{result.stdout[-2000:]}"
+        if not out_pdb_path.is_file():
+            raise RuntimeError(
+                f"AttnPacker exited 0 but didn't write {out_pdb_path}. "
+                f"stdout tail:\n{result.stdout[-2000:]}"
+            )
+
+        return AttnPackerPackResult(
+            out_pdb_path=out_pdb_path,
+            runtime_seconds=runtime,
+            resource_root=resource_root,
         )
-
-    return AttnPackerPackResult(
-        out_pdb_path=out_pdb_path,
-        runtime_seconds=runtime,
-        resource_root=resource_root,
-    )
+    finally:
+        shutil.rmtree(cache_scratch, ignore_errors=True)
 
 
 def attnpacker_score(

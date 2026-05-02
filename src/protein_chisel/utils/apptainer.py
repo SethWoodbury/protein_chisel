@@ -187,7 +187,7 @@ class ApptainerCall:
             raise RuntimeError(
                 f"apptainer exec failed (exit {proc.returncode}):\n"
                 f"  cmd: {shlex.join(cmd)}\n"
-                f"  stderr: {result.stderr.strip()[:2000]}"
+                f"  stderr: {result.stderr.strip()[-8000:]}"
             )
         return result
 
