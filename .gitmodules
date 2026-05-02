@@ -4,3 +4,18 @@
 [submodule "external/metal-site-prediction"]
 	path = external/metal-site-prediction
 	url = https://github.com/lcbc-epfl/metal-site-prediction
+[submodule "external/faspr"]
+	path = external/faspr
+	url = https://github.com/tommyhuangthu/FASPR.git
+[submodule "external/attnpacker"]
+	path = external/attnpacker
+	url = https://github.com/MattMcPartlon/AttnPacker.git
+[submodule "external/opus_rota5"]
+	path = external/opus_rota5
+	url = https://github.com/OPUS-MaLab/opus_rota5.git
+[submodule "external/pippack"]
+	path = external/pippack
+	url = https://github.com/Kuhlman-Lab/PIPPack.git
+[submodule "external/flowpacker"]
+	path = external/flowpacker
+	url = https://gitlab.com/mjslee0921/flowpacker.git

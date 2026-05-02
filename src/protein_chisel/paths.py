@@ -92,6 +92,74 @@ METAL3D_RUNNER_SCRIPT = (
 )
 
 
+# ---- Sidechain packers + scorers (vendored as submodules) -----------------
+#
+# Each sidechain tool follows the same pattern as ESM-C / fpocket / metal3d:
+#   - source vendored as a git submodule under external/<tool>/
+#   - python runtime (torch, deps) lives inside an apptainer .sif
+#   - heavyweight model weights live at /net/databases/lab/<tool>/, bind-
+#     mounted at runtime so they aren't duplicated per-clone
+#   - a thin protein_chisel wrapper at
+#     src/protein_chisel/tools/sidechain_packing_and_scoring/<tool>_*.py
+#     calls into the sif via apptainer exec
+#
+# All five neural-or-statistical sidechain tools currently ride inside
+# esmc.sif (or a sibling sif when their dep stack conflicts). The
+# decision per tool is documented in the corresponding wrapper module.
+
+# --- FASPR (Huang 2020, MIT). Tiny C++ binary; no sif needed.
+FASPR_SOURCE_DIR = _REPO_ROOT_FROM_PATHS / "external" / "faspr"
+FASPR_CLUSTER_BIN = Path("/net/software/lab/faspr/bin/FASPR")
+FASPR_DUNBRACK_BIN = Path("/net/software/lab/faspr/bin/dun2010bbdep.bin")
+
+# --- PIPPack (Kuhlman lab 2024, MIT). torch + torch_geometric (pure-python,
+# no scatter/sparse/cluster) + lightning + hydra + biopython. Lives in esmc.sif
+# at /opt/pippack. Weights ship with the repo (~100MB, model_weights/).
+PIPPACK_SOURCE_DIR = _REPO_ROOT_FROM_PATHS / "external" / "pippack"
+PIPPACK_SIF = ESMC_SIF                # rides in esmc.sif
+PIPPACK_GUEST_SOURCE_DIR = Path("/opt/pippack")  # path inside the sif
+PIPPACK_WEIGHTS_DIR = Path("/net/databases/lab/pippack/model_weights")
+
+# --- AttnPacker (McPartlon 2023, NO LICENSE — academic use only). The
+# repo recommends python 3.8 + torch 1.11.0; whether it runs on esmc.sif's
+# python 3.12 + torch 2.x is determined by attnpacker_install_research.
+# Weights from Zenodo (record/7713779).
+ATTNPACKER_SOURCE_DIR = _REPO_ROOT_FROM_PATHS / "external" / "attnpacker"
+ATTNPACKER_SIF = ESMC_SIF             # provisional — confirm post-build
+ATTNPACKER_GUEST_SOURCE_DIR = Path("/opt/attnpacker")
+ATTNPACKER_WEIGHTS_DIR = Path("/net/databases/lab/attnpacker")
+
+# --- FlowPacker (Lee 2025, MIT). torch + torch_geometric + e3nn + biotite.
+# Includes a likelihood.py for per-residue scoring.
+FLOWPACKER_SOURCE_DIR = _REPO_ROOT_FROM_PATHS / "external" / "flowpacker"
+FLOWPACKER_SIF = ESMC_SIF
+FLOWPACKER_GUEST_SOURCE_DIR = Path("/opt/flowpacker")
+FLOWPACKER_WEIGHTS_DIR = Path("/net/databases/lab/flowpacker")
+
+# --- OPUS-Rota5 (Xu 2024, GPL-3 — propagates downstream). README pins
+# python 3.7 + TF 2.4 — almost certainly needs its OWN sibling sif rather
+# than esmc.sif. Confirmed via opus_rota5_install_research.
+OPUS_ROTA5_SOURCE_DIR = _REPO_ROOT_FROM_PATHS / "external" / "opus_rota5"
+OPUS_ROTA5_SIF = Path("/net/software/containers/users/woodbuse/opus_rota5.sif")
+OPUS_ROTA5_GUEST_SOURCE_DIR = Path("/opt/opus_rota5")
+OPUS_ROTA5_WEIGHTS_DIR = Path("/net/databases/lab/opus_rota5")
+
+# --- MolProbity rotalyze via cctbx-base — statistical Top8000 KDE scorer
+# complementary to Rosetta fa_dun. cctbx-base pip-installs into esmc.sif.
+# At runtime, rotalyze needs:
+#   - the CCP4 monomer library (env var CLIBD_MON)
+#   - the Top8000 rotarama .pickle cache (libtbx finds via repository path
+#     'chem_data/rotarama_data'). We bind-mount our chem_data over
+#     /opt/esmc/chem_data inside the sif so libtbx.find_in_repositories
+#     locates it.
+MOLPROBITY_DIR = Path("/net/databases/lab/molprobity")
+MOLPROBITY_MONOMERS_DIR = MOLPROBITY_DIR / "monomers"
+MOLPROBITY_CHEM_DATA_DIR = MOLPROBITY_DIR / "chem_data"
+# The guest path inside esmc.sif where chem_data must appear for cctbx
+# to find it via libtbx.env.find_in_repositories('chem_data/rotarama_data').
+MOLPROBITY_CHEM_DATA_GUEST = Path("/opt/esmc/chem_data")
+
+
 # ---- Cluster scratch / outputs --------------------------------------------
 
 SLURM_LOG_DIR = Path.home() / "slurm_logs"
