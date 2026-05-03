@@ -19,3 +19,9 @@
 [submodule "external/flowpacker"]
 	path = external/flowpacker
 	url = https://gitlab.com/mjslee0921/flowpacker.git
+[submodule "external/pocketgen"]
+	path = external/pocketgen
+	url = https://github.com/zaixizhang/PocketGen.git
+[submodule "external/clean"]
+	path = external/clean
+	url = https://github.com/tttianhao/CLEAN.git
