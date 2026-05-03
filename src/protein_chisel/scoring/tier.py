@@ -247,7 +247,11 @@ def evaluate_tiered(
     tier but are logged in ``constraint_failures`` so the caller can
     inspect why a candidate got stuck.
     """
-    cache = cache or InMemoryCache()
+    # Be explicit: JsonlCache.__len__() returns 0 on a fresh instance,
+    # which is falsy, so `cache or InMemoryCache()` would silently swap
+    # the user's persistent cache for an in-memory one. Use `is None`.
+    if cache is None:
+        cache = InMemoryCache()
     extra = extra_params_per_metric or {}
     candidates = list(candidates)
     if not candidates:
@@ -412,11 +416,23 @@ def evaluate_tiered(
         ))
 
     metrics_df = pd.DataFrame(list(metrics_rows.values()))
+    # Ensure constraint_failures has stable canonical columns even when
+    # zero failures occurred -- so to_csv produces a parseable file
+    # (with headers but no rows) instead of zero bytes.
+    canonical_failure_cols = [
+        "candidate_id", "tier_idx", "tier_name", "constraint_column",
+        "constraint_op", "constraint_value", "observed_value",
+        "failure_reason", "description",
+    ]
+    if constraint_failures:
+        cf_df = pd.DataFrame(constraint_failures)
+    else:
+        cf_df = pd.DataFrame(columns=canonical_failure_cols)
     return TierEvaluationResult(
         metrics_df=metrics_df,
         survivors=[c.candidate_id for c in survivors],
         tier_log=tier_log,
-        constraint_failures=pd.DataFrame(constraint_failures),
+        constraint_failures=cf_df,
     )
 
 
