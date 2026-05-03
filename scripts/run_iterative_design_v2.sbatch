@@ -28,6 +28,9 @@ LIG_PARAMS="${LIG_PARAMS:-/home/woodbuse/testing_space/scaffold_optimization/ZZZ
 TARGET_K="${TARGET_K:-50}"
 MIN_HAMMING="${MIN_HAMMING:-3}"
 N_CYCLES="${N_CYCLES:-3}"
+# AAs MPNN should never sample. PTE_i1 has no catalytic Cys, so we
+# exclude C as well as X (UNK) by default. Override per-scaffold.
+OMIT_AA="${OMIT_AA:-CX}"
 
 # Working dir for this job
 TS=$(date +%Y%m%d-%H%M%S)
@@ -93,6 +96,7 @@ apptainer exec --nv \
         --out_root "$WORK_ROOT" \
         --target_k "$TARGET_K" \
         --min_hamming "$MIN_HAMMING" \
-        --cycles "$N_CYCLES"
+        --cycles "$N_CYCLES" \
+        --omit_AA "$OMIT_AA"
 
 echo "=== DONE -- $WORK_DIR ==="

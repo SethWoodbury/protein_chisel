@@ -99,6 +99,12 @@ class CycleConfig:
     sap_max_threshold: float = 15.0
     consensus_threshold: float = 0.85
     consensus_strength: float = 2.0
+    # AAs MPNN may never sample. "X" (UNK) is always omitted by fused_mpnn
+    # convention; everything else is opt-in. Default empty -> no AA-omission.
+    # The PTE_i1 sbatch passes "CX" to also exclude cysteine (no Cys is
+    # catalytic in this scaffold). If your scaffold has a catalytic Cys,
+    # pass "" or list only the ones you actually want to forbid.
+    omit_AA: str = "X"
 
 
 @dataclass
@@ -110,20 +116,26 @@ class IterativeRunConfig:
     fix_remark_666: bool = True
 
 
-def default_cycles() -> list[CycleConfig]:
-    """Three-cycle exploration → exploitation schedule."""
+def default_cycles(omit_AA: str = "X") -> list[CycleConfig]:
+    """Three-cycle exploration → exploitation schedule.
+
+    ``omit_AA`` is the AAs MPNN may never sample, threaded through to
+    every cycle. The default is just "X" (UNK token); pass e.g. "CX" to
+    also forbid cysteine. Catalytic AAs are NOT controlled by this knob
+    — they're frozen by ``--fixed_residues_multi`` regardless.
+    """
     return [
         CycleConfig(
             cycle_idx=0, n_samples=500, sampling_temperature=0.20,
-            net_charge_max=-10.0, sap_max_threshold=15.0,
+            net_charge_max=-10.0, sap_max_threshold=15.0, omit_AA=omit_AA,
         ),
         CycleConfig(
             cycle_idx=1, n_samples=400, sampling_temperature=0.18,
-            net_charge_max=-11.0, sap_max_threshold=13.0,
+            net_charge_max=-11.0, sap_max_threshold=13.0, omit_AA=omit_AA,
         ),
         CycleConfig(
             cycle_idx=2, n_samples=300, sampling_temperature=0.15,
-            net_charge_max=-12.0, sap_max_threshold=12.0,
+            net_charge_max=-12.0, sap_max_threshold=12.0, omit_AA=omit_AA,
         ),
     ]
 
@@ -174,7 +186,7 @@ def stage_sample(
         repack_everything=0,        # CRITICAL: keep catalytic rotamers intact
         pack_side_chains=1,         # write packed PDBs
         ligand_mpnn_use_side_chain_context=1,
-        omit_AA="CX",
+        omit_AA=cycle_cfg.omit_AA,
         # No global bias_AA -- per-residue bias is the whole point.
         extra_flags=(
             "--checkpoint_ligand_mpnn", LMPNN_CKPT,
@@ -870,6 +882,11 @@ def main() -> None:
     p.add_argument("--cycles", type=int, default=3,
                    help="Use the default 3-cycle schedule when 3 (default), "
                         "or override with a single-cycle short test (1).")
+    p.add_argument("--omit_AA", type=str, default="X",
+                   help="AAs MPNN may never sample. Default 'X' (UNK only) -- "
+                        "no canonical AAs are silently forbidden. Pass 'CX' "
+                        "to also exclude cysteine (recommended for scaffolds "
+                        "with no catalytic Cys); add others as needed.")
     args = p.parse_args()
 
     logging.basicConfig(
@@ -915,13 +932,13 @@ def main() -> None:
     LOGGER.info("WT OmpT motif count: %d (filter threshold)", wt_ompt_count)
 
     # ---- Cycle schedule ---------------------------------------------
-    cycles = default_cycles()
+    cycles = default_cycles(omit_AA=args.omit_AA)
     if args.cycles == 1:
         cycles = cycles[:1]   # short-test mode
     elif args.cycles != 3:
         # Honor any positive int by truncating / extending the default schedule.
         cycles = cycles[: max(1, args.cycles)]
-    LOGGER.info("cycle schedule: %d cycles", len(cycles))
+    LOGGER.info("cycle schedule: %d cycles, omit_AA=%r", len(cycles), args.omit_AA)
 
     # ---- Loop cycles ------------------------------------------------
     all_ranked: list[pd.DataFrame] = []
