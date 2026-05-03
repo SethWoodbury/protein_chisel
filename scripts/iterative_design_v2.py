@@ -433,8 +433,10 @@ def stage_seq_filter(
         rejects = out_df.copy()
     survivors.to_csv(out_dir / "survivors_seq.tsv", sep="\t", index=False)
     rejects.to_csv(out_dir / "rejects_seq.tsv", sep="\t", index=False)
-    LOGGER.info("stage_seq_filter: %d / %d passed (charge<%.0f, OmpT<=%d)",
-                 len(survivors), len(out_df), net_charge_max, wt_ompt_count)
+    LOGGER.info(
+        "stage_seq_filter: %d / %d passed (charge<%.0f + expression rules)",
+        len(survivors), len(out_df), net_charge_max,
+    )
     return out_dir / "survivors_seq.tsv"
 
 
