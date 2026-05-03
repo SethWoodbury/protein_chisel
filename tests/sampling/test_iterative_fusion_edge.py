@@ -336,3 +336,55 @@ def test_telemetry_n_eligible_excludes_fixed_positions():
         config=cfg,
     )
     assert telem.n_positions_eligible == 3   # 5 surface - 2 fixed
+
+
+# ----------------------------------------------------------------------
+# protein_resnos for resno-precise telemetry (gap-aware chains)
+# ----------------------------------------------------------------------
+
+
+def test_telemetry_uses_protein_resnos_when_provided():
+    """When the protein chain has resno gaps (e.g. [10, 11, 13, 14, 15]),
+    telemetry should report actual PDB resnos, not array_index+1."""
+    L = 5
+    base = _zero_bias(L)
+    seqs = ["AAAAA"] * 10
+    classes = ["surface"] * L
+    protein_resnos = [10, 11, 13, 14, 15]   # NOT contiguous (12 missing)
+    cfg = IterationBiasConfig(
+        consensus_threshold=0.5, consensus_strength=2.0,
+        only_at_classes=("surface",), max_augmented_fraction=1.0,
+    )
+    out, telem = build_iteration_bias(
+        base, seqs, classes,
+        protein_resnos=protein_resnos,
+        config=cfg,
+    )
+    # Augmented positions should map to PDB resnos via protein_resnos[i]
+    assert telem.augmented_resnos == [10, 11, 13, 14, 15]
+
+
+def test_telemetry_falls_back_to_array_index_plus_one_without_protein_resnos():
+    """When protein_resnos is omitted, telemetry uses i+1 (back-compat)."""
+    L = 4
+    base = _zero_bias(L)
+    seqs = ["AAAA"] * 10
+    cfg = IterationBiasConfig(
+        consensus_threshold=0.5, consensus_strength=2.0,
+        only_at_classes=("surface",), max_augmented_fraction=1.0,
+    )
+    out, telem = build_iteration_bias(
+        base, seqs, ["surface"] * L,
+        config=cfg,
+    )
+    assert telem.augmented_resnos == [1, 2, 3, 4]
+
+
+def test_protein_resnos_wrong_length_raises():
+    L = 5
+    base = _zero_bias(L)
+    with pytest.raises(ValueError):
+        build_iteration_bias(
+            base, ["AAAAA"], ["surface"] * L,
+            protein_resnos=[1, 2, 3],   # length 3 != L=5
+        )

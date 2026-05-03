@@ -85,6 +85,7 @@ def build_iteration_bias(
     survivor_sequences: Sequence[str],
     position_classes: Sequence[str],
     fixed_resnos_zero_indexed: Optional[Sequence[int]] = None,
+    protein_resnos: Optional[Sequence[int]] = None,
     config: Optional[IterationBiasConfig] = None,
 ) -> tuple[np.ndarray, IterationBiasTelemetry]:
     """Augment ``base_bias`` with consensus from ``survivor_sequences``.
@@ -97,6 +98,12 @@ def build_iteration_bias(
       "first_shell", "pocket", "buried", "surface", "ligand").
     - ``fixed_resnos_zero_indexed``: positions to NEVER augment, even
       if they're in ``only_at_classes``. Pass the catalytic indices.
+    - ``protein_resnos``: optional length-L list of PDB resnos for
+      each row of ``base_bias``. When provided, the telemetry's
+      ``augmented_resnos`` field carries actual PDB resnos (correct
+      even when the protein chain has resseq gaps). When omitted,
+      we fall back to ``i + 1`` which equals PDB resno only for
+      gap-free chains.
     """
     cfg = config or IterationBiasConfig()
     if base_bias.ndim != 2 or base_bias.shape[1] != 20:
@@ -105,6 +112,10 @@ def build_iteration_bias(
     if len(position_classes) != L:
         raise ValueError(
             f"position_classes length {len(position_classes)} != L {L}"
+        )
+    if protein_resnos is not None and len(protein_resnos) != L:
+        raise ValueError(
+            f"protein_resnos length {len(protein_resnos)} != L {L}"
         )
 
     out_bias = base_bias.copy()
@@ -133,15 +144,12 @@ def build_iteration_bias(
     top_freq = freqs.max(axis=1)
     top_aa = freqs.argmax(axis=1)
 
-    # Candidate positions: eligible AND top_freq >= threshold
     candidates = np.where(
         eligible_mask & (top_freq >= cfg.consensus_threshold)
     )[0]
 
-    # Cap: never augment more than max_augmented_fraction of L
     cap = int(np.floor(cfg.max_augmented_fraction * L))
     if len(candidates) > cap:
-        # Pick the candidates with highest top_freq (most agreement first)
         order = np.argsort(-top_freq[candidates])
         candidates = candidates[order[:cap]]
         telem.capped = True
@@ -154,7 +162,10 @@ def build_iteration_bias(
 
     for i in candidates:
         out_bias[i, top_aa[i]] += cfg.consensus_strength
-        telem.augmented_resnos.append(int(i + 1))  # 1-indexed for humans
+        if protein_resnos is not None:
+            telem.augmented_resnos.append(int(protein_resnos[i]))
+        else:
+            telem.augmented_resnos.append(int(i + 1))
 
     telem.n_positions_augmented = len(candidates)
     LOGGER.info(

@@ -145,6 +145,67 @@ def default_cycles(omit_AA: str = "X") -> list[CycleConfig]:
 # ----------------------------------------------------------------------
 
 
+def _wt_aa_at_resno(seed_pdb: Path, resnos: Iterable[int], chain: str) -> dict[int, str]:
+    """Return {resno: 1-letter AA} for the seed PDB's chain residues."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from protein_chisel.io.pdb import extract_sequence
+    seq = extract_sequence(seed_pdb, chain=chain)
+    # extract_sequence returns the chain's protein sequence in resno-order
+    # for a gap-free chain. For a gap-containing chain, this would still
+    # return a contiguous string; we'd need a richer parser. PTE_i1 is
+    # gap-free so this works; for new scaffolds the position table is the
+    # canonical source of (resno, AA) and is passed in by the caller.
+    raise NotImplementedError(
+        "use compute_catalytic_neighbor_omit_dict_from_position_table"
+    )
+
+
+def compute_catalytic_neighbor_omit_dict(
+    *,
+    position_table_df,                              # PositionTable.df
+    fixed_resnos: Iterable[int],
+    chain: str = CHAIN,
+    forbid_at_neighbors_of: tuple[str, ...] = ("K", "R"),
+    forbid_aas: str = "KR",
+) -> dict[str, str]:
+    """Build the per-residue omit_AA dict for fused_mpnn.
+
+    For each *fixed* residue whose 1-letter AA is in ``forbid_at_neighbors_of``
+    (catalytic K or R by default), forbid ``forbid_aas`` (default "KR") at
+    the immediately adjacent protein resnos (resno-1 and resno+1) on the
+    same chain. Returns ``{"<chain><resno>": "KR", ...}``.
+
+    Skips neighbors that:
+      - aren't on the same chain
+      - aren't protein residues
+      - are themselves in the fixed/catalytic set (don't constrain catalytic AAs)
+
+    For PTE_i1 with catalytic K157: returns ``{"A156": "KR", "A158": "KR"}``,
+    which forbids K and R at PDB resnos 156 and 158 -> no design can put
+    a K or R adjacent to the catalytic K157, breaking the unsolvable
+    KK-at-157-158 OmpT motif at sample time. Surface residues, no
+    catalytic geometry impact.
+    """
+    fixed_set = set(int(r) for r in fixed_resnos)
+    df = position_table_df
+    prot = df[(df["is_protein"]) & (df["chain"] == chain)].sort_values("resno")
+    resno_to_aa = dict(zip(prot["resno"].astype(int), prot["name1"]))
+    resnos_in_chain = set(resno_to_aa.keys())
+
+    out: dict[str, str] = {}
+    for r in sorted(fixed_set):
+        aa = resno_to_aa.get(r)
+        if aa not in forbid_at_neighbors_of:
+            continue
+        for nb in (r - 1, r + 1):
+            if nb in fixed_set:
+                continue            # don't constrain another catalytic residue
+            if nb not in resnos_in_chain:
+                continue            # off-chain or non-protein
+            out[f"{chain}{nb}"] = forbid_aas
+    return out
+
+
 def _parse_remark_block(ref_pdb: Path) -> list[str]:
     """Pull REMARK 666 / HETNAM / LINK / REMARK PDBinfo-LABEL from ref."""
     head: list[str] = []
@@ -169,16 +230,35 @@ def stage_sample(
     fixed_resnos: Iterable[int],
     out_dir: Path,
     chain: str = CHAIN,
+    omit_AA_per_residue: Optional[dict[str, str]] = None,
 ) -> Path:
-    """Sample N candidates via LigandMPNN with the given (L,20) bias."""
+    """Sample N candidates via LigandMPNN with the given (L,20) bias.
+
+    ``omit_AA_per_residue`` is the fused_mpnn ``--omit_AA_per_residue_multi``
+    payload: ``{"<chain><resno>": "AAs_to_forbid"}``. For PTE_i1 we set
+    {"A156": "KR", "A158": "KR"} so MPNN can't pick K/R adjacent to the
+    catalytic K157 (otherwise it forces the KK-OmpT motif at sample time).
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Make sure protein_chisel src is on path (we run inside universal.sif
-    # but PYTHONPATH was set by the sbatch wrapper).
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
     from protein_chisel.tools.ligand_mpnn import (
         LigandMPNNConfig, sample_with_ligand_mpnn,
     )
+
+    extra_flags = [
+        "--checkpoint_ligand_mpnn", LMPNN_CKPT,
+        "--checkpoint_path_sc", SC_CKPT,
+    ]
+    if omit_AA_per_residue:
+        # Build the multi-format JSON: {"<pdb_path>": {"<chain><resno>": "AAs"}}
+        omit_path = out_dir / "omit_AA_per_residue.json"
+        omit_path.write_text(json.dumps({
+            str(Path(seed_pdb).resolve()): omit_AA_per_residue
+        }, indent=2))
+        extra_flags += ["--omit_AA_per_residue_multi", str(omit_path)]
+        LOGGER.info("stage_sample[cycle=%d]: omit_AA_per_residue=%s",
+                     cycle_cfg.cycle_idx, omit_AA_per_residue)
 
     cfg = LigandMPNNConfig(
         temperature=cycle_cfg.sampling_temperature,
@@ -188,10 +268,7 @@ def stage_sample(
         ligand_mpnn_use_side_chain_context=1,
         omit_AA=cycle_cfg.omit_AA,
         # No global bias_AA -- per-residue bias is the whole point.
-        extra_flags=(
-            "--checkpoint_ligand_mpnn", LMPNN_CKPT,
-            "--checkpoint_path_sc", SC_CKPT,
-        ),
+        extra_flags=tuple(extra_flags),
     )
 
     LOGGER.info(
@@ -293,9 +370,12 @@ def stage_seq_filter(
     OmpT threshold is "no worse than WT" — we don't degrade dibasic-motif
     count below the natural enzyme. This is the right policy: WT
     expresses fine in E. coli, so matching WT's dibasic count is OK.
-    Critically, the catalytic K157 forces a KK at 157-158 in this
-    scaffold, so a strict 0-motif rule rejects WT and every faithful
-    design.
+
+    NB: the v2 driver also forbids K/R at positions adjacent to catalytic
+    K/R via ``--omit_AA_per_residue_multi`` so the WT's catalytic-adjacent
+    KK motif is actively redesigned away from. The filter still enforces
+    the WT-relative cap on the non-catalytic-adjacent motifs MPNN
+    sometimes introduces elsewhere.
     """
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
     from protein_chisel.filters.protparam import protparam_metrics
@@ -761,6 +841,7 @@ def run_cycle(
     fitness_cache: dict,
     wt_length: int,
     wt_ompt_count: int,
+    omit_AA_per_residue: Optional[dict[str, str]] = None,
     catalytic_his_resnos: Iterable[int] = CATALYTIC_HIS_RESNOS,
 ) -> tuple[Optional[pd.DataFrame], dict[str, Path]]:
     """Run ONE iteration cycle. Returns (ranked DataFrame, pdb_map)."""
@@ -790,6 +871,7 @@ def run_cycle(
             survivor_sequences=survivors_prev["sequence"].tolist(),
             position_classes=position_classes,
             fixed_resnos_zero_indexed=fixed_idx,
+            protein_resnos=protein_resnos,
             config=cfg,
         )
         telem = {
@@ -810,6 +892,7 @@ def run_cycle(
         cycle_cfg=cycle_cfg, seed_pdb=seed_pdb, bias=bias_k,
         protein_resnos=protein_resnos, fixed_resnos=fixed_resnos,
         out_dir=sample_dir,
+        omit_AA_per_residue=omit_AA_per_residue,
     )
 
     # ---- 2. Restore PDBs --------------------------------------------
@@ -931,6 +1014,17 @@ def main() -> None:
     wt_ompt_count = _count_ompt_motifs(wt_seq)
     LOGGER.info("WT OmpT motif count: %d (filter threshold)", wt_ompt_count)
 
+    # Per-residue K/R omission at neighbors of catalytic K/R: prevents the
+    # unsolvable "catalytic K + adjacent K = forced KK motif" sampling
+    # outcome. This is a sample-time constraint, not a filter -- MPNN
+    # will simply pick a non-K/R AA at those positions.
+    omit_AA_per_residue = compute_catalytic_neighbor_omit_dict(
+        position_table_df=pt.df,
+        fixed_resnos=DEFAULT_CATRES,
+        chain=CHAIN,
+    )
+    LOGGER.info("catalytic-neighbor omit_AA: %s", omit_AA_per_residue)
+
     # ---- Cycle schedule ---------------------------------------------
     cycles = default_cycles(omit_AA=args.omit_AA)
     if args.cycles == 1:
@@ -963,6 +1057,7 @@ def main() -> None:
             fitness_cache=fitness_cache,
             wt_length=L,
             wt_ompt_count=wt_ompt_count,
+            omit_AA_per_residue=omit_AA_per_residue,
         )
         if ranked_df is not None and len(ranked_df) > 0:
             ranked_df = ranked_df.copy()
