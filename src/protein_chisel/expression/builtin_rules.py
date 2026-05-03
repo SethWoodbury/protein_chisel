@@ -40,6 +40,10 @@ class SsrATagCTermRule(Rule):
     Native ssrA = AANDENYALAA. We also flag close terminal patterns
     like ...YALAA / ...ALAA / ...LAA / ...AA when preceded by a
     flexible region (loop or low-complexity GS run).
+
+    Skipped when ``profile.c_tag`` is set: the designed body's C-terminus
+    becomes an internal junction in the full construct, not a free
+    C-terminus exposed to ClpXP.
     """
     name = "ssra_tag_cterm"
     default_severity = Severity.HARD_FILTER
@@ -48,6 +52,8 @@ class SsrATagCTermRule(Rule):
     _ssra_like = re.compile(r"(YALAA|ALAA|LAA|AA)$")
 
     def evaluate(self, ctx: StructureContext, profile: "ExpressionProfile") -> list[RuleHit]:
+        if profile.c_tag:
+            return []
         sev = self.resolved_severity(profile)
         seq = ctx.sequence
         L = ctx.L
@@ -96,6 +102,8 @@ class HydrophobicCTailRule(Rule):
     default_severity = Severity.HARD_FILTER
 
     def evaluate(self, ctx: StructureContext, profile: "ExpressionProfile") -> list[RuleHit]:
+        if profile.c_tag:
+            return []
         sev = self.resolved_severity(profile)
         seq = ctx.sequence
         L = ctx.L
@@ -129,6 +137,12 @@ class NEndRuleDestabilizingRule(Rule):
     default_severity = Severity.HARD_FILTER
 
     def evaluate(self, ctx: StructureContext, profile: "ExpressionProfile") -> list[RuleHit]:
+        if profile.n_tag:
+            # Designed body's N-term is buffered by the n_tag in the full
+            # construct -- the actual N-end-rule residue is the n_tag's
+            # first residue (after MetAP), which is the user's
+            # responsibility.
+            return []
         sev = self.resolved_severity(profile)
         if ctx.n_terminal_pair is None:
             return []
@@ -185,6 +199,9 @@ class SignalPeptideNTermRule(Rule):
 
     def evaluate(self, ctx: StructureContext, profile: "ExpressionProfile") -> list[RuleHit]:
         if profile.compartment != "cytosolic":
+            return []
+        if profile.n_tag:
+            # Designed body's N-term is internal in the full construct.
             return []   # signal peptide expected in periplasmic/secreted
         seq = ctx.sequence
         nterm = seq[:30] if len(seq) >= 30 else seq
@@ -228,6 +245,9 @@ class TatSignalMotifRule(Rule):
     def evaluate(self, ctx: StructureContext, profile: "ExpressionProfile") -> list[RuleHit]:
         if profile.compartment != "cytosolic":
             return []
+        if profile.n_tag:
+            # Designed body's N-term is internal in the full construct.
+            return []
         seq = ctx.sequence[:40]
         m = self._re.search(seq)
         if m:
@@ -247,6 +267,9 @@ class LipoboxNTermRule(Rule):
 
     def evaluate(self, ctx: StructureContext, profile: "ExpressionProfile") -> list[RuleHit]:
         if profile.compartment != "cytosolic":
+            return []
+        if profile.n_tag:
+            # Designed body's N-term is internal in the full construct.
             return []
         seq = ctx.sequence[:30]
         m = self._re.search(seq)
@@ -468,6 +491,9 @@ class CytosolicDisulfideOverloadRule(Rule):
 
     def evaluate(self, ctx: StructureContext, profile: "ExpressionProfile") -> list[RuleHit]:
         if profile.compartment != "cytosolic":
+            return []
+        if profile.n_tag:
+            # Designed body's N-term is internal in the full construct.
             return []
         params = profile.rule_params.get(self.name, {})
         max_cys = params.get("max_cys", 2)
