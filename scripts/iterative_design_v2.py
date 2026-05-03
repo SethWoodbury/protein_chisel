@@ -145,21 +145,6 @@ def default_cycles(omit_AA: str = "X") -> list[CycleConfig]:
 # ----------------------------------------------------------------------
 
 
-def _wt_aa_at_resno(seed_pdb: Path, resnos: Iterable[int], chain: str) -> dict[int, str]:
-    """Return {resno: 1-letter AA} for the seed PDB's chain residues."""
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-    from protein_chisel.io.pdb import extract_sequence
-    seq = extract_sequence(seed_pdb, chain=chain)
-    # extract_sequence returns the chain's protein sequence in resno-order
-    # for a gap-free chain. For a gap-containing chain, this would still
-    # return a contiguous string; we'd need a richer parser. PTE_i1 is
-    # gap-free so this works; for new scaffolds the position table is the
-    # canonical source of (resno, AA) and is passed in by the caller.
-    raise NotImplementedError(
-        "use compute_catalytic_neighbor_omit_dict_from_position_table"
-    )
-
-
 def compute_catalytic_neighbor_omit_dict(
     *,
     position_table_df,                              # PositionTable.df
@@ -363,19 +348,21 @@ def stage_seq_filter(
     out_dir: Path,
     net_charge_max: float,
     wt_length: int,
-    wt_ompt_count: int,
+    expression_engine,                # ExpressionRuleEngine
+    seed_ss_reduced: Optional[str] = None,
+    seed_sasa: Optional[np.ndarray] = None,
+    seed_position_class: Optional[list[str]] = None,
+    seed_protein_resnos: Optional[list[int]] = None,
+    catalytic_resnos: Iterable[int] = (),
+    fixed_resnos: Iterable[int] = (),
 ) -> Path:
-    """Cheap sequence-only filter: charge, length, OmpT motifs.
+    """Cheap sequence-only filter: charge, length, expression-rule HARD_FILTERs.
 
-    OmpT threshold is "no worse than WT" — we don't degrade dibasic-motif
-    count below the natural enzyme. This is the right policy: WT
-    expresses fine in E. coli, so matching WT's dibasic count is OK.
-
-    NB: the v2 driver also forbids K/R at positions adjacent to catalytic
-    K/R via ``--omit_AA_per_residue_multi`` so the WT's catalytic-adjacent
-    KK motif is actively redesigned away from. The filter still enforces
-    the WT-relative cap on the non-catalytic-adjacent motifs MPNN
-    sometimes introduces elsewhere.
+    The expression engine encodes all known E. coli expression risks
+    (ssrA, signal peptides, AMP-like, hydrophobic C-tails, etc.). Per-
+    sequence: any HARD_FILTER hit rejects the sequence; SOFT_BIAS and
+    HARD_OMIT hits are recorded in metadata and applied at MPNN sample
+    time in the next cycle (see ``stage_sample``).
     """
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
     from protein_chisel.filters.protparam import protparam_metrics
@@ -399,9 +386,26 @@ def stage_seq_filter(
             reasons.append(
                 f"net_charge_no_HIS={pp.charge_at_pH7_no_HIS:.2f} >= {net_charge_max}"
             )
-        n_hits = _count_ompt_motifs(seq)
-        if n_hits > wt_ompt_count:
-            reasons.append(f"OmpT motifs={n_hits} > WT={wt_ompt_count}")
+
+        # Run the full expression-rule engine (covers OmpT, ssrA, Tat, signal
+        # peptides, AMP-like, polyproline, SecM, cytosolic disulfides, and
+        # tag-protease internal sites). Structure-aware rules use the SEED
+        # PDB's SS / SASA / class -- designs share the seed backbone.
+        eng_res = expression_engine.evaluate(
+            seq,
+            ss_reduced=seed_ss_reduced,
+            sasa=seed_sasa,
+            position_class=seed_position_class,
+            catalytic_resnos=catalytic_resnos,
+            fixed_resnos=fixed_resnos,
+            protein_resnos=seed_protein_resnos,
+        )
+        for h in eng_res.hard_filter_hits:
+            reasons.append(f"{h.rule_name}: {h.reason}")
+        n_warnings = len(eng_res.warnings)
+        n_soft_bias = len(eng_res.soft_bias_hits)
+        n_hard_omit = len(eng_res.hard_omit_hits)
+
         rows.append({
             **row.to_dict(),
             "length": len(seq),
@@ -409,7 +413,13 @@ def stage_seq_filter(
             "instability_index": pp.instability_index,
             "gravy": pp.gravy,
             "pi": pp.pi,
-            "n_ecoli_sites": n_hits,
+            "n_expression_warnings": n_warnings,
+            "n_expression_soft_bias_hits": n_soft_bias,
+            "n_expression_hard_omit_hits": n_hard_omit,
+            "n_expression_hard_filter_hits": len(eng_res.hard_filter_hits),
+            "expression_rule_summary": ";".join(
+                f"{h.rule_name}={h.severity.name}" for h in eng_res.hits
+            ),
             "passed_seq_filter": not reasons,
             "fail_reasons": "; ".join(reasons),
         })
@@ -840,7 +850,11 @@ def run_cycle(
     cycle_dir: Path,
     fitness_cache: dict,
     wt_length: int,
-    wt_ompt_count: int,
+    expression_engine,                # ExpressionRuleEngine
+    seed_ss_reduced: Optional[str] = None,
+    seed_sasa: Optional[np.ndarray] = None,
+    seed_position_class: Optional[list[str]] = None,
+    seed_protein_resnos: Optional[list[int]] = None,
     omit_AA_per_residue: Optional[dict[str, str]] = None,
     catalytic_his_resnos: Iterable[int] = CATALYTIC_HIS_RESNOS,
 ) -> tuple[Optional[pd.DataFrame], dict[str, Path]]:
@@ -911,7 +925,13 @@ def run_cycle(
         candidates_tsv=cand_tsv, out_dir=seq_filter_dir,
         net_charge_max=cycle_cfg.net_charge_max,
         wt_length=wt_length,
-        wt_ompt_count=wt_ompt_count,
+        expression_engine=expression_engine,
+        seed_ss_reduced=seed_ss_reduced,
+        seed_sasa=seed_sasa,
+        seed_position_class=seed_position_class,
+        seed_protein_resnos=seed_protein_resnos,
+        catalytic_resnos=fixed_resnos,
+        fixed_resnos=fixed_resnos,
     )
 
     # ---- 4. Struct filter -------------------------------------------
@@ -970,6 +990,15 @@ def main() -> None:
                         "no canonical AAs are silently forbidden. Pass 'CX' "
                         "to also exclude cysteine (recommended for scaffolds "
                         "with no catalytic Cys); add others as needed.")
+    p.add_argument("--expression_profile", type=str,
+                   default="bl21_cytosolic_streptag",
+                   choices=["bl21_cytosolic_streptag", "k12_cytosolic",
+                            "bl21_periplasmic"],
+                   help="Host-expression profile that drives the rule engine.")
+    p.add_argument("--expression_overrides", type=str, default="",
+                   help="Comma-sep rule_name=SEVERITY overrides, e.g. "
+                        "'kr_neighbor_dibasic=HARD_OMIT,polyproline_stall=WARN_ONLY'. "
+                        "SEVERITY in {WARN_ONLY,SOFT_BIAS,HARD_OMIT,HARD_FILTER}.")
     args = p.parse_args()
 
     logging.basicConfig(
@@ -1011,19 +1040,51 @@ def main() -> None:
     # are no worse than WT for E. coli expression. WT has dibasic motifs
     # that are forced by the catalytic K157 (KK at 157-158); a strict
     # 0-motif rule rejects WT and every faithful design.
-    wt_ompt_count = _count_ompt_motifs(wt_seq)
-    LOGGER.info("WT OmpT motif count: %d (filter threshold)", wt_ompt_count)
-
-    # Per-residue K/R omission at neighbors of catalytic K/R: prevents the
-    # unsolvable "catalytic K + adjacent K = forced KK motif" sampling
-    # outcome. This is a sample-time constraint, not a filter -- MPNN
-    # will simply pick a non-K/R AA at those positions.
-    omit_AA_per_residue = compute_catalytic_neighbor_omit_dict(
-        position_table_df=pt.df,
-        fixed_resnos=DEFAULT_CATRES,
-        chain=CHAIN,
+    # ---- Build expression-rule engine -------------------------------
+    from protein_chisel.expression import (
+        ExpressionRuleEngine, ExpressionProfile,
     )
-    LOGGER.info("catalytic-neighbor omit_AA: %s", omit_AA_per_residue)
+    import protein_chisel.expression.builtin_rules  # noqa: F401 — registers
+    from protein_chisel.structure import SSProvider
+
+    base_profile = {
+        "bl21_cytosolic_streptag": ExpressionProfile.bl21_cytosolic_streptag,
+        "k12_cytosolic": ExpressionProfile.k12_cytosolic,
+        "bl21_periplasmic": ExpressionProfile.bl21_periplasmic,
+    }[args.expression_profile]()
+    profile = ExpressionProfile.from_overrides_string(
+        base_profile, args.expression_overrides,
+    )
+    LOGGER.info("expression profile: %s (preset=%s)", profile.name, profile.preset)
+    if profile.severity_overrides:
+        LOGGER.info("severity overrides: %s",
+                     {k: v.name for k, v in profile.severity_overrides.items()})
+    expression_engine = ExpressionRuleEngine(profile=profile)
+
+    # ---- Compute SS consensus + per-residue features once on seed PDB
+    LOGGER.info("computing SS consensus on seed PDB (3 algorithms)")
+    ss = SSProvider().from_pdb(args.seed_pdb, chain=CHAIN)
+    LOGGER.info("SS: H=%d E=%d L=%d (mean confidence %.2f, used %s, failed %s)",
+                 ss.ss_reduced.count("H"), ss.ss_reduced.count("E"),
+                 ss.ss_reduced.count("L"), float(ss.confidence.mean()),
+                 ss.used_algos, ss.failed_algos or "none")
+    if len(ss.ss_reduced) != L:
+        raise RuntimeError(f"SS length {len(ss.ss_reduced)} != L {L}")
+    seed_sasa = protein_rows["sasa"].astype(float).values
+
+    # ---- Pre-flight: evaluate WT against the engine ---------------
+    wt_eng = expression_engine.evaluate(
+        wt_seq,
+        ss_reduced=ss.ss_reduced,
+        sasa=seed_sasa,
+        position_class=position_classes,
+        catalytic_resnos=DEFAULT_CATRES,
+        fixed_resnos=DEFAULT_CATRES,
+        protein_resnos=protein_resnos,
+    )
+    LOGGER.info("WT engine eval: %s", wt_eng.summary())
+    omit_AA_per_residue = wt_eng.to_omit_AA_json("A", protein_resnos=protein_resnos)
+    LOGGER.info("expression-engine HARD_OMIT JSON: %s", omit_AA_per_residue)
 
     # ---- Cycle schedule ---------------------------------------------
     cycles = default_cycles(omit_AA=args.omit_AA)
@@ -1056,7 +1117,11 @@ def main() -> None:
             cycle_dir=cycle_dir,
             fitness_cache=fitness_cache,
             wt_length=L,
-            wt_ompt_count=wt_ompt_count,
+            expression_engine=expression_engine,
+            seed_ss_reduced=ss.ss_reduced,
+            seed_sasa=seed_sasa,
+            seed_position_class=position_classes,
+            seed_protein_resnos=protein_resnos,
             omit_AA_per_residue=omit_AA_per_residue,
         )
         if ranked_df is not None and len(ranked_df) > 0:
