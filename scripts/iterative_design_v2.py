@@ -172,6 +172,13 @@ def default_cycles(
     ``"plddt_residpo_alpha_20250116-aec4d0c4"``. Boosts mean fitness
     by ~0.02 nats/residue at a diversity cost.
     """
+    # Per-monomer charge schedule. Per the Sukhwal et al. PEDS 2024
+    # supercharged-PTE paper: their best negatively-charged variant has
+    # net charge -14 at the DIMER level = -7 per monomer. Our previous
+    # schedule (-10 to -12 per MONOMER, = -20 to -24 per dimer) was
+    # ~3x more negative than the literature optimum -- likely
+    # over-shooting. New schedule targets -5 to -8 per monomer
+    # (-10 to -16 per dimer), bracketing the paper's -7.
     common = dict(
         omit_AA=omit_AA,
         use_side_chain_context=use_side_chain_context,
@@ -183,15 +190,15 @@ def default_cycles(
     return [
         CycleConfig(
             cycle_idx=0, n_samples=500, sampling_temperature=0.20,
-            net_charge_max=-10.0, sap_max_threshold=15.0, **common,
+            net_charge_max=-5.0, sap_max_threshold=15.0, **common,
         ),
         CycleConfig(
             cycle_idx=1, n_samples=400, sampling_temperature=0.18,
-            net_charge_max=-11.0, sap_max_threshold=13.0, **common,
+            net_charge_max=-6.0, sap_max_threshold=13.0, **common,
         ),
         CycleConfig(
             cycle_idx=2, n_samples=300, sampling_temperature=0.15,
-            net_charge_max=-12.0, sap_max_threshold=12.0, **common,
+            net_charge_max=-7.0, sap_max_threshold=12.0, **common,
         ),
     ]
 
@@ -1112,10 +1119,16 @@ def stage_struct_filter(
         hbonds = _detect_hbond_to_his_sidechain(pdb, catalytic_his_resnos)
         for h in hbonds:
             hbond_rows.append({"id": cid, **h})
-        # Cheap geometric ligand-contact panel: hbond, salt-bridge,
-        # aromatic, hydrophobic. Heavy-atom distance only, no hydrogens
-        # or angle geometry. Reported as metrics, not filters by default.
-        lc = _detect_ligand_contacts(pdb, chain=CHAIN)
+        # Cheap geometric protein<->ligand interaction panel via the
+        # generalizable tools.geometric_interactions module: H-bonds
+        # with antecedent-angle check, donor/acceptor type-aware salt
+        # bridges, π-π with plane angle, π-cation, hydrophobic, and
+        # vdW-clash detection -- each with a Gaussian strength score.
+        # ~50 ms/design. Replaces the previous embedded helper.
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+        from protein_chisel.tools.geometric_interactions import detect_interactions
+        panel = detect_interactions(pdb, chain=CHAIN, selection="protein_vs_ligand")
+        gi_metrics = panel.to_dict("ligand_int__")
         sap = _compute_sap_proxy(pdb) or {}
         sap_max = sap.get("sap_max", float("nan"))
         # Clash detection (catalytic + ligand vs designed sidechains)
@@ -1137,11 +1150,7 @@ def stage_struct_filter(
             )
         rows.append({**row.to_dict(),
                      "n_hbonds_to_cat_his": len(hbonds),
-                     "ligand_contacts__n_hbonds": lc["n_hbonds"],
-                     "ligand_contacts__n_salt_bridges": lc["n_salt_bridges"],
-                     "ligand_contacts__n_aromatic": lc["n_aromatic"],
-                     "ligand_contacts__n_hydrophobic": lc["n_hydrophobic"],
-                     "ligand_contacts__n_total": lc["n_total"],
+                     **gi_metrics,
                      "sap_max": sap_max,
                      "sap_mean": sap.get("sap_mean", float("nan")),
                      "sap_p95": sap.get("sap_p95", float("nan")),
@@ -1686,12 +1695,20 @@ def run_cycle(
     # most first-shell positions.
     diversity_omit: dict[str, str] = {}
     if position_table_df is not None:
+        # Per agent-review bug: cycle_idx*7919 with cycle_idx=0 gives
+        # seed=0, so cycle 0 always picks the same 4 first-shell
+        # positions across every production run. Mix in a process-wide
+        # constant + run-time minute so different runs explore different
+        # subsets, while still being deterministic within a single run.
+        cycle_seed = (cycle_cfg.cycle_idx + 1) * 7919 + (
+            int(_dt.datetime.now().minute) * 31
+        )
         diversity_omit = compute_first_shell_diversity_omits(
             position_table_df=position_table_df,
             fixed_resnos=fixed_resnos,
             chain=CHAIN,
             fraction_to_diversify=0.30,
-            seed=cycle_cfg.cycle_idx * 7919,   # different per cycle, deterministic
+            seed=cycle_seed,
         )
     LOGGER.info(
         "cycle %d: diversity-omit at first-shell = %s",
