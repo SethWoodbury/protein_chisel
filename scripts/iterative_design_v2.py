@@ -2858,12 +2858,14 @@ def main() -> None:
         detect_resources, configure_torch_threads,
     )
     resources = detect_resources()
-    # Always pin torch threads to the slurm allocation. On a GPU job,
-    # PyTorch's default uses all node cores for CPU ops (numpy / SAP /
-    # the multiprocessing.Pool workers), which oversubscribes our
-    # cpus_per_task allocation. Codex r2 estimate: ~5-15s/cycle GPU,
-    # ~10-20s/cycle CPU on top of the explicit Pool stages.
-    configure_torch_threads(resources.n_cpus)
+    # Pin torch threads for the parent process only on CPU runs.
+    # On GPU jobs, the empirical test (round 2) showed setting
+    # threads-in-parent caused multiprocessing.Pool workers (which
+    # fork from parent) to inherit threads=N each, leading to N×N
+    # thread oversubscription (4 workers × 4 threads = 16 on 4 CPUs).
+    # Better: let GPU runs use defaults; only constrain CPU.
+    if resources.n_gpus == 0:
+        configure_torch_threads(resources.n_cpus)
 
     # ---- Load PLM artifacts -----------------------------------------
     art = args.plm_artifacts_dir
