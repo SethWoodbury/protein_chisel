@@ -12,6 +12,7 @@ Codex flagged 5 hard blockers + 5 soft blockers; all addressed below.
 - §4: `d_ca_ligand` redefined as `min(CA → any ligand atom)` instead of CA→centroid (better for elongated substrates like paraoxon).
 - §4: `secondary_sasa_max_fraction` raised 0.30 → 0.40 (avoids demoting true 2nd-shell residues on flexible loops).
 - §4: oxyanion-hole detection narrowed to backbone-N donors only (was any backbone atom).
+- §4 (post-user feedback): backbone polar contact now covers BOTH N (donor, e.g. oxyanion hole) AND O (acceptor, e.g. substrate-orienting backbone carbonyls). Codex narrowed it too far; donor-only would miss real acceptor-side H-bonds. CA and C still excluded (not polar atoms).
 - §4: precondition added — assert `min(d_sidechain_lig over catalytic residues) < 5` before classifying; loud warning if not (catches poorly-placed ligand poses).
 - §4: empty `catalytic_resnos` → loud warning + return all-distal classification (no silent demotion).
 - §5 phantom Cβ: chirality marked as PROVISIONAL — implementation must compute both `cross(â, b̂)` and `cross(b̂, â)`, test against real Cβ on a non-Gly residue, pick the one with mean deviation < 0.15 Å. The 54.7356° tilt is canonical (`acos(1/√3)`). Codex flagged the cross-product order; the unit test is the source of truth.
@@ -79,7 +80,7 @@ New columns to add to PositionTable (alongside existing ones):
 | `d_ca_ligand`           | float   | CA → ligand-centroid distance (renamed from current `dist_ligand`)      |
 | `theta_orient_deg`      | float   | angle between (CA → CB_or_phantom) and (CA → ligand-centroid), 0–180°   |
 | `sasa_sc_fraction`      | float   | sidechain SASA / max sidechain SASA for this AA type (Tien 2013 max)   |
-| `is_backbone_contact`   | bool    | ANY backbone atom (N/CA/C/O) ≤ 4.5 Å of ligand — captures oxyanion-hole NH cases |
+| `is_backbone_polar_contact` | bool | Backbone N (donor) OR O (acceptor) ≤ 4.5 Å of ligand. Captures oxyanion-hole NH AND substrate-orienting backbone C=O. CA + C excluded as non-polar. |
 | `is_rim_ambiguous`      | bool    | rotamer-library scan finds rotamers in BOTH primary and secondary buckets (optional, see §10) |
 
 The legacy `dist_ligand` and `dist_catalytic` are kept verbatim for backwards compat with downstream code that reads them.
@@ -106,13 +107,18 @@ def classify(residue, ligand_atoms, catalytic_resnos, cfg):
     if residue.resno in catalytic_resnos:
         return "primary_sphere"
 
-    # ----- Tier 1 — primary contact (codex: tighter backbone rule) -----
-    is_backbone_donor = any(
-        ||r.atom('N') - lig|| <= 4.5 for lig in ligand_atoms
-    )  # oxyanion-hole NH H-bond donor only, not generic any-bb-atom
+    # ----- Tier 1 — primary contact -----
+    # Backbone polar contact: N (H-bond donor, e.g. oxyanion hole) OR
+    # O (H-bond acceptor, e.g. substrate-orienting backbone carbonyls).
+    # Excludes CA (sp3, not polar) and C (sp2 carbonyl carbon -- the
+    # polar atom is its O, already covered).
+    is_backbone_polar_contact = (
+        any(||r.atom('N') - lig|| <= 4.5 for lig in ligand_atoms) OR
+        any(||r.atom('O') - lig|| <= 4.5 for lig in ligand_atoms)
+    )
     if (d_sidechain_lig <= cfg.primary_distance
         OR d_sidechain_catshell <= cfg.primary_distance
-        OR is_backbone_donor):
+        OR is_backbone_polar_contact):
         return "primary_sphere"
 
     # ----- Tier 2 — secondary sphere (codex: also catshell-only path) -----
