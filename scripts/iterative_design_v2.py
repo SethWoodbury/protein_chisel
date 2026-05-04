@@ -541,18 +541,14 @@ def merge_omit_dicts(*dicts: dict[str, str]) -> dict[str, str]:
 
 
 def _parse_remark_block(ref_pdb: Path) -> list[str]:
-    """Pull REMARK 666 / HETNAM / LINK / REMARK PDBinfo-LABEL from ref."""
-    head: list[str] = []
-    with open(ref_pdb) as fh:
-        for line in fh:
-            if line.startswith("ATOM"):
-                break
-            if (line.startswith("REMARK 666")
-                or line.startswith("REMARK PDBinfo-LABEL")
-                or line.startswith("HETNAM")
-                or line.startswith("LINK")):
-                head.append(line)
-    return head
+    """Pull REMARK 666 / HETNAM / LINK / REMARK PDBinfo-LABEL from ref.
+
+    Thin wrapper over ``protein_chisel.tools.pdb_restoration.extract_remark_lines``
+    kept for back-compat; new code should call the tool directly.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from protein_chisel.tools.pdb_restoration import extract_remark_lines
+    return extract_remark_lines(ref_pdb)
 
 
 def stage_sample(
@@ -640,41 +636,33 @@ def stage_restore_pdbs(
     out_pdb_dir: Path,
     pdb_basename: str,
     candidate_ids: list[str],
+    chain: str = CHAIN,
+    catalytic_resnos: Iterable[int] = DEFAULT_CATRES,
+    catalytic_hydrogens: bool = True,
 ) -> dict[str, Path]:
-    """Re-prepend REMARK 666/HETNAM/LINK to packed MPNN PDBs."""
-    out_pdb_dir.mkdir(parents=True, exist_ok=True)
-    head_lines = _parse_remark_block(ref_pdb)
-    LOGGER.info("stage_restore_pdbs: prepending %d header lines", len(head_lines))
+    """Restore REMARK 666 / HETNAM / LINK + HIS tautomer (HIS_D / HIE / HIP)
+    + KCX cap atoms + catalytic hydrogens onto the packed MPNN PDBs.
 
-    packed_dir = sample_dir / "packed"
-    if not packed_dir.is_dir():
-        raise FileNotFoundError(
-            f"No packed/ subdir under {sample_dir} -- did fused_mpnn "
-            "run with pack_side_chains=1?"
-        )
-
-    out_map: dict[str, Path] = {}
-    for cid in candidate_ids:
-        m = re.match(rf"^{re.escape(pdb_basename)}_lmpnn_(\d+)$", cid)
-        if not m:
-            continue
-        idx = int(m.group(1))
-        if idx == 0:
-            continue   # WT input row, no PDB
-        src = packed_dir / f"{pdb_basename}_packed_{idx}_1.pdb"
-        if not src.is_file():
-            LOGGER.warning("stage_restore_pdbs: missing PDB %s", src.name)
-            continue
-        dst = out_pdb_dir / f"{cid}.pdb"
-        with open(src) as fin, open(dst, "w") as fout:
-            fout.writelines(head_lines)
-            for line in fin:
-                if line.startswith("REMARK"):
-                    continue   # MPNN's redundant REMARKs
-                fout.write(line)
-        out_map[cid] = dst
-    LOGGER.info("stage_restore_pdbs: restored %d PDBs", len(out_map))
-    return out_map
+    Delegates to ``protein_chisel.tools.pdb_restoration.restore_sample_dir``;
+    see that module for the full restoration semantics. The signature is
+    kept stable so call sites in this driver are unchanged.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from protein_chisel.tools.pdb_restoration import restore_sample_dir
+    LOGGER.info(
+        "stage_restore_pdbs: restoring header+tautomers for %d candidates",
+        len(candidate_ids),
+    )
+    return restore_sample_dir(
+        sample_dir=sample_dir,
+        ref_pdb=ref_pdb,
+        out_pdb_dir=out_pdb_dir,
+        pdb_basename=pdb_basename,
+        candidate_ids=candidate_ids,
+        chain=chain,
+        catalytic_resnos=catalytic_resnos,
+        catalytic_hydrogens=catalytic_hydrogens,
+    )
 
 
 OMPT_ONLY_PATTERNS = [
