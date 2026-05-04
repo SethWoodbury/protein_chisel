@@ -109,10 +109,12 @@ class CycleConfig:
     sap_max_threshold: float = 15.0
     consensus_threshold: float = 0.85
     consensus_strength: float = 2.0
-    # Soluble-enzyme pI window. Mature B. diminuta PTE pI ~6.5; arylesterase
-    # variants ~7.0. Activity assays at pH 7.5-8.5. Reject designs with
-    # pI outside [pi_min, pi_max].
-    pi_min: float = 6.0
+    # pI window. WT PTE is highly acidic (pI ~4.6); a strict pI 6.5-7.2
+    # window conflicts with the user's net_charge_no_HIS<-10 constraint
+    # (acidic charge by definition gives acidic pI). Default is wide
+    # enough to keep the negative-charge filter as the dominant signal;
+    # user can tighten via --pi_min / --pi_max for less-acidic variants.
+    pi_min: float = 4.0
     pi_max: float = 7.5
     # fpocket-druggability filter on the active-site pocket. Designs
     # with druggability < this are dropped (no detectable active-site
@@ -152,7 +154,7 @@ def default_cycles(
     omit_AA: str = "X",
     use_side_chain_context: int = 0,
     enhance: Optional[str] = None,
-    pi_min: float = 6.0,
+    pi_min: float = 4.0,
     pi_max: float = 7.5,
     fpocket_druggability_min: float = 0.30,
     clash_filter: bool = True,
@@ -1328,11 +1330,13 @@ def main() -> None:
                         "Default None (use base ligand_mpnn). Available choices "
                         f"({len(AVAILABLE_ENHANCE_CHECKPOINTS)}): "
                         + ", ".join(AVAILABLE_ENHANCE_CHECKPOINTS))
-    p.add_argument("--pi_min", type=float, default=6.0,
-                   help="Minimum theoretical pI for designs (filter). "
-                        "Default 6.0 -- targets soluble cytosolic enzyme "
-                        "expression at pH 7.5-8.5 (pI window ~6.5-7.2 for "
-                        "B. diminuta PTE-like cores).")
+    p.add_argument("--pi_min", type=float, default=4.0,
+                   help="Minimum theoretical pI. Default 4.0 (wide; keeps "
+                        "the WT-like very-acidic PTE pI of 4.58 valid). "
+                        "Strict aspirational target was 6.5-7.2 for soluble "
+                        "B. diminuta PTE-like cores assayed at pH 7.5-8.5, "
+                        "but that conflicts with --net_charge_max<-10. "
+                        "Tighten only if you accept relaxing net_charge.")
     p.add_argument("--pi_max", type=float, default=7.5)
     p.add_argument("--fpocket_druggability_min", type=float, default=0.30,
                    help="Drop designs with fpocket-druggability below this "
