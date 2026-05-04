@@ -1120,16 +1120,13 @@ def run_cycle(
     # most first-shell positions.
     diversity_omit: dict[str, str] = {}
     if position_table_df is not None:
-        from scripts.iterative_design_v2 import (   # noqa
-            compute_first_shell_diversity_omits,
+        diversity_omit = compute_first_shell_diversity_omits(
+            position_table_df=position_table_df,
+            fixed_resnos=fixed_resnos,
+            chain=CHAIN,
+            fraction_to_diversify=0.30,
+            seed=cycle_cfg.cycle_idx * 7919,   # different per cycle, deterministic
         )
-    diversity_omit = compute_first_shell_diversity_omits(
-        position_table_df=position_table_df,
-        fixed_resnos=fixed_resnos,
-        chain=CHAIN,
-        fraction_to_diversify=0.30,
-        seed=cycle_cfg.cycle_idx * 7919,   # different per cycle, deterministic
-    )
     LOGGER.info(
         "cycle %d: diversity-omit at first-shell = %s",
         cycle_cfg.cycle_idx, diversity_omit,
