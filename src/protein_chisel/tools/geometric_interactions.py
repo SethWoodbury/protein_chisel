@@ -196,7 +196,11 @@ class InteractionPanel:
 
 
 def _parse_pdb_atoms(pdb_path: Path | str) -> list[dict]:
-    """Read all ATOM/HETATM heavy-atom records into dict-list."""
+    """Read all ATOM/HETATM heavy-atom records into dict-list.
+
+    Format-aware: handles both standard PDB (3-char res_name) and
+    Rosetta-extended (5-char res_name like "HIS_D" with chain at col 22).
+    """
     out: list[dict] = []
     with open(pdb_path) as fh:
         for line in fh:
@@ -206,11 +210,13 @@ def _parse_pdb_atoms(pdb_path: Path | str) -> list[dict]:
                 element = line[76:78].strip()
                 if element == "H":
                     continue
+                # res_name at cols 16-20 (5 chars; works for both standard
+                # PDB with leading space and Rosetta-extended like HIS_D).
                 out.append({
                     "record": line[:6].strip(),
                     "atom_name": line[12:16].strip(),
-                    "alt_loc": line[16].strip(),
-                    "res_name": line[17:20].strip(),
+                    "alt_loc": "",     # consumed by extended res_name field
+                    "res_name": line[16:21].strip(),
                     "chain_id": line[21].strip(),
                     "res_seq": int(line[22:26].strip() or 0),
                     "x": float(line[30:38]),

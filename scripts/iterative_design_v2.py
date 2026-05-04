@@ -783,7 +783,14 @@ def stage_seq_filter(
 
 
 def _read_atoms(pdb_path: Path) -> list[dict]:
-    """Minimal stdlib PDB ATOM/HETATM parser."""
+    """Minimal stdlib PDB ATOM/HETATM parser, format-aware.
+
+    Reads res_name from cols 16-20 (overlaps altloc col 16). In standard
+    PDB col 16 is a space + cols 17-19 are the 3-char res_name, so
+    line[16:21].strip() returns the canonical 3-char name. In Rosetta-
+    extended PDB the 5-char form (e.g. "HIS_D") fills cols 16-20 and
+    line[16:21].strip() returns "HIS_D". Chain is at col 21 in both.
+    """
     atoms = []
     with open(pdb_path) as fh:
         for line in fh:
@@ -793,7 +800,7 @@ def _read_atoms(pdb_path: Path) -> list[dict]:
                 atoms.append({
                     "record": line[:6].strip(),
                     "atom_name": line[12:16].strip(),
-                    "res_name": line[17:20].strip(),
+                    "res_name": line[16:21].strip(),
                     "chain_id": line[21].strip(),
                     "res_seq": int(line[22:26].strip() or 0),
                     "x": float(line[30:38]),

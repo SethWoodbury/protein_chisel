@@ -87,7 +87,13 @@ class ClashCheckResult:
 
 
 def _read_atoms(pdb_path: Path) -> list[dict]:
-    """Stdlib ATOM/HETATM parser. Returns one dict per heavy atom."""
+    """Stdlib ATOM/HETATM parser, format-aware.
+
+    Reads res_name from cols 16-20 — standard PDB has space at 16 plus
+    3-char name at 17-19, Rosetta-extended fills all 5 cols (e.g.
+    "HIS_D"). line[16:21].strip() returns the right thing for both.
+    Chain stays at col 21.
+    """
     out = []
     with open(pdb_path) as fh:
         for line in fh:
@@ -97,8 +103,7 @@ def _read_atoms(pdb_path: Path) -> list[dict]:
                 d = {
                     "record": line[:6].strip(),
                     "atom_name": line[12:16].strip(),
-                    "alt_loc": line[16].strip(),
-                    "res_name": line[17:20].strip(),
+                    "res_name": line[16:21].strip(),
                     "chain_id": line[21].strip(),
                     "res_seq": int(line[22:26].strip() or 0),
                     "x": float(line[30:38]),
@@ -109,7 +114,7 @@ def _read_atoms(pdb_path: Path) -> list[dict]:
             except (ValueError, IndexError):
                 continue
             if d["element"] == "H":
-                continue   # skip hydrogens; we work on heavy atoms
+                continue
             out.append(d)
     return out
 
