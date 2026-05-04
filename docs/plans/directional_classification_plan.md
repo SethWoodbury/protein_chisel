@@ -10,6 +10,18 @@ Codex flagged 5 hard blockers + 5 soft blockers; user added 4 more conceptual fi
 
 - §4 (post-user-feedback v3): TWO-PASS algorithm. Primary = substrate contact only (literature definition: Tawfik HG3 / Markin PafA / Warshel preorganization). Secondary = coordinates a primary-sphere residue. The previous "d_sidechain_catshell ≤ 4.5 → primary" was wrong: contacting a catalytic His's sidechain at 3 Å but being 8 Å from substrate is *secondary* by the standard definition, not primary.
 - §3 / §3b (post-user-feedback v3): orientation now uses CA→sidechain centroid by default (better proxy for long flexible sidechains than CA→CB). Three orientation columns recorded (CB, centroid, functional-atom) so we can experiment without re-classifying. Soft membership scores (sigmoid over each cutoff) added so we can apply gradient PLM weights or re-bin offline.
+- §3 / §4 (codex round 2): more edge cases addressed.
+  - Path A of secondary now allows sidechain-to-backbone-polar contacts (helix-cap preorganization, classic Tawfik scaffolds), not just sidechain-to-sidechain.
+  - `secondary_coordination_count` recorded; `secondary_score` scaled 1.0–1.5× by it (multi-primary preorganization hub gets a soft boost without changing class).
+  - His functional atom: closer-of-{ND1, NE2} to ligand (codex: tautomer assignment from a static PDB is unreliable; this is a deliberate simplification).
+  - Trp functional atom: NE1 (donor); ring centroid recorded separately as `theta_orient_aromatic_deg`.
+  - Phe/Tyr/Trp/His have a dedicated `theta_orient_aromatic_deg` column for π-stacking direction (distinct from H-bond functional atom).
+  - Soft sigmoid gate on θ added (was hard threshold; inconsistent with soft distance gates).
+  - Sequence-neighbor backbone exclusion: residue (i±1) of a catalytic residue can't trigger primary via bb-polar path (peptide bond is 1.3 Å, would be a trivial artifact). Sidechain-reach path unchanged.
+  - Disulfide-partner exclusion: SG-SG ≤ 2.3 Å pairs don't trigger secondary via sidechain-to-sidechain path on each other.
+  - chain-aware `catalytic_resnos`: now `set[(chain_id, resno)]` for homodimer / multi-chain support (PTE_i1 is a homodimer).
+  - Documented: classifier is structure-state, not sampling-state; omit_AA enforcement is the consumer's job.
+  - Water-mediated H-bonds deliberately ignored in v1.
 - §4: `d_ca_ligand` redefined as `min(CA → any ligand atom)` instead of CA→centroid (better for elongated substrates like paraoxon).
 - §4: `secondary_sasa_max_fraction` raised 0.30 → 0.40 (avoids demoting true 2nd-shell residues on flexible loops).
 - §4: oxyanion-hole detection narrowed to backbone-N donors only (was any backbone atom).
@@ -85,7 +97,8 @@ New columns to add to PositionTable. All distances Å, angles deg, scores [0, 1]
 | `d_ca_ligand` | float | min(CA → any ligand atom) (NOT centroid; codex finding for elongated paraoxon-like substrates) |
 | `theta_orient_cb_deg` | float | angle((CA→CB or phantom_CB), (CA→ligand-centroid)). Rotamer-stable. EXIA literature reference |
 | `theta_orient_centroid_deg` | float | angle((CA→sidechain_centroid), (CA→ligand-centroid)). Better proxy than CB for long flexible sidechains (Arg/Lys/Met/Glu/Gln). **This is what the directional gate uses.** Gly: phantom CB. Pro: CB-CG-CD centroid |
-| `theta_orient_functional_deg` | float | angle((CA→functional_atom), (CA→ligand-centroid)) — chemical-tip orientation. Defined per AA: NZ (Lys), NH1/NH2 mean (Arg), OG/OG1 (Ser/Thr), ND1/NE2 (His tautomer-aware), OH (Tyr), CZ (Phe), OE1/OE2 mean (Glu), OD1/OD2 mean (Asp), OE1+NE2 mean (Gln), OD1+ND2 mean (Asn), SD (Met), SG (Cys), CG (Trp ring centroid alt). NaN for Gly/Ala/short residues without a clear functional atom |
+| `theta_orient_functional_deg` | float | angle((CA→functional_atom), (CA→ligand-centroid)) — chemical-tip orientation. Defined per AA: NZ (Lys), NH1/NH2 mean (Arg), OG/OG1 (Ser/Thr), **closer-of-{ND1, NE2} to ligand** (His — codex r2: tautomer assignment from a static PDB is unreliable; this is a deliberate simplification), OH (Tyr), ring centroid (Phe), OE1/OE2 mean (Glu), OD1/OD2 mean (Asp), OE1+NE2 mean (Gln), OD1+ND2 mean (Asn), SD (Met), SG (Cys), **NE1 (Trp — donor; ring centroid recorded separately as `theta_orient_aromatic_deg`)**. NaN for Gly/Ala/short residues without a clear functional atom |
+| `theta_orient_aromatic_deg` | float | angle((CA→ring centroid), (CA→ligand-centroid)) for Phe/Tyr/Trp/His — captures π-stacking direction. Distinct from functional atom (which is the H-bond donor/acceptor) |
 | `sasa_sc_fraction` | float | sidechain SASA / max sidechain SASA for this AA type (Tien 2013 max-SASA values, doi:10.1371/journal.pone.0080635) |
 | `is_backbone_polar_proximity` | bool | backbone N OR O ≤ 4.5 Å of ligand — RAW proximity flag |
 | `is_backbone_polar_contact` | bool | proximity AND (`theta_orient_centroid_deg ≤ 110°` OR explicit H-bond geometry) — the actual primary-trigger flag |
@@ -118,6 +131,14 @@ nearby_score = (
     sigmoid((cfg.nearby_ca_distance - d_ca_ligand) / cfg.nearby_halfwidth)
     * (1 - primary_score - secondary_score)
 )
+
+# Codex r2 #4: θ as a hard threshold is inconsistent with soft distance.
+# Add a sigmoid soft gate on the orientation angle so a residue at θ=71°
+# vs 69° doesn't flip-flop on/off secondary.
+theta_score = sigmoid((cfg.orient_inward_max_deg - theta_orient_centroid_deg) / cfg.theta_halfwidth)
+# theta_halfwidth = 10° — score is 0.5 at 70°, 0.73 at 65°, 0.27 at 75°
+# Multiply into secondary_score for residues hitting Path B:
+secondary_score = secondary_score * theta_score   # only path B; path A unaffected
 ```
 
 These scores let us:
@@ -142,12 +163,23 @@ def is_primary(residue, ligand_atoms, catalytic_resnos, cfg):
     if residue.d_sidechain_lig <= cfg.primary_distance:
         return True
 
-    # Backbone polar contact to ligand WITH directional gate
+    # Backbone polar contact to ligand WITH directional gate.
+    # IMPLEMENTER NOTE (codex r2 #2): bb-polar gate uses backbone-atom
+    # distances (d_backbone_N_lig / d_backbone_O_lig), NOT d_sidechain_lig.
+    # The two metrics are different; do not "simplify" them.
     bb_proximity = (
         residue.d_backbone_N_lig <= cfg.primary_distance
         OR residue.d_backbone_O_lig <= cfg.primary_distance
     )
-    if bb_proximity and (
+    # Sequence-neighbor exclusion (codex r2 #7): residue (i+1) inherits
+    # backbone proximity from a catalytic residue at i because peptide
+    # bond is ~1.3 Å. That's a trivial sequence artifact, not a real
+    # contact. Exclude residues within 1 sequence step of a catalytic.
+    is_seq_neighbor_of_cat = any(
+        abs(residue.resno - cat) <= 1 and residue.chain == cat_chain
+        for cat, cat_chain in catalytic_resnos_with_chain
+    )
+    if bb_proximity and not is_seq_neighbor_of_cat and (
         residue.theta_orient_centroid_deg <= 110.0    # path (a)
         OR has_explicit_backbone_hbond(residue, ligand_atoms)  # path (b)
     ):
@@ -160,23 +192,30 @@ def is_primary(residue, ligand_atoms, catalytic_resnos, cfg):
 
 ```python
 def is_secondary(residue, primary_residues, ligand_atoms, cfg):
-    # Path A: contacts a primary residue's sidechain (preorganization).
-    # This is the literature definition — "second shell coordinates first."
-    if any(
-        residue.min_dist_sidechain_to(p.sidechain_atoms) <= cfg.primary_distance
+    # Path A: contacts a primary residue (preorganization).
+    # Codex round 2: include BOTH sidechain-to-sidechain AND
+    # sidechain-to-backbone-polar (helix-cap preorganization H-bonds
+    # the backbone NH of a primary, classic in Tawfik scaffolds).
+    n_coordinated = sum(
+        residue.min_dist_sidechain_to(
+            p.sidechain_atoms + p.backbone_polar_atoms  # N + O
+        ) <= cfg.primary_distance
         for p in primary_residues
-    ):
-        return True   # Includes the Asp301↔His254-catalytic case
+    )
+    if n_coordinated >= 1:
+        return True, n_coordinated   # used for soft scoring (codex r2 #5)
 
-    # Path B: near-pocket residues pointing inward (preorganize from a
-    # distance via VDW packing or 2nd-shell H-bond networks).
+    # Path B: near-pocket residues pointing inward (preorganize via VDW
+    # packing or 2nd-shell H-bond networks).
     if (residue.d_sidechain_lig <= cfg.secondary_distance
         AND residue.theta_orient_centroid_deg <= cfg.orient_inward_max_deg
         AND residue.sasa_sc_fraction < cfg.secondary_sasa_max_fraction):
-        return True
+        return True, 0
 
-    return False
+    return False, 0
 ```
+
+Also recorded: `secondary_coordination_count` (int) — how many primary residues this secondary residue coordinates. Used for soft scoring: `secondary_score *= clamp(1 + 0.3 * (n-1), 1.0, 1.5)`. A residue coordinating 3 primaries (e.g. Asp catalytic-triad-style preorganization hub) gets a 1.4× boost. Don't change the hard `class` label on count.
 
 ### Tiers 3–4: same as before
 
@@ -276,6 +315,14 @@ Then `d_sidechain_lig = min(||sc_atom - lig_atom||)` over all (sidechain atom, l
 `d_sidechain_catshell` is the same but vs catalytic-residue sidechain atoms instead.
 
 This naturally handles the Arg-reaches-into-pocket case: if NH1 is at 3 Å from the ligand, `d_sidechain_lig = 3.0` regardless of where the CA sits.
+
+## 6b. Misclassification edge-case exclusions (codex round 2)
+
+- **Sequence-neighbor backbone (codex r2 #7).** Residue (i+1) inherits backbone proximity from a catalytic residue at i because the peptide bond is ~1.3 Å. That's a trivial sequence artifact, not a real contact. Excluded in `is_primary` (see Pass 1 pseudocode).
+- **Disulfide-bonded Cys (codex r2 #8).** SG-SG ≈ 2.05 Å; if a primary residue is also Cys, its disulfide partner trivially passes "sidechain within 4.5 Å of primary's sidechain" without being mechanistically relevant. Add `is_disulfide_partner` boolean column; exclude from secondary path A. Detection: any pair of CYS with SG-SG ≤ 2.3 Å.
+- **omit_AA Cys at sample time (codex r2 #6).** **Classification reads structure-state, not sampling-state.** If a position is `omit_AA="C"` in the driver (PTE_i1 default), classification still reports the structural class based on whatever residue is currently in that position. Downstream consumers enforce the omit at sample time. We do not collapse omitted AAs into a special class.
+- **Symmetric multimers / chain-aware catalytic_resnos (codex r2 #8).** PTE_i1 is a homodimer; catalytic residues in one chain may be in the other chain's active site. `catalytic_resnos` MUST carry chain ID, not just resno. Internal representation: `set[(chain_id, resno)]`. The current `parse_remark_666` already returns `CatalyticResidue` with chain; we just need to keep it through.
+- **Water-mediated H-bonds.** Deliberately ignored in v1 (no water modeling). Documented; revisit in v2 if it matters.
 
 ## 7. PTE-specific fixes
 
