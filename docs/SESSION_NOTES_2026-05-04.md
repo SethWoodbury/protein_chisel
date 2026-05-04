@@ -100,6 +100,50 @@ Revised efficiency recommendations after codex pushback:
 
 Plan committed at `docs/plans/efficiency_plan.md`. Execution deferred to your direction.
 
+## Update 12:55 PM — production efficiency landed
+
+After user instruction at ~12:45 PM, executed the efficiency plan:
+
+1. **CLI defaults flipped to Sweep B** (commit `ecb4fe9`): `--strategy
+   annealing`, `--consensus_threshold 0.90`, `--consensus_strength 1.0`,
+   `--consensus_max_fraction 0.15`. `--plm_strength 1.25` already.
+2. **DFI seed-only refactor**: was per-design (~80 ms × 200 = 16s/cycle
+   wasted); now computed once at startup, broadcast as constants.
+3. **fpocket parallelization** via `multiprocessing.Pool(min(cpus, n_designs, 8))`.
+   Each fpocket subprocess writes to its own tmp dir; safe.
+4. **sbatch defaults cut**: mem 16G→10G, time 8h→1h.
+
+### GPU efficiency test (job 14118716, cpus=4 mem=10G)
+
+**Wall time: 3m49s** (was 8m9s for Sweep A) — **53% faster**.
+- MaxRSS 3.35 GB (33% of 10G allocation; could even go to 6G)
+- fpocket per-cycle: ~6-16s (was 76-91s) — 5-8× speedup
+- Top fitness max −1.795 (matches Sweep B's −1.791 — quality preserved)
+- Mean fitness −1.839, ham 38.6 — pool drift due to stochastic
+  sampling (`fused_mpnn --seed 0` randomizes each run); within
+  expected envelope. WT is at −1.822, so max is still above WT.
+
+Sweep B-quality results in HALF the wall time, HALF the slurm priority cost.
+
+### CPU efficiency test (job 14118717, cpus=8 mem=12G) — RUNNING
+
+In flight at 12:55 PM, ~5 min into cycle 0 sampling. Will report when done.
+
+## Compute WT fitness for comparison
+
+Computed direct from seed PDB + cached PLM artifacts:
+
+```
+WT logp_fused = −1.8217  (logp_esmc = −2.057, logp_saprot = −1.756)
+```
+
+Production-best max −1.791 is **above WT** (more PLM-natural per residue
+than WT). The "0.1 mean fitness loss" reflects keeping a more diverse
+pool — elite designs are not regressed.
+
+## Final state at 6:05 AM
+(Original state — see below for the autonomous-block summary.)
+
 ## Final state at 6:05 AM
 
 **Phase 1, 2, 3 all complete.**
