@@ -132,12 +132,15 @@ class CycleConfig:
     # catalytic in this scaffold). If your scaffold has a catalytic Cys,
     # pass "" or list only the ones you actually want to forbid.
     omit_AA: str = "X"
-    # MPNN flags (4-condition ablation showed sc=0 substantially boosts
-    # first-shell diversity at no fitness cost; pLDDT enhance gives +0.02
-    # nats fitness at a small diversity cost). Defaults below are the
-    # diversity-first settings; pass --use_side_chain_context 1 or
-    # --enhance plddt_residpo_alpha_<tag> to override.
-    use_side_chain_context: int = 0
+    # MPNN flags. Default use_side_chain_context=1 because sc=0 (which
+    # the ablation suggested for first-shell diversity) causes severe
+    # clashes between MPNN-sampled bulky residues at first-shell positions
+    # and catalytic sidechain rotamers (which MPNN can't see when sc=0).
+    # On the PTE_i1 scaffold sc=0 produced 90%+ rejection at the clash
+    # filter for residue 35 (Y) clashing with catalytic E131. Diversity
+    # injection at first-shell still works fine with sc=1; we just lose
+    # the small marginal diversity gain.
+    use_side_chain_context: int = 1
     enhance: Optional[str] = None
 
 
@@ -152,7 +155,7 @@ class IterativeRunConfig:
 
 def default_cycles(
     omit_AA: str = "X",
-    use_side_chain_context: int = 0,
+    use_side_chain_context: int = 1,
     enhance: Optional[str] = None,
     pi_min: float = 4.0,
     pi_max: float = 7.5,
@@ -1316,14 +1319,15 @@ def main() -> None:
                    help="Comma-sep rule_name=SEVERITY overrides, e.g. "
                         "'kr_neighbor_dibasic=HARD_OMIT,polyproline_stall=WARN_ONLY'. "
                         "SEVERITY in {WARN_ONLY,SOFT_BIAS,HARD_OMIT,HARD_FILTER}.")
-    p.add_argument("--use_side_chain_context", type=int, default=0,
+    p.add_argument("--use_side_chain_context", type=int, default=1,
                    choices=[0, 1],
-                   help="LigandMPNN flag. 0 (default) = MPNN sees only "
-                        "backbone + ligand atoms (more diverse first-shell "
-                        "sampling). 1 = MPNN sees catalytic sidechain "
-                        "rotamers (more WT-conservative). 4-condition "
-                        "ablation showed sc=0 raises first-shell unique "
-                        "AAs/pos from 2.14 -> 2.93 at no fitness cost.")
+                   help="LigandMPNN flag. 1 (default) = MPNN sees catalytic "
+                        "sidechain rotamers; safer because the packer can "
+                        "fit designed sidechains around them. 0 = MPNN sees "
+                        "only backbone + ligand atoms; gives slightly more "
+                        "first-shell diversity but in our tests caused 90%% "
+                        "design rejection on PTE_i1 due to severe clashes "
+                        "(designed Y@35 clashing with catalytic E@131).")
     p.add_argument("--enhance", type=str, default=None,
                    choices=[None, *AVAILABLE_ENHANCE_CHECKPOINTS],
                    help="Optional pLDDT-enhanced fused_mpnn checkpoint name. "

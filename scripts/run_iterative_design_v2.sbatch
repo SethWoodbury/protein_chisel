@@ -32,10 +32,11 @@ N_CYCLES="${N_CYCLES:-3}"
 # exclude C as well as X (UNK) by default. Override per-scaffold.
 OMIT_AA="${OMIT_AA:-CX}"
 
-# LigandMPNN side-chain-context flag. 0 (default) = MPNN sees only
-# backbone + ligand atoms (more first-shell diversity per ablation).
-# 1 = MPNN sees catalytic sidechain rotamers (WT-conservative).
-USE_SIDE_CHAIN_CONTEXT="${USE_SIDE_CHAIN_CONTEXT:-0}"
+# LigandMPNN side-chain-context flag. 1 (default) = MPNN sees catalytic
+# sidechain rotamers (clash-safe). 0 trades safety for first-shell
+# diversity but on PTE_i1 caused 90%+ design rejection due to severe
+# clashes (designed Y@35 vs catalytic E@131).
+USE_SIDE_CHAIN_CONTEXT="${USE_SIDE_CHAIN_CONTEXT:-1}"
 
 # Optional pLDDT-enhanced fused_mpnn checkpoint name (without .pth);
 # empty string = disabled. Adds ~+0.02 nats/residue mean fitness.
