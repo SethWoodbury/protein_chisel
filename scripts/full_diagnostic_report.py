@@ -220,22 +220,54 @@ def main() -> None:
               f"min {arr.min()}  max {arr.max()}   WT {wt}")
 
     # ------------------------------------------------------------------
-    print("\n-- DIVERSITY  (pairwise + identity-to-WT) --")
-    # Pairwise hamming.
+    print("\n-- DIVERSITY  (pairwise + identity-to-WT, full + per-class) --")
     L = len(seqs[0])
     arr = np.array([list(s) for s in seqs])
     n = len(arr)
-    pw = []
-    for i in range(n):
-        for j in range(i+1, n):
-            pw.append(int((arr[i] != arr[j]).sum()))
-    pw = np.array(pw)
-    print(f"  pairwise hamming                    {_fmt(pd.Series(pw), '.1f')}")
-    # Identity to WT.
+
+    def _pairwise_hamming(arr_subset: np.ndarray) -> np.ndarray:
+        if arr_subset.shape[1] == 0 or len(arr_subset) < 2:
+            return np.array([0])
+        out = []
+        for i in range(len(arr_subset)):
+            for j in range(i+1, len(arr_subset)):
+                out.append(int((arr_subset[i] != arr_subset[j]).sum()))
+        return np.array(out) if out else np.array([0])
+
+    def _per_position_unique(arr_subset: np.ndarray) -> np.ndarray:
+        """Number of unique AAs sampled at each position. 1 = collapsed."""
+        if arr_subset.shape[1] == 0:
+            return np.array([0])
+        return np.array([len(np.unique(arr_subset[:, j])) for j in range(arr_subset.shape[1])])
+
+    # Full-sequence hamming.
+    pw = _pairwise_hamming(arr)
+    print(f"  pairwise hamming (full L={L})       {_fmt(pd.Series(pw), '.1f')}")
     h_to_wt = _hamming_to_ref(seqs, WT_SEQ)
     pct_id = 100.0 * (1.0 - h_to_wt / L)
     print(f"  hamming to WT (n_mutations)         {_fmt(pd.Series(h_to_wt), '.1f')}")
     print(f"  sequence identity to WT (%)         {_fmt(pd.Series(pct_id), '.1f')}")
+
+    # Per-class diversity using re-classified PositionTable.
+    pt_v2 = run_dir / "position_table_v2.parquet"
+    if pt_v2.exists():
+        pt = pd.read_parquet(pt_v2)
+        prot = pt[pt["is_protein"]].sort_values("resno").reset_index(drop=True)
+        # Map seq position (0-indexed in design seq) to row index.
+        # All seqs have same length L; protein rows are also length L.
+        for cls in ("primary_sphere", "secondary_sphere", "nearby_surface",
+                    "distal_buried", "distal_surface"):
+            mask = (prot["class"] == cls).values
+            if not mask.any() or mask.sum() < 1:
+                continue
+            sub = arr[:, mask]
+            pw_cls = _pairwise_hamming(sub)
+            uniq = _per_position_unique(sub)
+            n_pos = mask.sum()
+            print(f"  [{cls:<18}] n={n_pos:3d}   "
+                  f"hamming {pw_cls.mean():5.1f} ± {pw_cls.std():4.1f}  "
+                  f"unique-AAs/pos {uniq.mean():.2f} ± {uniq.std():.2f} "
+                  f"(max possible {min(20, len(arr))})")
 
     # ------------------------------------------------------------------
     print("\n-- LIGAND GEOMETRY (heavy atoms only, no metals) --")

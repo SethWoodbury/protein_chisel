@@ -133,16 +133,33 @@ def compute_class_balanced_bias_AA(
         low_aa, low_z = zs[0]
         high_aa, high_z = zs[-1]
         if high_z > balance_z_threshold and low_z < -balance_z_threshold:
+            # Symmetric swap: both ends extreme.
             down_mag = min(max_bias_nats, bias_per_z * high_z)
             up_mag = min(max_bias_nats, bias_per_z * abs(low_z))
             _add(high_aa, -down_mag)
             _add(low_aa, +up_mag)
             swaps.append({
-                "class": class_name,
+                "class": class_name, "kind": "swap",
                 "down_aa": high_aa, "down_z": round(high_z, 2),
                 "up_aa": low_aa, "up_z": round(low_z, 2),
                 "down_bias": round(-down_mag, 3),
                 "up_bias": round(up_mag, 3),
+            })
+        elif high_z > over_z_threshold:
+            # Extreme over-rep with no swap partner: downweight anyway.
+            # Without this clause, an AA at z=+5 with no class member at
+            # z<−threshold is left untouched, which is exactly the
+            # E z=+5 / D z=−1.7 hole the user flagged. Downweighting here
+            # uses the same magnitude formula but doesn't produce an
+            # upweight on any partner.
+            down_mag = min(max_bias_nats, bias_per_z * high_z)
+            _add(high_aa, -down_mag)
+            swaps.append({
+                "class": class_name, "kind": "downweight_only",
+                "down_aa": high_aa, "down_z": round(high_z, 2),
+                "up_aa": None, "up_z": None,
+                "down_bias": round(-down_mag, 3),
+                "up_bias": 0.0,
             })
 
     # Clamp per-AA bias.
