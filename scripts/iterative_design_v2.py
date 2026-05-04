@@ -2188,7 +2188,13 @@ def run_cycle(
             pool_seq,
             reference="swissprot_ec3_hydrolases_2026_01",
             exclude_aas=excl,
-            balance_z_threshold=2.0,
+            # Lowered from 2.0 to 1.5 (2026-05-04): cycle-1 telemetry
+            # consistently showed E z=+5.4 paired with D z=-1.98 — D
+            # JUST missed the 2.0 cutoff so the literature-suggested
+            # E/D swap never fired. 1.5 catches the case where one
+            # class member is moderately under-rep AND the other is
+            # extremely over-rep.
+            balance_z_threshold=1.5,
             over_z_threshold=3.0,
             max_bias_nats=2.5,
             bias_per_z=0.4,
