@@ -67,8 +67,8 @@ SAPROT_MODEL="${SAPROT_MODEL:-saprot_35m}"
 # empty string = disabled. Adds ~+0.02 nats/residue mean fitness.
 ENHANCE="${ENHANCE:-}"
 
-# Working dir for this job
-TS=$(date +%Y%m%d-%H%M%S)
+# Working dir for this job (ms + PID for collision safety with concurrent jobs)
+TS=$(python3 -c 'import datetime,os; t=datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]; print(f"{t}-pid{os.getpid()}")' 2>/dev/null || date +%Y%m%d-%H%M%S)
 WORK_ROOT=/net/scratch/woodbuse
 WORK_DIR="$WORK_ROOT/iterative_design_v2_PTE_i1_${TS}"
 mkdir -p "$WORK_DIR"
