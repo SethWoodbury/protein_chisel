@@ -125,9 +125,18 @@ After user instruction at ~12:45 PM, executed the efficiency plan:
 
 Sweep B-quality results in HALF the wall time, HALF the slurm priority cost.
 
-### CPU efficiency test (job 14118717, cpus=8 mem=12G) — RUNNING
+### CPU efficiency test (job 14118717, cpus=8 mem=12G) — DONE
 
-In flight at 12:55 PM, ~5 min into cycle 0 sampling. Will report when done.
+**Wall time: 21m54s** for 3 cycles (was ~30 min extrapolation; faster
+due to fpocket parallelization).
+- MaxRSS 6.0 GB (50% of 12G allocation)
+- Top fitness max −1.799 (matches GPU's −1.795 within sampling noise)
+- Pool quality identical to GPU (mean −1.848, ham 37.8, pi 5.10,
+  0/36 severe clashes)
+- CPU is **5.7× slower than GPU** (3:49 vs 21:54), uses 0 GPU priority
+
+For "thousands of jobs" workflow: CPU is fully viable. Trade ~6× wall
+time for unlimited concurrent slurm slots.
 
 ## Compute WT fitness for comparison
 
