@@ -133,15 +133,12 @@ class CycleConfig:
     # catalytic in this scaffold). If your scaffold has a catalytic Cys,
     # pass "" or list only the ones you actually want to forbid.
     omit_AA: str = "X"
-    # MPNN flags. Default use_side_chain_context=1 because sc=0 (which
-    # the ablation suggested for first-shell diversity) causes severe
-    # clashes between MPNN-sampled bulky residues at first-shell positions
-    # and catalytic sidechain rotamers (which MPNN can't see when sc=0).
-    # On the PTE_i1 scaffold sc=0 produced 90%+ rejection at the clash
-    # filter for residue 35 (Y) clashing with catalytic E131. Diversity
-    # injection at first-shell still works fine with sc=1; we just lose
-    # the small marginal diversity gain.
-    use_side_chain_context: int = 1
+    # MPNN flags. Default use_side_chain_context=0 (diverse first-shell
+    # sampling). The clash failure mode (Y/F/W at residues with Cb < 5A
+    # of catalytic sidechain) is prevented at sample time by
+    # compute_clash_prone_first_shell_omits, which auto-forbids bulky
+    # AAs at those positions. So sc=0 is now safe.
+    use_side_chain_context: int = 0
     enhance: Optional[str] = None
 
 
@@ -156,7 +153,7 @@ class IterativeRunConfig:
 
 def default_cycles(
     omit_AA: str = "X",
-    use_side_chain_context: int = 1,
+    use_side_chain_context: int = 0,
     enhance: Optional[str] = None,
     pi_min: float = 5.0,
     pi_max: float = 7.5,
@@ -245,6 +242,67 @@ def compute_catalytic_neighbor_omit_dict(
             if nb not in resnos_in_chain:
                 continue            # off-chain or non-protein
             out[f"{chain}{nb}"] = forbid_aas
+    return out
+
+
+def compute_clash_prone_first_shell_omits(
+    *,
+    seed_pdb: Path,
+    position_table_df,
+    fixed_resnos: Iterable[int],
+    chain: str = CHAIN,
+    cb_clearance_threshold: float = 5.0,
+    forbid_aas: str = "YFWHM",
+    eligible_classes: tuple[str, ...] = ("first_shell", "buried"),
+) -> dict[str, str]:
+    """Auto-detect first-shell positions where MPNN cannot place bulky
+    side-chains without clashing with fixed catalytic atoms.
+
+    Per the side-chain-packer ablation (commit log), every learned and
+    rotamer-library packer converges to the same Y/F/W rotamer at
+    PDB-resno 35 in PTE_i1 (chi1 ~ g-) which clashes with catalytic E131
+    + nearby F135 -- the only non-clashing rotamer is in a low-prior
+    chi1 ~ 90-150 deg window that no packer picks. The fix is sample-
+    time: forbid Y/F/W at positions whose CB is within
+    ``cb_clearance_threshold`` of any fixed-residue sidechain heavy
+    atom, so MPNN never proposes them in the first place.
+
+    Returns ``{<chain><resno>: "YFWHM", ...}`` for the
+    --omit_AA_per_residue_multi JSON.
+    """
+    from protein_chisel.structure.clash_check import (
+        SIDECHAIN_ATOM_NAMES, _read_atoms,
+    )
+    fixed_set = set(int(r) for r in fixed_resnos)
+    eligible_classes_set = set(eligible_classes)
+    df = position_table_df
+    prot = df[(df["is_protein"]) & (df["chain"] == chain)].sort_values("resno")
+    eligible_resnos = prot[
+        (prot["class"].isin(eligible_classes_set))
+        & (~prot["resno"].astype(int).isin(fixed_set))
+    ]["resno"].astype(int).tolist()
+
+    atoms = _read_atoms(Path(seed_pdb))
+    cb_by_resno: dict[int, np.ndarray] = {}
+    fixed_sc_atoms: list[np.ndarray] = []
+    for a in atoms:
+        if a["chain_id"] != chain or a["record"] != "ATOM":
+            continue
+        if a["res_seq"] in fixed_set:
+            sc_names = SIDECHAIN_ATOM_NAMES.get(a["res_name"], set())
+            if a["atom_name"] in sc_names:
+                fixed_sc_atoms.append(np.array([a["x"], a["y"], a["z"]]))
+        elif a["res_seq"] in eligible_resnos and a["atom_name"] == "CB":
+            cb_by_resno[a["res_seq"]] = np.array([a["x"], a["y"], a["z"]])
+
+    if not fixed_sc_atoms:
+        return {}
+    fixed_arr = np.array(fixed_sc_atoms)
+    out: dict[str, str] = {}
+    for resno, cb in cb_by_resno.items():
+        d = np.linalg.norm(fixed_arr - cb, axis=1).min()
+        if d < cb_clearance_threshold:
+            out[f"{chain}{resno}"] = forbid_aas
     return out
 
 
@@ -1320,15 +1378,16 @@ def main() -> None:
                    help="Comma-sep rule_name=SEVERITY overrides, e.g. "
                         "'kr_neighbor_dibasic=HARD_OMIT,polyproline_stall=WARN_ONLY'. "
                         "SEVERITY in {WARN_ONLY,SOFT_BIAS,HARD_OMIT,HARD_FILTER}.")
-    p.add_argument("--use_side_chain_context", type=int, default=1,
+    p.add_argument("--use_side_chain_context", type=int, default=0,
                    choices=[0, 1],
-                   help="LigandMPNN flag. 1 (default) = MPNN sees catalytic "
-                        "sidechain rotamers; safer because the packer can "
-                        "fit designed sidechains around them. 0 = MPNN sees "
-                        "only backbone + ligand atoms; gives slightly more "
-                        "first-shell diversity but in our tests caused 90%% "
-                        "design rejection on PTE_i1 due to severe clashes "
-                        "(designed Y@35 clashing with catalytic E@131).")
+                   help="LigandMPNN flag. 0 (default) = MPNN sees only "
+                        "backbone + ligand atoms (better first-shell "
+                        "diversity). The clash failure mode that previously "
+                        "made sc=0 unsafe (Y/F/W at first-shell positions "
+                        "vs catalytic sidechains) is now prevented at "
+                        "sample time by auto-detected per-residue omits "
+                        "for clash-prone positions. 1 = MPNN sees catalytic "
+                        "sidechain rotamers (more WT-conservative).")
     p.add_argument("--enhance", type=str, default=None,
                    choices=[None, *AVAILABLE_ENHANCE_CHECKPOINTS],
                    help="Optional pLDDT-enhanced fused_mpnn checkpoint name. "
@@ -1436,8 +1495,24 @@ def main() -> None:
         protein_resnos=protein_resnos,
     )
     LOGGER.info("WT engine eval: %s", wt_eng.summary())
-    omit_AA_per_residue = wt_eng.to_omit_AA_json("A", protein_resnos=protein_resnos)
-    LOGGER.info("expression-engine HARD_OMIT JSON: %s", omit_AA_per_residue)
+    expression_omit = wt_eng.to_omit_AA_json("A", protein_resnos=protein_resnos)
+    LOGGER.info("expression-engine HARD_OMIT JSON: %s", expression_omit)
+
+    # Auto-detect first-shell positions where Cb is too close to a fixed
+    # catalytic sidechain to fit Y/F/W/H/M (per the side-chain-packer
+    # ablation: every learned and rotamer-library packer converges to
+    # clashing rotamers at residues like 35; the only fix is sample-time).
+    clash_prone_omit = compute_clash_prone_first_shell_omits(
+        seed_pdb=args.seed_pdb,
+        position_table_df=pt.df,
+        fixed_resnos=DEFAULT_CATRES,
+        chain=CHAIN,
+        cb_clearance_threshold=5.0,
+        forbid_aas="YFWHM",
+    )
+    LOGGER.info("clash-prone first-shell omit_AA: %s", clash_prone_omit)
+    omit_AA_per_residue = merge_omit_dicts(expression_omit, clash_prone_omit)
+    LOGGER.info("merged structural omit_AA: %s", omit_AA_per_residue)
 
     # ---- Cycle schedule ---------------------------------------------
     cycles = default_cycles(
