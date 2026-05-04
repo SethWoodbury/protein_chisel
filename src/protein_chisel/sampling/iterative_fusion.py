@@ -34,8 +34,16 @@ _AA_TO_IDX = {aa: i for i, aa in enumerate(AA_ORDER)}
 class IterationBiasConfig:
     consensus_threshold: float = 0.85         # AA freq required to "agree"
     consensus_strength: float = 2.0           # nats added at agreed AA
+    # Classes where consensus reinforcement is allowed. Includes BOTH
+    # legacy 5-class names AND new directional 6-class names so this
+    # works with old and new PositionTables. Excludes active_site/
+    # primary_sphere by default (those are typically fixed catalytic
+    # residues — consensus there would just reinforce the WT identity).
     only_at_classes: tuple[str, ...] = (
+        # Legacy 5-class:
         "buried", "surface", "first_shell", "pocket",
+        # New directional 6-class:
+        "secondary_sphere", "nearby_surface", "distal_buried", "distal_surface",
     )
     # Cap on how many positions can be augmented; protects diversity.
     max_augmented_fraction: float = 0.30
