@@ -317,7 +317,12 @@ def compute_graded_clash_bias(
     cb_clearance_threshold: float = 5.0,
     eligible_classes: tuple[str, ...] = ("first_shell", "buried"),
     bulky_aas: str = "YFWHMR",
-    bias_strength_per_pct_clash: float = 3.0,
+    # Per-AA bias = -bias_strength_per_pct_clash * clash_pct.
+    # Crude 9-stub rotamer grid produces small clash percentages
+    # (typically 0.1-0.3), so we need a high strength to give a
+    # meaningful nudge. At strength=20: 20% clash -> -4 nats (firm
+    # discouragement, still sample-able when context strongly favors).
+    bias_strength_per_pct_clash: float = 20.0,
     rotamer_grid_chi1: tuple[float, ...] = (-60, 60, 180),
     rotamer_grid_chi2: tuple[float, ...] = (-60, 60, 180),
     clash_atom_distance: float = 2.0,
