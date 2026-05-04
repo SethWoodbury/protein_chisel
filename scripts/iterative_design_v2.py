@@ -727,6 +727,13 @@ def stage_seq_filter(
     catalytic_resnos: Iterable[int] = (),
     design_ph: float = 7.5,
     fixed_resnos: Iterable[int] = (),
+    # Light de-novo filters on cheap sequence-only metrics. Generous
+    # thresholds — only catch truly broken designs, not most of the pool.
+    instability_max: float = 60.0,        # Guruprasad 1990; lit 40 is for natives
+    gravy_min: float = -0.8,              # typical soluble: -0.4 to 0
+    gravy_max: float = +0.3,
+    aliphatic_min: float = 40.0,          # thermostable: ~85-100
+    boman_max: float = 4.5,               # PPI-prone above ~2.5
     pi_min: float = 0.0,
     pi_max: float = 14.0,
 ) -> Path:
@@ -770,6 +777,26 @@ def stage_seq_filter(
         if not (pi_min <= pp.pi <= pi_max):
             reasons.append(f"pI={pp.pi:.2f} outside [{pi_min}, {pi_max}]")
 
+        # Light de-novo filters on cheap sequence-only metrics. Each
+        # threshold is set so they catch *truly broken* designs only —
+        # the production pool typically passes all of these comfortably.
+        if pp.instability_index >= instability_max:
+            reasons.append(
+                f"instability_index={pp.instability_index:.1f} >= {instability_max}"
+            )
+        if not (gravy_min <= pp.gravy <= gravy_max):
+            reasons.append(
+                f"GRAVY={pp.gravy:+.3f} outside [{gravy_min}, {gravy_max}]"
+            )
+        if pp.aliphatic_index < aliphatic_min:
+            reasons.append(
+                f"aliphatic_index={pp.aliphatic_index:.1f} < {aliphatic_min}"
+            )
+        if pp.boman_index >= boman_max:
+            reasons.append(
+                f"boman_index={pp.boman_index:.2f} >= {boman_max}"
+            )
+
         # Run the full expression-rule engine (covers OmpT, ssrA, Tat, signal
         # peptides, AMP-like, polyproline, SecM, cytosolic disulfides, and
         # tag-protease internal sites). Structure-aware rules use the SEED
@@ -803,6 +830,18 @@ def stage_seq_filter(
             "instability_index": pp.instability_index,
             "gravy": pp.gravy,
             "pi": pp.pi,
+            # Cheap sequence-only metrics added 2026-05-04 for diagnostic +
+            # light filtering. All sub-ms.
+            "aliphatic_index": pp.aliphatic_index,
+            "boman_index": pp.boman_index,
+            "aromaticity": pp.aromaticity,
+            "flexibility_mean_seq": pp.flexibility_mean if pp.flexibility_mean is not None else float("nan"),
+            "helix_frac_seq": pp.helix_frac_seq,
+            "turn_frac_seq": pp.turn_frac_seq,
+            "sheet_frac_seq": pp.sheet_frac_seq,
+            "molecular_weight": pp.molecular_weight,
+            "extinction_280nm_no_disulfide": pp.extinction_280nm_no_disulfide,
+            "extinction_280nm_disulfide": pp.extinction_280nm_disulfide,
             "n_expression_warnings": n_warnings,
             "n_expression_soft_bias_hits": n_soft_bias,
             "n_expression_hard_omit_hits": n_hard_omit,
@@ -1130,6 +1169,9 @@ def stage_struct_filter(
     fixed_resnos: Iterable[int] = (),
     clash_filter: bool = True,
     clash_severe_distance: float = 1.5,
+    # For DFI per-class summary
+    position_classes_for_dfi: Optional[list[str]] = None,
+    position_resnos_for_dfi: Optional[list[int]] = None,
 ) -> Path:
     """Apply h-bond + SAP-proxy structural filter."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1206,6 +1248,25 @@ def stage_struct_filter(
                 "preorg__n_first_shell": 0,
                 "preorg__n_second_shell": 0,
             }
+        # DFI (GNM-based dynamic flexibility index). Diagnostic only,
+        # ~50-80 ms/design. Per-class summary picks up the active-site
+        # vs framework signal we want for enzyme design QC.
+        from protein_chisel.scoring.dfi import compute_dfi
+        try:
+            dfi_classes = position_classes_for_dfi
+            dfi_resnos = position_resnos_for_dfi
+            dfi_res = compute_dfi(
+                pdb, chain=CHAIN,
+                classes=dfi_classes, classes_resnos=dfi_resnos,
+            )
+            dfi_metrics = dfi_res.to_dict()
+        except Exception as e:                # pragma: no cover
+            LOGGER.warning("DFI failed for %s: %s", cid, e)
+            dfi_metrics = {
+                "dfi__mean": float("nan"), "dfi__std": float("nan"),
+                "dfi__min": float("nan"), "dfi__max": float("nan"),
+                "dfi__elapsed_ms": float("nan"),
+            }
         reasons: list[str] = []
         if len(hbonds) < 1:
             reasons.append("no h-bonds to catalytic HIS")
@@ -1225,6 +1286,7 @@ def stage_struct_filter(
                      "sap_p95": sap.get("sap_p95", float("nan")),
                      **clash_dict,
                      **preorg_metrics,
+                     **dfi_metrics,
                      "passed_struct_filter": not reasons,
                      "struct_fail": "; ".join(reasons)})
 
@@ -2135,6 +2197,11 @@ def run_cycle(
     catalytic_his_resnos: Iterable[int] = CATALYTIC_HIS_RESNOS,
     balance_z_threshold: float = 2.0,
     design_ph: float = 7.5,
+    instability_max: float = 60.0,
+    gravy_min: float = -0.8,
+    gravy_max: float = 0.3,
+    aliphatic_min: float = 40.0,
+    boman_max: float = 4.5,
 ) -> tuple[Optional[pd.DataFrame], dict[str, Path]]:
     """Run ONE iteration cycle. Returns (ranked DataFrame, pdb_map)."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -2302,6 +2369,11 @@ def run_cycle(
         pi_min=cycle_cfg.pi_min,
         pi_max=cycle_cfg.pi_max,
         design_ph=design_ph,
+        instability_max=instability_max,
+        gravy_min=gravy_min,
+        gravy_max=gravy_max,
+        aliphatic_min=aliphatic_min,
+        boman_max=boman_max,
     )
 
     # ---- 4. Struct filter -------------------------------------------
@@ -2314,6 +2386,8 @@ def run_cycle(
         fixed_resnos=fixed_resnos,
         clash_filter=cycle_cfg.clash_filter,
         clash_severe_distance=cycle_cfg.clash_severe_distance,
+        position_classes_for_dfi=seed_position_class,
+        position_resnos_for_dfi=seed_protein_resnos,
     )
 
     n_struct = len(pd.read_csv(survivors_struct, sep="\t"))
@@ -2415,6 +2489,24 @@ def main() -> None:
                         "Rosetta no-repack metrics panel (DDG + interface "
                         "energy + ...) on the top-K only. ~30-60 s/design, "
                         "needs pyrosetta.sif. Default OFF.")
+    p.add_argument("--instability_max", type=float, default=60.0,
+                   help="Light filter on Guruprasad 1990 instability index. "
+                        "Lit threshold for native E. coli expression is 40, "
+                        "but de novo designs run higher; default 60 catches "
+                        "truly broken sequences only. Set 9999 to disable.")
+    p.add_argument("--gravy_min", type=float, default=-0.8,
+                   help="Light filter on Kyte-Doolittle GRAVY. Typical "
+                        "soluble proteins fall in [-0.4, 0]; default [-0.8, "
+                        "0.3] is generous.")
+    p.add_argument("--gravy_max", type=float, default=0.3)
+    p.add_argument("--aliphatic_min", type=float, default=40.0,
+                   help="Light filter on Ikai 1980 aliphatic index. "
+                        "Thermostable native: ~85-100. Default lower bound "
+                        "40 catches only extremely low-aliphatic outliers.")
+    p.add_argument("--boman_max", type=float, default=4.5,
+                   help="Light filter on Boman index (PPI/sticky propensity). "
+                        "Boman 2003 threshold ~2.5; default 4.5 catches only "
+                        "extreme cases.")
     p.add_argument("--design_ph", type=float, default=7.8,
                    help="pH at which net charge / pI / etc. are computed. "
                         "Default 7.8 (close to PTE assay buffer pH 8.0, "
@@ -2707,6 +2799,11 @@ def main() -> None:
             omit_AA_per_residue=omit_AA_per_residue,
             balance_z_threshold=args.balance_z_threshold,
             design_ph=args.design_ph,
+            instability_max=args.instability_max,
+            gravy_min=args.gravy_min,
+            gravy_max=args.gravy_max,
+            aliphatic_min=args.aliphatic_min,
+            boman_max=args.boman_max,
         )
         if ranked_df is not None and len(ranked_df) > 0:
             ranked_df = ranked_df.copy()

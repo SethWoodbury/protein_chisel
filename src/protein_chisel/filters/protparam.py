@@ -62,6 +62,19 @@ class ProtParamResult:
     # DIAGNOSTIC: minimalist legacy variant — only D/E/K/R + termini
     # (no H/C/Y). Matches the legacy Rosetta NetCharge filter.
     charge_at_pH_DE_KR_only: float = 0.0
+    # Aliphatic index (Ikai 1980, doi:10.1093/oxfordjournals.jbchem.a131836).
+    # AI = X(A) + 2.9·X(V) + 3.9·(X(I) + X(L)),
+    # with X(AA) the mol percent. Correlates with thermostability:
+    # native mesophilic ~75, thermophiles ~85-100. Higher = more
+    # thermally stable in general. Computed sub-ms.
+    aliphatic_index: float = 0.0
+    # Boman index (Boman 2003, doi:10.1046/j.1365-2796.2003.01228.x; using
+    # Radzicka-Wolfenden 1988 water→cyclohexane transfer free energies).
+    # Per-residue mean of the transfer free energy: positive values =
+    # protein-protein-interaction-prone / "sticky" / aggregation-prone.
+    # Threshold ~2.48 in Boman's original work; pharmaceutical proteins
+    # typically <2.0. Computed sub-ms.
+    boman_index: float = 0.0
     flexibility_mean: Optional[float] = None
     helix_frac_seq: float = 0.0  # ProtParam's secondary-structure-from-sequence
     turn_frac_seq: float = 0.0
@@ -82,6 +95,8 @@ class ProtParamResult:
             f"{prefix}charge_at_pH7_no_HIS": self.charge_at_pH7_no_HIS,
             f"{prefix}charge_at_pH7_HIS_half": self.charge_at_pH7_HIS_half,
             f"{prefix}charge_at_pH_DE_KR_only": self.charge_at_pH_DE_KR_only,
+            f"{prefix}aliphatic_index": self.aliphatic_index,
+            f"{prefix}boman_index": self.boman_index,
             f"{prefix}flexibility_mean": self.flexibility_mean if self.flexibility_mean is not None else float("nan"),
             f"{prefix}helix_frac_seq": self.helix_frac_seq,
             f"{prefix}turn_frac_seq": self.turn_frac_seq,
@@ -148,6 +163,8 @@ def protparam_metrics(sequence: str, ph: float = 7.8) -> ProtParamResult:
             + 0.5 * canonical.count("H")
         ),
         charge_at_pH_DE_KR_only=float(_charge_at_ph_de_kr_only(canonical, ph)),
+        aliphatic_index=_aliphatic_index(canonical),
+        boman_index=_boman_index(canonical),
         flexibility_mean=flex_mean,
         helix_frac_seq=float(helix),
         turn_frac_seq=float(turn),
@@ -196,6 +213,47 @@ def _charge_at_ph_de_kr_only(sequence: str, ph: float) -> float:
     nterm = _hh_pos(ph, _NTERM_PKA)
     cterm = _hh_neg(ph, _CTERM_PKA)
     return n_pos + nterm - n_neg - cterm
+
+
+# Radzicka & Wolfenden 1988 water → cyclohexane transfer free energies
+# (kcal/mol). Used by the Boman index. Negative = hydrophobic (prefers
+# cyclohexane); positive = hydrophilic (prefers water). Reference:
+# Radzicka A, Wolfenden R. Biochemistry 1988, 27, 1664.
+_RADZICKA_DG = {
+    "A": 1.81,  "R": 14.92, "N":  6.64, "D":  8.72, "C":  1.28,
+    "Q":  5.54, "E":  6.81, "G":  0.94, "H":  4.66, "I": -1.56,
+    "L": -1.81, "K":  5.55, "M": -0.76, "F": -2.20, "P":  0.0,
+    "S":  1.25, "T":  0.46, "W": -2.09, "Y":  0.21, "V": -0.78,
+}
+
+
+def _aliphatic_index(sequence: str) -> float:
+    """Ikai 1980 aliphatic index. Higher → more thermostable.
+
+    AI = X(A) + 2.9·X(V) + 3.9·(X(I) + X(L))
+    where X(aa) is the mol percent (NOT fraction).
+    """
+    L = len(sequence)
+    if L == 0:
+        return 0.0
+    pct_A = 100.0 * sequence.count("A") / L
+    pct_V = 100.0 * sequence.count("V") / L
+    pct_I = 100.0 * sequence.count("I") / L
+    pct_L = 100.0 * sequence.count("L") / L
+    return float(pct_A + 2.9 * pct_V + 3.9 * (pct_I + pct_L))
+
+
+def _boman_index(sequence: str) -> float:
+    """Boman 2003 protein-binding index.
+
+    Mean of side-chain water → cyclohexane transfer ΔG, per residue.
+    Higher → more "sticky" (PPI-prone, aggregation risk).
+    """
+    L = len(sequence)
+    if L == 0:
+        return 0.0
+    total = sum(_RADZICKA_DG.get(aa, 0.0) for aa in sequence)
+    return float(total / L)
 
 
 def _hh_pos(ph: float, pka: float) -> float:
