@@ -21,6 +21,20 @@ def _engine(profile=None):
     return ExpressionRuleEngine(profile=profile)
 
 
+def _no_tag_engine():
+    """Profile with no tags — terminus rules NOT short-circuited.
+
+    Used for tests that want to exercise the terminus rules directly.
+    With the default Strep-tag profile, ssra/hydrophobic_c_tail/
+    n_end_rule/signal_peptide/tat/lipobox short-circuit because the
+    designed body's termini are internal in the full construct.
+    """
+    p = ExpressionProfile.bl21_cytosolic_streptag()
+    return ExpressionRuleEngine(
+        profile=type(p)(**{**p.__dict__, "n_tag": "", "c_tag": ""}),
+    )
+
+
 # ----------------------------------------------------------------------
 # Severity ordering + overrides
 # ----------------------------------------------------------------------
@@ -68,7 +82,7 @@ def test_profile_overrides_string_missing_eq_raises():
 
 
 def test_ssra_exact_fires():
-    res = _engine().evaluate("MSGDESIGNAANDENYALAA")
+    res = _no_tag_engine().evaluate("MSGDESIGNAANDENYALAA")
     fail = [h for h in res.hits if h.rule_name == "ssra_tag_cterm"]
     assert fail, "ssrA_tag_cterm did not fire on exact AANDENYALAA"
     assert fail[0].severity == Severity.HARD_FILTER
@@ -83,13 +97,13 @@ def test_ssra_does_not_fire_on_strep_tag():
 
 
 def test_hydrophobic_c_tail_fires_on_VLAAA():
-    res = _engine().evaluate("MSGEEEDDDLLLLEEDDLAAGSVAAVLAAA")
+    res = _no_tag_engine().evaluate("MSGEEEDDDLLLLEEDDLAAGSVAAVLAAA")
     fail = [h for h in res.hits if h.rule_name == "hydrophobic_c_tail"]
     assert fail, "hydrophobic_c_tail did not fire on VLAAA"
 
 
 def test_hydrophobic_c_tail_does_not_fire_on_charged_tail():
-    res = _engine().evaluate("MSGEEEDDDLLLLEEDDLAAGSEEDDDK")
+    res = _no_tag_engine().evaluate("MSGEEEDDDLLLLEEDDLAAGSEEDDDK")
     fail = [h for h in res.hits if h.rule_name == "hydrophobic_c_tail"]
     assert not fail
 
@@ -115,7 +129,7 @@ def test_metap_warning_does_not_fire_on_ML():
 
 def test_n_end_rule_fires_on_no_M_start_with_L():
     """Sequence starting with L (no M, no MetAP) -> mature N-term L = degron."""
-    res = _engine().evaluate("LDESIGNGSAEEDDLLEEDDDDK")
+    res = _no_tag_engine().evaluate("LDESIGNGSAEEDDLLEEDDDDK")
     n_end = [h for h in res.hits if h.rule_name == "n_end_rule_destabilizing"]
     assert n_end, "n_end_rule should fire when seq[0] = L"
     assert n_end[0].severity == Severity.HARD_FILTER
@@ -123,7 +137,7 @@ def test_n_end_rule_fires_on_no_M_start_with_L():
 
 def test_signal_peptide_fires_on_synthetic_sec():
     """Synthetic Sec signal: basic n-region + hydrophobic h-region + AXA."""
-    res = _engine().evaluate(
+    res = _no_tag_engine().evaluate(
         "MKKLLALAVLAAFAQAAAGSAEEEDDDLLLLEKKK" + "A" * 50,
     )
     sp = [h for h in res.hits if h.rule_name == "signal_peptide_n_term"]
@@ -137,13 +151,13 @@ def test_signal_peptide_does_not_fire_on_acidic_n_term():
 
 
 def test_tat_motif_fires():
-    res = _engine().evaluate("MNSRRTFLKAAEEDDLLEEDDLAAGSEEDDK")
+    res = _no_tag_engine().evaluate("MNSRRTFLKAAEEDDLLEEDDLAAGSEEDDK")
     tat = [h for h in res.hits if h.rule_name == "tat_signal_motif"]
     assert tat
 
 
 def test_lipobox_fires():
-    res = _engine().evaluate("MSGAAAALAGCAAEEDDLLEEDDLAAGSEEDDK")
+    res = _no_tag_engine().evaluate("MSGAAAALAGCAAEEDDLLEEDDLAAGSEEDDK")
     lb = [h for h in res.hits if h.rule_name == "lipobox_n_term"]
     assert lb
 

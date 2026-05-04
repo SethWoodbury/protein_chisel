@@ -90,6 +90,16 @@ SC_CKPT = "/net/databases/mpnn/packer_weights/s_300756.pt"
 # ----------------------------------------------------------------------
 
 
+AVAILABLE_ENHANCE_CHECKPOINTS: tuple[str, ...] = (
+    "plddt_residpo_alpha_20250116-aec4d0c4",
+    "plddt_residpo_combine_from_timo_100k_20250905-36329ea5",
+    "plddt_preetham_20241018-5cb969e8",
+    "plddt_3_20240930-f9c9ea0f",
+    "plddt_4_20241003-a358098e",
+    "plddt_16_20240910-b65a33eb",
+)
+
+
 @dataclass
 class CycleConfig:
     cycle_idx: int
@@ -99,6 +109,21 @@ class CycleConfig:
     sap_max_threshold: float = 15.0
     consensus_threshold: float = 0.85
     consensus_strength: float = 2.0
+    # Soluble-enzyme pI window. Mature B. diminuta PTE pI ~6.5; arylesterase
+    # variants ~7.0. Activity assays at pH 7.5-8.5. Reject designs with
+    # pI outside [pi_min, pi_max].
+    pi_min: float = 6.0
+    pi_max: float = 7.5
+    # fpocket-druggability filter on the active-site pocket. Designs
+    # with druggability < this are dropped (no detectable active-site
+    # cavity = bad design). Set to 0 to disable.
+    fpocket_druggability_min: float = 0.30
+    # Heavy-atom clash check. Designs with severe clashes (any heavy-
+    # atom pair < 1.5 A between designed sidechain and catalytic /
+    # ligand) are dropped. With sc_context=0 MPNN can't see catalytic
+    # rotamers and sometimes proposes residues the packer can't fit.
+    clash_filter: bool = True
+    clash_severe_distance: float = 1.5
     # AAs MPNN may never sample. "X" (UNK) is always omitted by fused_mpnn
     # convention; everything else is opt-in. Default empty -> no AA-omission.
     # The PTE_i1 sbatch passes "CX" to also exclude cysteine (no Cys is
@@ -127,6 +152,10 @@ def default_cycles(
     omit_AA: str = "X",
     use_side_chain_context: int = 0,
     enhance: Optional[str] = None,
+    pi_min: float = 6.0,
+    pi_max: float = 7.5,
+    fpocket_druggability_min: float = 0.30,
+    clash_filter: bool = True,
 ) -> list[CycleConfig]:
     """Three-cycle exploration → exploitation schedule.
 
@@ -138,21 +167,26 @@ def default_cycles(
     ``"plddt_residpo_alpha_20250116-aec4d0c4"``. Boosts mean fitness
     by ~0.02 nats/residue at a diversity cost.
     """
+    common = dict(
+        omit_AA=omit_AA,
+        use_side_chain_context=use_side_chain_context,
+        enhance=enhance,
+        pi_min=pi_min, pi_max=pi_max,
+        fpocket_druggability_min=fpocket_druggability_min,
+        clash_filter=clash_filter,
+    )
     return [
         CycleConfig(
             cycle_idx=0, n_samples=500, sampling_temperature=0.20,
-            net_charge_max=-10.0, sap_max_threshold=15.0, omit_AA=omit_AA,
-            use_side_chain_context=use_side_chain_context, enhance=enhance,
+            net_charge_max=-10.0, sap_max_threshold=15.0, **common,
         ),
         CycleConfig(
             cycle_idx=1, n_samples=400, sampling_temperature=0.18,
-            net_charge_max=-11.0, sap_max_threshold=13.0, omit_AA=omit_AA,
-            use_side_chain_context=use_side_chain_context, enhance=enhance,
+            net_charge_max=-11.0, sap_max_threshold=13.0, **common,
         ),
         CycleConfig(
             cycle_idx=2, n_samples=300, sampling_temperature=0.15,
-            net_charge_max=-12.0, sap_max_threshold=12.0, omit_AA=omit_AA,
-            use_side_chain_context=use_side_chain_context, enhance=enhance,
+            net_charge_max=-12.0, sap_max_threshold=12.0, **common,
         ),
     ]
 
@@ -422,6 +456,8 @@ def stage_seq_filter(
     seed_protein_resnos: Optional[list[int]] = None,
     catalytic_resnos: Iterable[int] = (),
     fixed_resnos: Iterable[int] = (),
+    pi_min: float = 0.0,
+    pi_max: float = 14.0,
 ) -> Path:
     """Cheap sequence-only filter: charge, length, expression-rule HARD_FILTERs.
 
@@ -453,6 +489,8 @@ def stage_seq_filter(
             reasons.append(
                 f"net_charge_no_HIS={pp.charge_at_pH7_no_HIS:.2f} >= {net_charge_max}"
             )
+        if not (pi_min <= pp.pi <= pi_max):
+            reasons.append(f"pI={pp.pi:.2f} outside [{pi_min}, {pi_max}]")
 
         # Run the full expression-rule engine (covers OmpT, ssrA, Tat, signal
         # peptides, AMP-like, polyproline, SecM, cytosolic disulfides, and
@@ -673,11 +711,17 @@ def stage_struct_filter(
     out_dir: Path,
     sap_max_threshold: float,
     catalytic_his_resnos: Iterable[int] = CATALYTIC_HIS_RESNOS,
+    fixed_resnos: Iterable[int] = (),
+    clash_filter: bool = True,
+    clash_severe_distance: float = 1.5,
 ) -> Path:
     """Apply h-bond + SAP-proxy structural filter."""
     out_dir.mkdir(parents=True, exist_ok=True)
     df = pd.read_csv(survivors_seq_tsv, sep="\t")
     LOGGER.info("stage_struct_filter: input n=%d", len(df))
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from protein_chisel.structure import detect_clashes
 
     rows: list[dict] = []
     hbond_rows: list[dict] = []
@@ -690,6 +734,10 @@ def stage_struct_filter(
                          "sap_max": float("nan"),
                          "sap_mean": float("nan"),
                          "sap_p95": float("nan"),
+                         "clash__n_total": 0,
+                         "clash__n_to_catalytic": 0,
+                         "clash__n_to_ligand": 0,
+                         "clash__has_severe": 0,
                          "passed_struct_filter": False,
                          "struct_fail": f"pdb_missing: {pdb}"})
             continue
@@ -698,16 +746,29 @@ def stage_struct_filter(
             hbond_rows.append({"id": cid, **h})
         sap = _compute_sap_proxy(pdb) or {}
         sap_max = sap.get("sap_max", float("nan"))
+        # Clash detection (catalytic + ligand vs designed sidechains)
+        clash = detect_clashes(
+            pdb, catalytic_resnos=fixed_resnos, chain=CHAIN,
+            severe_distance=clash_severe_distance,
+        )
+        clash_dict = clash.to_dict()
         reasons: list[str] = []
         if len(hbonds) < 1:
             reasons.append("no h-bonds to catalytic HIS")
         if sap_max == sap_max and sap_max > sap_max_threshold:
             reasons.append(f"sap_max={sap_max:.2f} > {sap_max_threshold}")
+        if clash_filter and clash.has_severe_clash:
+            reasons.append(
+                f"severe clash (n_cat={clash.clashes_to_catalytic}, "
+                f"n_lig={clash.clashes_to_ligand}, "
+                f"detail={clash_dict['clash__detail']})"
+            )
         rows.append({**row.to_dict(),
                      "n_hbonds_to_cat_his": len(hbonds),
                      "sap_max": sap_max,
                      "sap_mean": sap.get("sap_mean", float("nan")),
                      "sap_p95": sap.get("sap_p95", float("nan")),
+                     **clash_dict,
                      "passed_struct_filter": not reasons,
                      "struct_fail": "; ".join(reasons)})
 
@@ -1180,6 +1241,8 @@ def run_cycle(
         seed_protein_resnos=seed_protein_resnos,
         catalytic_resnos=fixed_resnos,
         fixed_resnos=fixed_resnos,
+        pi_min=cycle_cfg.pi_min,
+        pi_max=cycle_cfg.pi_max,
     )
 
     # ---- 4. Struct filter -------------------------------------------
@@ -1189,6 +1252,9 @@ def run_cycle(
         out_dir=struct_filter_dir,
         sap_max_threshold=cycle_cfg.sap_max_threshold,
         catalytic_his_resnos=catalytic_his_resnos,
+        fixed_resnos=fixed_resnos,
+        clash_filter=cycle_cfg.clash_filter,
+        clash_severe_distance=cycle_cfg.clash_severe_distance,
     )
 
     n_struct = len(pd.read_csv(survivors_struct, sep="\t"))
@@ -1257,10 +1323,25 @@ def main() -> None:
                         "ablation showed sc=0 raises first-shell unique "
                         "AAs/pos from 2.14 -> 2.93 at no fitness cost.")
     p.add_argument("--enhance", type=str, default=None,
-                   help="Optional pLDDT-enhanced fused_mpnn checkpoint, e.g. "
-                        "'plddt_residpo_alpha_20250116-aec4d0c4'. Adds "
-                        "~+0.02 nats/residue mean fitness at small "
-                        "diversity cost.")
+                   choices=[None, *AVAILABLE_ENHANCE_CHECKPOINTS],
+                   help="Optional pLDDT-enhanced fused_mpnn checkpoint name. "
+                        "Default None (use base ligand_mpnn). Available choices "
+                        f"({len(AVAILABLE_ENHANCE_CHECKPOINTS)}): "
+                        + ", ".join(AVAILABLE_ENHANCE_CHECKPOINTS))
+    p.add_argument("--pi_min", type=float, default=6.0,
+                   help="Minimum theoretical pI for designs (filter). "
+                        "Default 6.0 -- targets soluble cytosolic enzyme "
+                        "expression at pH 7.5-8.5 (pI window ~6.5-7.2 for "
+                        "B. diminuta PTE-like cores).")
+    p.add_argument("--pi_max", type=float, default=7.5)
+    p.add_argument("--fpocket_druggability_min", type=float, default=0.30,
+                   help="Drop designs with fpocket-druggability below this "
+                        "(no detectable active-site cavity = bad design). "
+                        "Set to 0 to disable.")
+    p.add_argument("--no_clash_filter", action="store_true",
+                   help="Disable the heavy-atom clash check between catalytic+"
+                        "ligand and designed sidechains. Off by default; only "
+                        "use if you're debugging clash false positives.")
     args = p.parse_args()
 
     logging.basicConfig(
@@ -1353,6 +1434,9 @@ def main() -> None:
         omit_AA=args.omit_AA,
         use_side_chain_context=args.use_side_chain_context,
         enhance=args.enhance,
+        pi_min=args.pi_min, pi_max=args.pi_max,
+        fpocket_druggability_min=args.fpocket_druggability_min,
+        clash_filter=not args.no_clash_filter,
     )
     if args.cycles == 1:
         cycles = cycles[:1]   # short-test mode
@@ -1406,6 +1490,17 @@ def main() -> None:
 
         pool = pd.concat(all_ranked, ignore_index=True)
         pool = deduplicate_by_sequence(pool)
+        # Drop designs with no detectable active-site pocket. fpocket
+        # druggability < threshold means the constrained search at the
+        # catalytic site couldn't find a pocket -- bad design.
+        druggability_min = cycles[0].fpocket_druggability_min
+        if "fpocket__druggability" in pool.columns and druggability_min > 0:
+            n_before = len(pool)
+            pool = pool[pool["fpocket__druggability"] >= druggability_min].copy()
+            LOGGER.info(
+                "fpocket-druggability filter: %d -> %d (cutoff=%.2f)",
+                n_before, len(pool), druggability_min,
+            )
         pool = pool.sort_values(
             ["fitness__logp_fused_mean", "fpocket__mean_alpha_sphere_radius"],
             ascending=[False, True], na_position="last",

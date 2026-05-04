@@ -492,9 +492,6 @@ class CytosolicDisulfideOverloadRule(Rule):
     def evaluate(self, ctx: StructureContext, profile: "ExpressionProfile") -> list[RuleHit]:
         if profile.compartment != "cytosolic":
             return []
-        if profile.n_tag:
-            # Designed body's N-term is internal in the full construct.
-            return []
         params = profile.rule_params.get(self.name, {})
         max_cys = params.get("max_cys", 2)
         n_cys = ctx.sequence.count("C")
@@ -573,6 +570,159 @@ class EnterokinaseSiteRule(_TagProteaseRule):
 
 
 # ----------------------------------------------------------------------
+# AA-composition rules (Swiss-Prot enzyme-distribution z-score)
+# ----------------------------------------------------------------------
+
+
+class AaCompositionOutOfDistributionRule(Rule):
+    """Flag designs whose AA composition is far from natural enzymes.
+
+    For each canonical AA we compute a per-sequence z-score against
+    the Swiss-Prot enzyme distribution (release 2026_01,
+    n=279,501 EC-annotated proteins). AAs whose abs(z) exceeds the
+    rule's threshold trigger one hit per AA.
+
+    Default severity is SOFT_BIAS for over-represented AAs (suggests
+    forbidding more of that AA at sample time). Cysteine is
+    automatically excluded when it's already in the global ``omit_AA``
+    setting (de-novo designs that skip C should not be penalised for
+    sub-distribution C frequency).
+    """
+    name = "aa_composition_out_of_distribution"
+    default_severity = Severity.SOFT_BIAS
+
+    def evaluate(self, ctx: StructureContext, profile: "ExpressionProfile") -> list[RuleHit]:
+        from protein_chisel.expression.aa_composition import out_of_distribution_aas
+        params = profile.rule_params.get(self.name, {})
+        z_high = params.get("z_high", 2.0)
+        z_low = params.get("z_low_excluded", 9999)   # don't flag under-rep by default
+        reference = params.get("reference", "swissprot_enzyme_2026_01")
+        # Always exclude C (if user is omitting it via --omit_AA) +
+        # whatever the user adds.
+        excluded = set(params.get("exclude_aas", "C"))
+        sev = self.resolved_severity(profile)
+        out_high = out_of_distribution_aas(
+            ctx.sequence, reference=reference,
+            z_threshold=z_high, direction="high",
+            exclude_aas="".join(excluded),
+        )
+        hits: list[RuleHit] = []
+        for aa, z in sorted(out_high.items(), key=lambda kv: -kv[1]):
+            hits.append(RuleHit(
+                rule_name=self.name, severity=sev,
+                start=0, end=ctx.L, matched=aa,
+                suggested_omit_AAs=aa,
+                reason=f"{aa} over-represented (z={z:.2f} vs {reference})",
+                metadata={"aa": aa, "z_score": float(z)},
+            ))
+        return hits
+
+
+class MethionineOverrepresentedRule(Rule):
+    """Specifically catch internal-Met-rich designs (alt-start risk).
+
+    Severity is conservative because alt-start is mostly a translation-
+    yield issue, not a hard fail. Threshold is parameterized but the
+    default is Methionine z>2 vs enzyme distribution (~5% of sequence).
+    """
+    name = "methionine_overrepresented"
+    default_severity = Severity.SOFT_BIAS
+
+    def evaluate(self, ctx: StructureContext, profile: "ExpressionProfile") -> list[RuleHit]:
+        from protein_chisel.expression.aa_composition import (
+            aa_composition_pct, aa_z_scores,
+        )
+        params = profile.rule_params.get(self.name, {})
+        z_thresh = params.get("z_threshold", 2.0)
+        z = aa_z_scores(ctx.sequence)["M"]
+        if z <= z_thresh:
+            return []
+        return [RuleHit(
+            rule_name=self.name,
+            severity=self.resolved_severity(profile),
+            start=0, end=ctx.L, matched="M",
+            suggested_omit_AAs="M",
+            reason=f"Methionine over-represented (z={z:.2f}); risk of "
+                   f"internal alt-start codons",
+            metadata={"M_z": float(z), "M_pct": aa_composition_pct(ctx.sequence)["M"]},
+        )]
+
+
+# ----------------------------------------------------------------------
+# Repetitive / low-complexity segments
+# ----------------------------------------------------------------------
+
+
+class RepetitiveSegmentRule(Rule):
+    """Detect homopolymer runs and 2-/3-mer repeats that often indicate
+    low-complexity regions vulnerable to slippage / aggregation /
+    DNA-level synthesis problems.
+
+    Catches: runs of 5+ of the same AA (any), and 2-mer repeats like
+    GSGSGSGS, PXPXPXPX.
+    """
+    name = "repetitive_segment"
+    default_severity = Severity.SOFT_BIAS
+
+    _hp = re.compile(r"([A-Z])\1{4,}")              # 5+ of same AA
+    _dimer = re.compile(r"([A-Z]{2})\1{3,}")        # 4+ rep of a 2-mer
+    _trimer = re.compile(r"([A-Z]{3})\1{2,}")       # 3+ rep of a 3-mer
+
+    def evaluate(self, ctx: StructureContext, profile: "ExpressionProfile") -> list[RuleHit]:
+        sev = self.resolved_severity(profile)
+        hits: list[RuleHit] = []
+        for pat, label in ((self._hp, "homopolymer"),
+                            (self._dimer, "2-mer-repeat"),
+                            (self._trimer, "3-mer-repeat")):
+            for m in pat.finditer(ctx.sequence):
+                hits.append(RuleHit(
+                    rule_name=self.name, severity=sev,
+                    start=m.start(), end=m.end(), matched=m.group(0),
+                    suggested_omit_AAs=m.group(1)[0],
+                    reason=f"{label} {m.group(0)!r} at pos {m.start() + 1}",
+                ))
+        return hits
+
+
+# ----------------------------------------------------------------------
+# Dibasic motif count cap (host-agnostic, not just OmpT)
+# ----------------------------------------------------------------------
+
+
+class DibasicMotifCountCapRule(Rule):
+    """Cap on total internal dibasic motifs (KK/KR/RK/RR).
+
+    Even in BL21 (ompT- lon-) where dibasic motifs aren't a strict
+    proteolysis risk, an excess (>~5) signals a non-natural surface
+    charge-cluster pattern. This rule fires only when total count
+    exceeds the cap (default 5). Different from the
+    ``kr_neighbor_dibasic`` rule (which is local-to-catalytic-K/R);
+    this one is global.
+    """
+    name = "dibasic_motif_count_cap"
+    default_severity = Severity.SOFT_BIAS
+
+    _re = re.compile(r"[KR][KR]")
+
+    def evaluate(self, ctx: StructureContext, profile: "ExpressionProfile") -> list[RuleHit]:
+        params = profile.rule_params.get(self.name, {})
+        cap = params.get("max_motifs", 5)
+        matches = list(self._re.finditer(ctx.sequence))
+        if len(matches) <= cap:
+            return []
+        sev = self.resolved_severity(profile)
+        # Emit one hit covering all matches, suggesting K/R downweight
+        return [RuleHit(
+            rule_name=self.name, severity=sev,
+            start=matches[0].start(), end=matches[-1].end(),
+            matched=str(len(matches)),
+            suggested_omit_AAs="KR",
+            reason=f"{len(matches)} dibasic motifs exceeds cap {cap}",
+            metadata={"n_motifs": len(matches), "cap": cap},
+        )]
+
+
+# ----------------------------------------------------------------------
 # Registration
 # ----------------------------------------------------------------------
 
@@ -583,6 +733,8 @@ for _cls in (
     TatSignalMotifRule, LipoboxNTermRule,
     KRNeighborDibasicRule, LongHydrophobicStretchRule, AmpLikePeptideRule,
     PolyprolineStallRule, SecMArrestRule, CytosolicDisulfideOverloadRule,
+    AaCompositionOutOfDistributionRule, MethionineOverrepresentedRule,
+    RepetitiveSegmentRule, DibasicMotifCountCapRule,
     TEVSiteRule, PreScissionSiteRule, ThrombinSiteRule, EnterokinaseSiteRule,
 ):
     REGISTRY.register(_cls())
@@ -594,5 +746,7 @@ __all__ = [c.__name__ for c in (
     TatSignalMotifRule, LipoboxNTermRule,
     KRNeighborDibasicRule, LongHydrophobicStretchRule, AmpLikePeptideRule,
     PolyprolineStallRule, SecMArrestRule, CytosolicDisulfideOverloadRule,
+    AaCompositionOutOfDistributionRule, MethionineOverrepresentedRule,
+    RepetitiveSegmentRule, DibasicMotifCountCapRule,
     TEVSiteRule, PreScissionSiteRule, ThrombinSiteRule, EnterokinaseSiteRule,
 )]
