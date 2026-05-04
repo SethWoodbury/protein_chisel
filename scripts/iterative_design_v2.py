@@ -191,6 +191,55 @@ def compute_catalytic_neighbor_omit_dict(
     return out
 
 
+def compute_first_shell_diversity_omits(
+    *,
+    position_table_df,
+    fixed_resnos: Iterable[int],
+    chain: str = CHAIN,
+    fraction_to_diversify: float = 0.30,
+    eligible_classes: tuple[str, ...] = ("first_shell",),
+    seed: Optional[int] = None,
+) -> dict[str, str]:
+    """Build a per-residue omit dict that forbids the WT AA at a random
+    subset of first-shell (or other-class) positions.
+
+    Forces MPNN to break out of the WT identity at structurally
+    constrained positions where it otherwise just recovers the seed AA.
+    Catalytic / fixed positions are skipped.
+
+    For PTE_i1 with 14 first_shell positions and fraction=0.30:
+        ~4 random positions/cycle have their WT identity forbidden,
+        so each cycle explores a different non-WT axis at a different
+        subset of first-shell positions.
+    """
+    rng = np.random.default_rng(seed)
+    fixed_set = set(int(r) for r in fixed_resnos)
+    df = position_table_df
+    prot = df[(df["is_protein"]) & (df["chain"] == chain)].sort_values("resno")
+    eligible = prot[
+        (prot["class"].isin(eligible_classes))
+        & (~prot["resno"].astype(int).isin(fixed_set))
+    ]
+    n = max(1, int(len(eligible) * fraction_to_diversify))
+    picks = rng.choice(len(eligible), size=min(n, len(eligible)), replace=False)
+    out: dict[str, str] = {}
+    for i in picks:
+        row = eligible.iloc[int(i)]
+        out[f"{chain}{int(row['resno'])}"] = str(row["name1"])
+    return out
+
+
+def merge_omit_dicts(*dicts: dict[str, str]) -> dict[str, str]:
+    """Union AAs to forbid across multiple per-residue omit dicts."""
+    out: dict[str, str] = {}
+    for d in dicts:
+        for k, aas in d.items():
+            cur = set(out.get(k, ""))
+            cur.update(aas)
+            out[k] = "".join(sorted(cur))
+    return out
+
+
 def _parse_remark_block(ref_pdb: Path) -> list[str]:
     """Pull REMARK 666 / HETNAM / LINK / REMARK PDBinfo-LABEL from ref."""
     head: list[str] = []
@@ -697,9 +746,25 @@ def stage_fitness_score(
     return out_path
 
 
-def _run_fpocket(pdb_path: Path, work_dir: Path) -> Optional[dict]:
-    """Run fpocket. fpocket has a buffer overflow on long filenames so we
-    copy to ``design.pdb`` inside work_dir before invoking."""
+def _run_fpocket(
+    pdb_path: Path,
+    work_dir: Path,
+    catalytic_resnos: Optional[Iterable[int]] = None,
+    chain: str = CHAIN,
+    pocket_distance_cutoff: float = 6.0,
+) -> Optional[dict]:
+    """Run fpocket and pick the pocket containing the active site.
+
+    fpocket has a buffer overflow on long filenames so we copy to
+    ``design.pdb`` inside work_dir before invoking.
+
+    When ``catalytic_resnos`` is provided, we DON'T pick the most
+    druggable pocket — we pick the pocket whose bounding alpha-spheres
+    are within ``pocket_distance_cutoff`` of the most catalytic residues.
+    This is what we actually want: the pocket where our ligand sits.
+    Without this, fpocket will sometimes report a tighter peripheral
+    pocket on a different face of the protein.
+    """
     work_dir.mkdir(parents=True, exist_ok=True)
     local = work_dir / "design.pdb"
     local.write_bytes(pdb_path.read_bytes())
@@ -710,13 +775,137 @@ def _run_fpocket(pdb_path: Path, work_dir: Path) -> Optional[dict]:
             capture_output=True, text=True, timeout=300, check=False,
         )
         info_txt = work_dir / "design_out" / "design_info.txt"
+        pdb_out = work_dir / "design_out" / "design_out.pdb"
         if proc.returncode != 0 or not info_txt.is_file():
             LOGGER.warning("fpocket failed for %s: rc=%d", pdb_path.name, proc.returncode)
             return None
-        return _parse_fpocket_largest(info_txt)
+        if catalytic_resnos is None:
+            return _parse_fpocket_largest(info_txt)
+        # Active-site-aware: parse all pockets, score each by its
+        # alpha-sphere proximity to catalytic residues, return best.
+        return _parse_fpocket_active_site(
+            info_txt, pdb_out, local,
+            catalytic_resnos=catalytic_resnos,
+            chain=chain,
+            distance_cutoff=pocket_distance_cutoff,
+        )
     except subprocess.TimeoutExpired:
         LOGGER.warning("fpocket timeout (>300s) for %s", pdb_path.name)
         return None
+
+
+def _parse_fpocket_active_site(
+    info_txt: Path,
+    pdb_out: Path,
+    design_pdb: Path,
+    *,
+    catalytic_resnos: Iterable[int],
+    chain: str,
+    distance_cutoff: float = 6.0,
+) -> Optional[dict]:
+    """Pick the fpocket pocket containing the active site.
+
+    fpocket's ``<stem>_out.pdb`` lists every alpha sphere as a HETATM
+    record with res_name = "STP" and a unique res_seq per pocket
+    (1, 2, 3...). For each pocket, count alpha spheres within
+    ``distance_cutoff`` of any catalytic CA atom. Pick the pocket
+    with the highest count and return its info.txt entries plus a
+    ``mean_alpha_sphere_distance_to_catalytic`` proxy for "how
+    centered on the active site".
+    """
+    pockets = _parse_all_fpocket_pockets(info_txt)
+    if not pockets:
+        return None
+
+    # Catalytic CA coords
+    cat_set = set(int(r) for r in catalytic_resnos)
+    cat_coords: list[np.ndarray] = []
+    with open(design_pdb) as fh:
+        for line in fh:
+            if not line.startswith("ATOM"):
+                continue
+            if line[12:16].strip() != "CA":
+                continue
+            if line[21].strip() != chain:
+                continue
+            try:
+                resno = int(line[22:26].strip())
+            except ValueError:
+                continue
+            if resno not in cat_set:
+                continue
+            cat_coords.append(np.array([
+                float(line[30:38]), float(line[38:46]), float(line[46:54]),
+            ]))
+    if not cat_coords:
+        return _parse_fpocket_largest(info_txt)
+    cat_arr = np.array(cat_coords)
+
+    # Per-pocket alpha sphere coords (from <stem>_out.pdb HETATM STP)
+    pocket_spheres: dict[int, list[np.ndarray]] = {}
+    if pdb_out.is_file():
+        with open(pdb_out) as fh:
+            for line in fh:
+                if not line.startswith("HETATM"):
+                    continue
+                if line[17:20].strip() != "STP":
+                    continue
+                try:
+                    pidx = int(line[22:26].strip())
+                except ValueError:
+                    continue
+                pocket_spheres.setdefault(pidx, []).append(np.array([
+                    float(line[30:38]), float(line[38:46]), float(line[46:54]),
+                ]))
+
+    # Score each pocket: count of alpha spheres within distance_cutoff of
+    # ANY catalytic CA. Tie-break by proximity (mean min-distance).
+    scored = []
+    for p in pockets:
+        idx = p["pocket_idx"]
+        spheres = pocket_spheres.get(idx, [])
+        if not spheres:
+            continue
+        sph_arr = np.array(spheres)
+        # Min distance from each sphere to the nearest catalytic CA
+        d = np.linalg.norm(
+            sph_arr[:, None, :] - cat_arr[None, :, :], axis=-1,
+        ).min(axis=1)
+        n_close = int((d <= distance_cutoff).sum())
+        mean_d = float(d.mean())
+        scored.append((n_close, -mean_d, p, mean_d))   # higher n_close, lower mean_d wins
+    if not scored:
+        return _parse_fpocket_largest(info_txt)
+    scored.sort(reverse=True)
+    n_close, _, best, mean_d = scored[0]
+    out = dict(best)
+    out["n_alpha_spheres_near_catalytic"] = n_close
+    out["mean_alpha_sphere_dist_to_catalytic"] = mean_d
+    return out
+
+
+def _parse_all_fpocket_pockets(info_txt: Path) -> list[dict]:
+    """Parse ALL pockets from info.txt, not just the most druggable."""
+    pockets: list[dict] = []
+    cur: dict = {}
+    with open(info_txt) as fh:
+        for line in fh:
+            m = re.match(r"^Pocket\s+(\d+)\s*:", line)
+            if m:
+                if cur:
+                    pockets.append(cur)
+                cur = {"pocket_idx": int(m.group(1))}
+                continue
+            m = re.match(r"^\s*([A-Za-z0-9_/. ]+):\s*([+-]?[\d.eE+-]+)", line)
+            if m and cur:
+                key = m.group(1).strip().lower().replace(" ", "_").replace(".", "")
+                try:
+                    cur[key] = float(m.group(2))
+                except ValueError:
+                    pass
+    if cur:
+        pockets.append(cur)
+    return pockets
 
 
 def _parse_fpocket_largest(info_txt: Path) -> Optional[dict]:
@@ -751,11 +940,22 @@ def stage_fpocket_rank(
     scored_tsv: Path,
     pdb_map: dict[str, Path],
     out_dir: Path,
+    catalytic_resnos: Optional[Iterable[int]] = None,
+    chain: str = CHAIN,
 ) -> Path:
-    """Run fpocket on every fitness-scored survivor and emit ranked.tsv."""
+    """Run fpocket on every fitness-scored survivor and emit ranked.tsv.
+
+    When ``catalytic_resnos`` is given, fpocket is constrained to the
+    pocket whose alpha-spheres cluster around the catalytic residues
+    (the active-site pocket where our ligand binds), not the most
+    druggable pocket of any kind. Critical for enzyme designs: without
+    the constraint fpocket sometimes reports a peripheral pocket on
+    a different face of the protein.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     df = pd.read_csv(scored_tsv, sep="\t")
-    LOGGER.info("stage_fpocket_rank: input n=%d", len(df))
+    LOGGER.info("stage_fpocket_rank: input n=%d (active-site constraint=%s)",
+                 len(df), "yes" if catalytic_resnos else "no")
     fpocket_dir = out_dir / "per_design_fpocket"
     fpocket_dir.mkdir(exist_ok=True)
 
@@ -763,7 +963,10 @@ def stage_fpocket_rank(
     for _, row in df.iterrows():
         cid = row["id"]
         pdb = pdb_map.get(cid)
-        info = _run_fpocket(pdb, fpocket_dir / cid) if pdb else None
+        info = _run_fpocket(
+            pdb, fpocket_dir / cid,
+            catalytic_resnos=catalytic_resnos, chain=chain,
+        ) if pdb else None
         rows.append({
             **row.to_dict(),
             "fpocket__druggability": info.get("druggability_score", 0.0) if info else 0.0,
@@ -772,6 +975,11 @@ def stage_fpocket_rank(
                 info.get("mean_alpha_sphere_radius", 0.0) if info else 0.0,
             "fpocket__alpha_sphere_density":
                 info.get("alpha_sphere_density", 0.0) if info else 0.0,
+            "fpocket__n_alpha_spheres_near_catalytic":
+                info.get("n_alpha_spheres_near_catalytic", 0) if info else 0,
+            "fpocket__mean_alpha_sphere_dist_to_catalytic":
+                info.get("mean_alpha_sphere_dist_to_catalytic", float("nan"))
+                if info else float("nan"),
             "fpocket__n_pockets_found": 1 if info else 0,
         })
     ranked = pd.DataFrame(rows).sort_values(
@@ -857,6 +1065,7 @@ def run_cycle(
     seed_sasa: Optional[np.ndarray] = None,
     seed_position_class: Optional[list[str]] = None,
     seed_protein_resnos: Optional[list[int]] = None,
+    position_table_df=None,           # for first-shell diversity injection
     omit_AA_per_residue: Optional[dict[str, str]] = None,
     catalytic_his_resnos: Iterable[int] = CATALYTIC_HIS_RESNOS,
 ) -> tuple[Optional[pd.DataFrame], dict[str, Path]]:
@@ -904,11 +1113,33 @@ def run_cycle(
 
     # ---- 1. Sample --------------------------------------------------
     sample_dir = cycle_dir / "01_sample"
+    # Diversity injection: per-cycle, randomly forbid the WT identity at
+    # ~30% of first-shell positions so MPNN's structure-conditioned bias
+    # toward WT identities at structurally constrained sites is broken.
+    # Different positions per cycle -> across all cycles the union covers
+    # most first-shell positions.
+    diversity_omit: dict[str, str] = {}
+    if position_table_df is not None:
+        from scripts.iterative_design_v2 import (   # noqa
+            compute_first_shell_diversity_omits,
+        )
+    diversity_omit = compute_first_shell_diversity_omits(
+        position_table_df=position_table_df,
+        fixed_resnos=fixed_resnos,
+        chain=CHAIN,
+        fraction_to_diversify=0.30,
+        seed=cycle_cfg.cycle_idx * 7919,   # different per cycle, deterministic
+    )
+    LOGGER.info(
+        "cycle %d: diversity-omit at first-shell = %s",
+        cycle_cfg.cycle_idx, diversity_omit,
+    )
+    merged_omit = merge_omit_dicts(omit_AA_per_residue or {}, diversity_omit)
     cand_tsv = stage_sample(
         cycle_cfg=cycle_cfg, seed_pdb=seed_pdb, bias=bias_k,
         protein_resnos=protein_resnos, fixed_resnos=fixed_resnos,
         out_dir=sample_dir,
-        omit_AA_per_residue=omit_AA_per_residue,
+        omit_AA_per_residue=merged_omit,
     )
 
     # ---- 2. Restore PDBs --------------------------------------------
@@ -961,10 +1192,11 @@ def run_cycle(
         fitness_cache=fitness_cache,
     )
 
-    # ---- 6. Fpocket rank --------------------------------------------
+    # ---- 6. Fpocket rank (constrained to active-site pocket) -------
     fpocket_dir = cycle_dir / "05_fpocket"
     ranked = stage_fpocket_rank(
         scored_tsv=scored, pdb_map=pdb_map, out_dir=fpocket_dir,
+        catalytic_resnos=fixed_resnos,
     )
     ranked_df = pd.read_csv(ranked, sep="\t")
     return ranked_df, pdb_map
@@ -1124,6 +1356,7 @@ def main() -> None:
             seed_sasa=seed_sasa,
             seed_position_class=position_classes,
             seed_protein_resnos=protein_resnos,
+            position_table_df=pt.df,
             omit_AA_per_residue=omit_AA_per_residue,
         )
         if ranked_df is not None and len(ranked_df) > 0:
