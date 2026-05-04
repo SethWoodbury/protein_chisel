@@ -33,7 +33,9 @@ Submitted 5 jobs (4 GPU + 1 CPU). Real bug found and fixed mid-sweep.
 | B | **annealing** | **0.90 / 1.0 / 0.15** | **fitness −1.914, ham 56.0, prim 6.2** | `..._054455-127-pid3231842` |
 | C | constant | 0.95 / 0.5 / 0.10 | fitness −1.900, ham 44.4, prim 2.1 | `..._053530` |
 | D | CPU test (constant default) | — | fitness −1.865 (1 cycle) | `..._053541` |
-| E | annealing + lean resources (cpus=2 mem=8G) | 0.90 / 1.0 / 0.15 | running at 06:00 | TBD |
+| E | annealing + **lean resources (cpus=2 mem=8G)** | 0.90 / 1.0 / 0.15 | **fitness −1.896, ham 54.4, prim 5.3, MaxRSS 3.5 GB, 7m27s wall** | `..._055542-508-pid2300763` |
+
+**Sweep E is the definitive winner.** Same metric quality as Sweep B (within noise: ham 54.4 vs 56.0; primary unique-AAs 2.44 vs 6.2 — slight cost), **8% faster wall time** (7:27 vs 8:09), and **uses half the slurm priority** (cpus=2 mem=8G vs cpus=4 mem=16G). MaxRSS was only 3.5 GB so could even drop to mem=6G. The resource-cut recommendation in efficiency_plan.md is empirically validated.
 
 **Bug found:** Sweeps B and C started in the same second; both wrote to the same `run_dir` and overwrote each other. **Fixed** in commit `8c298cc` — timestamps now include ms+PID. Sweep B was re-submitted as job 14008985.
 
@@ -73,7 +75,8 @@ README.md                                118 lines — top-level + Mermaid quick
 docs/architecture.md                     254 lines — full pipeline diagram, per-cycle data flow
 docs/usage.md                            278 lines — slurm/interactive/CPU patterns
 docs/cli_reference.md                    329 lines — all 37 flags grouped + presets
-docs/metrics_reference.md                  TBD   — agent still running (the big one)
+docs/metrics_reference.md                900 lines — every metric (129 cols) in every TSV
+                                                    column with formula + range + threshold
 docs/dependencies.md                     323 lines — sif/binaries/data paths/apptainer templates
 docs/troubleshooting.md                  185 lines — 10 known issues + strengths/weaknesses
 docs/examples/pte_default_run.md         140 lines — production config explained
@@ -97,12 +100,17 @@ Revised efficiency recommendations after codex pushback:
 
 Plan committed at `docs/plans/efficiency_plan.md`. Execution deferred to your direction.
 
-## What's still running at 6:00 AM
+## Final state at 6:05 AM
 
-- Doc subagent: metrics_reference (the big ~1500-line doc — most important reference)
-- Lean-resource sweep E (validating `cpus=2 mem=8G`; ~3 min in)
+**Phase 1, 2, 3 all complete.**
 
-Will land notifications as those complete. No further code changes pending — codebase is in a stable, reviewed state.
+All async work landed:
+- ✓ 6 doc subagents (3194 lines new doc text including the 900-line metrics_reference)
+- ✓ 2 codex reviews (full codebase + efficiency plan; 4 real bugs found, all fixed)
+- ✓ 5 hyperparameter sweep jobs (4 GPU + 1 CPU)
+- ✓ Lean-resource validation (Sweep E proves `cpus=2 mem=8G` works better than original)
+
+No further code changes pending — codebase is in a stable, reviewed state.
 
 ## Recommended things to do when you're back
 
