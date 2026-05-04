@@ -12,7 +12,7 @@ sbatch /home/woodbuse/codebase_projects/protein_chisel/scripts/run_iterative_des
 sbatch -p cpu -c 8 --mem=24G --time=04:00:00 \
     scripts/run_iterative_design_v2.sbatch
 
-# Manual invocation (after Stage 1 + 2 have produced classify/ and plm_artifacts/)
+# Manual invocation — production-recommended config (best from 2026-05-04 sweep)
 python scripts/iterative_design_v2.py \
     --seed_pdb $SEED_PDB \
     --ligand_params $LIG_PARAMS \
@@ -21,9 +21,17 @@ python scripts/iterative_design_v2.py \
     --target_k 50 --min_hamming 3 --cycles 3 \
     --strategy annealing \
     --plm_strength 1.25 \
+    --consensus_threshold 0.90 --consensus_strength 1.0 --consensus_max_fraction 0.15 \
     --n_term_pad MSG --c_term_pad GSA \
     --design_ph 7.8
 ```
+
+The four `--strategy / --plm_strength / --consensus_*` flags above were
+empirically tuned across 8 PTE_i1 design rounds. With this exact config,
+Sweep B gave the best diversity (global hamming 56, primary-sphere
+unique-AAs 6.2/pos), best sap_max (1.24), tied-best preorganization
+strength, while keeping fitness, charge, pI, druggability, and clash
+filter all in their target ranges.
 
 Outputs land in `$WORK/iterative_design_v2_PTE_i1_<ts-pid>/{classify,plm_artifacts,cycle_00,cycle_01,cycle_02,final_topk,manifest.json}`. The shipped artifact is `final_topk/topk.fasta` + `final_topk/topk_pdbs/` + `final_topk/all_survivors.tsv`.
 
@@ -40,6 +48,30 @@ flowchart LR
 ```
 
 See [`docs/architecture.md`](docs/architecture.md) for the full per-cycle data flow, consensus reinforcement, and TOPSIS internals.
+
+## What's in the box
+
+```
+protein_chisel/
+├── scripts/
+│   ├── iterative_design_v2.py            # main driver (~3200 lines)
+│   ├── run_iterative_design_v2.sbatch    # 3-stage / 3-sif slurm wrapper
+│   ├── classify_positions_pte_i1.py      # Stage 1 entrypoint
+│   ├── precompute_plm_artifacts.py       # Stage 2 entrypoint
+│   └── audit_*, *_ablation.py, ...       # diagnostic / one-off tools
+├── src/protein_chisel/
+│   ├── sampling/{plm_fusion, iterative_fusion, biased_mpnn, fitness_score}.py
+│   ├── scoring/{multi_objective, dfi, preorganization, diversity, pareto}.py
+│   ├── expression/{aa_class_balance, aa_composition, builtin_rules, engine, profiles}.py
+│   ├── tools/{classify_positions, ligand_mpnn, geometric_interactions, ...}.py
+│   ├── filters/{protparam, protease_sites, length}.py
+│   ├── structure/{clash_check, ss_provider, ...}.py
+│   ├── io/{schemas, pdb, fasta}.py
+│   └── utils/{apptainer, slurm, pose, geometry}.py
+├── docs/                                  # see table below
+├── configs/, examples/, tests/
+└── pyproject.toml
+```
 
 ## Documentation
 
