@@ -266,12 +266,30 @@ def sample_with_ligand_mpnn(
 
     LOGGER.info("running fused_mpnn: %s", " ".join(cmd))
 
+    # Set torch / OpenMP / MKL thread counts in the subprocess env so
+    # fused_mpnn's PyTorch matches the slurm cpus_per_task allocation
+    # instead of defaulting to all node cores. Big win on CPU runs
+    # (codex round-2: ~150-300s saved on a 21-min CPU pipeline).
+    # Inherits from os.environ so caller can override.
+    import os as _os
+    sub_env = dict(_os.environ)
+    try:
+        from protein_chisel.utils.resources import detect_n_cpus
+        cpus, _ = detect_n_cpus()
+    except Exception:
+        cpus = int(_os.environ.get("SLURM_CPUS_PER_TASK", _os.cpu_count() or 1))
+    sub_env.setdefault("OMP_NUM_THREADS", str(cpus))
+    sub_env.setdefault("MKL_NUM_THREADS", str(cpus))
+    sub_env.setdefault("OPENBLAS_NUM_THREADS", str(cpus))
+
     if via_apptainer:
         from protein_chisel.utils.apptainer import universal_call
 
         result = universal_call(nv=True).run(cmd, check=True, timeout=7200)
     else:
-        proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        proc = subprocess.run(
+            cmd, check=True, capture_output=True, text=True, env=sub_env,
+        )
         from protein_chisel.utils.apptainer import ApptainerResult
         result = ApptainerResult(
             returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr, command=cmd,

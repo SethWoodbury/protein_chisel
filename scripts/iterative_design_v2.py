@@ -1806,12 +1806,29 @@ def _struct_filter_worker(args: tuple) -> tuple:
     (cid, pdb, cat_his, fixed_, sev_dist, sap_max_thr,
      seed_dfi_metrics_) = args
     if pdb is None or not Path(pdb).is_file():
+        # Schema-consistent empty row — every key the parent loop
+        # writes must be present so missing-PDB rows don't NaN-leak
+        # into the rest of the TSV. Codex r2 caught two missing keys
+        # (clash__detail string + ligand_int__* numeric panel).
         empty_row = {
             "n_hbonds_to_cat_his": 0,
             "sap_max": float("nan"), "sap_mean": float("nan"),
             "sap_p95": float("nan"),
             "clash__n_total": 0, "clash__n_to_catalytic": 0,
             "clash__n_to_ligand": 0, "clash__has_severe": 0,
+            "clash__detail": "",
+            # ligand_int__* — full panel default to 0 / 0.0
+            "ligand_int__n_total": 0, "ligand_int__strength_total": 0.0,
+            "ligand_int__n_hbond": 0, "ligand_int__strength_hbond": 0.0,
+            "ligand_int__n_salt_bridge": 0,
+            "ligand_int__strength_salt_bridge": 0.0,
+            "ligand_int__n_pi_pi": 0, "ligand_int__strength_pi_pi": 0.0,
+            "ligand_int__n_pi_cation": 0,
+            "ligand_int__strength_pi_cation": 0.0,
+            "ligand_int__n_hydrophobic": 0,
+            "ligand_int__strength_hydrophobic": 0.0,
+            "ligand_int__n_vdw_clash": 0,
+            "ligand_int__strength_vdw_clash": 0.0,
             "preorg__n_hbonds_to_cat": 0,
             "preorg__n_salt_bridges_to_cat": 0,
             "preorg__n_pi_to_cat": 0,
@@ -2841,8 +2858,12 @@ def main() -> None:
         detect_resources, configure_torch_threads,
     )
     resources = detect_resources()
-    if resources.n_gpus == 0:
-        configure_torch_threads(resources.n_cpus)
+    # Always pin torch threads to the slurm allocation. On a GPU job,
+    # PyTorch's default uses all node cores for CPU ops (numpy / SAP /
+    # the multiprocessing.Pool workers), which oversubscribes our
+    # cpus_per_task allocation. Codex r2 estimate: ~5-15s/cycle GPU,
+    # ~10-20s/cycle CPU on top of the explicit Pool stages.
+    configure_torch_threads(resources.n_cpus)
 
     # ---- Load PLM artifacts -----------------------------------------
     art = args.plm_artifacts_dir
