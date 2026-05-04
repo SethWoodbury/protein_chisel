@@ -55,11 +55,17 @@ def main() -> None:
     p.add_argument(
         "--saprot_model", default="saprot_35m",
         choices=["saprot_35m", "saprot_650m", "saprot_1.3b"],
-        help="SaProt model variant. saprot_35m (default, ~10s on H100; "
-             "AF2-trained) | saprot_650m (PDB-trained, ~3× slower, "
-             "structure-aware sharper) | saprot_1.3b (AFDB+OMG+NCBI, "
-             "~10× slower, ~6 GB VRAM, broadest pretraining). All "
-             "cached at /net/databases/huggingface/saprot/hub.",
+        help="SaProt model variant. From westlake-repl on HF: "
+             "saprot_35m = SaProt_35M_AF2 (35M params, 40M AF2 structures; "
+             "default, ~10s on H100). "
+             "saprot_650m = SaProt_650M_PDB (650M params, 40M AF2 phase1 + "
+             "60K PDB phase2; ~3× slower). "
+             "saprot_1.3b = SaProt_1.3B_AFDB_OMG_NCBI (1.3B params, "
+             "40M AF2 + 200M OMG_prot50 + 150M NCBI 70%% identity-filtered; "
+             "~10× slower, ~6 GB VRAM, broadest pretraining). All three "
+             "are cached at /net/databases/huggingface/saprot/hub. "
+             "(SaProt_650M_AF2 also exists upstream but is NOT cached "
+             "locally.)",
     )
     p.add_argument("--device", default="auto",
                    help="'auto' picks cuda if available else cpu. Pass "
