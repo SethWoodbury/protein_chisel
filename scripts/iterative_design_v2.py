@@ -172,13 +172,11 @@ def default_cycles(
     ``"plddt_residpo_alpha_20250116-aec4d0c4"``. Boosts mean fitness
     by ~0.02 nats/residue at a diversity cost.
     """
-    # Per-monomer charge schedule. Per the Sukhwal et al. PEDS 2024
-    # supercharged-PTE paper: their best negatively-charged variant has
-    # net charge -14 at the DIMER level = -7 per monomer. Our previous
-    # schedule (-10 to -12 per MONOMER, = -20 to -24 per dimer) was
-    # ~3x more negative than the literature optimum -- likely
-    # over-shooting. New schedule targets -5 to -8 per monomer
-    # (-10 to -16 per dimer), bracketing the paper's -7.
+    # Per-monomer charge schedule. The user's target range is -4 to
+    # -15 per monomer, bracketing both the supercharged-PTE paper's
+    # -7/monomer (Sukhwal 2024, dimer = -14) and pushing toward more
+    # acidic for cycle-2 selection pressure. Schedule: c0 lenient
+    # (<-4) -> c1 mid (<-10) -> c2 most restrictive (<-15).
     common = dict(
         omit_AA=omit_AA,
         use_side_chain_context=use_side_chain_context,
@@ -190,15 +188,15 @@ def default_cycles(
     return [
         CycleConfig(
             cycle_idx=0, n_samples=500, sampling_temperature=0.20,
-            net_charge_max=-5.0, sap_max_threshold=15.0, **common,
+            net_charge_max=-4.0, sap_max_threshold=15.0, **common,
         ),
         CycleConfig(
             cycle_idx=1, n_samples=400, sampling_temperature=0.18,
-            net_charge_max=-6.0, sap_max_threshold=13.0, **common,
+            net_charge_max=-10.0, sap_max_threshold=13.0, **common,
         ),
         CycleConfig(
             cycle_idx=2, n_samples=300, sampling_temperature=0.15,
-            net_charge_max=-7.0, sap_max_threshold=12.0, **common,
+            net_charge_max=-15.0, sap_max_threshold=12.0, **common,
         ),
     ]
 
