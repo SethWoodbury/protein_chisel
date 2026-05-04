@@ -308,6 +308,158 @@ def compute_clash_prone_first_shell_omits(
     return out
 
 
+def compute_graded_clash_bias(
+    *,
+    seed_pdb: Path,
+    position_table_df,
+    fixed_resnos: Iterable[int],
+    chain: str = CHAIN,
+    cb_clearance_threshold: float = 5.0,
+    eligible_classes: tuple[str, ...] = ("first_shell", "buried"),
+    bulky_aas: str = "YFWHMR",
+    bias_strength_per_pct_clash: float = 3.0,
+    rotamer_grid_chi1: tuple[float, ...] = (-60, 60, 180),
+    rotamer_grid_chi2: tuple[float, ...] = (-60, 60, 180),
+    clash_atom_distance: float = 2.0,
+) -> tuple[np.ndarray, dict]:
+    """Per-residue × per-AA clash-aware bias matrix (L, 20).
+
+    For each (clash-prone position, bulky AA) pair, sample a 9-rotamer
+    chi1×chi2 grid, place a tip atom at canonical reach distance, and
+    count what fraction of rotamers come within ``clash_atom_distance``
+    of any fixed-residue sidechain heavy atom. The bias added to the
+    base PLM-fusion bias at that (position, AA) is::
+
+        bias[i, j] -= bias_strength_per_pct_clash * clash_fraction
+
+    Result: positions where Y/F/W literally have no fitting rotamer
+    get -3 nats; positions where they fit fine get 0; in-between get
+    proportional. Replaces the previous all-or-nothing hard-omit which
+    forbade Y/F/W/H/M at every clash-prone position even when they fit.
+
+    Returns (bias_matrix, telemetry_dict). bias_matrix is shape (L, 20)
+    in PLM_AA_ORDER ('ACDEFGHIKLMNPQRSTVWY').
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from protein_chisel.sampling.plm_fusion import AA_ORDER
+    from protein_chisel.structure.clash_check import (
+        SIDECHAIN_ATOM_NAMES, _read_atoms,
+    )
+
+    AA_TO_IDX = {a: i for i, a in enumerate(AA_ORDER)}
+    fixed_set = set(int(r) for r in fixed_resnos)
+    eligible_classes_set = set(eligible_classes)
+
+    # Approximate sidechain reach distance (Cb -> tip atom) per AA in Å.
+    # Used for the rotamer stub. Crude but consistent across AAs.
+    SIDECHAIN_REACH = {
+        "Y": 5.5, "F": 5.0, "W": 5.7, "H": 4.5, "M": 4.6, "R": 6.0,
+        "K": 5.5, "L": 3.8, "I": 3.6, "Q": 4.5, "N": 3.5, "E": 4.5,
+        "D": 3.5, "S": 2.8, "T": 3.0, "V": 2.8, "A": 1.5, "P": 2.5,
+        "G": 0.0, "C": 2.8,
+    }
+
+    df = position_table_df
+    prot = df[(df["is_protein"]) & (df["chain"] == chain)].sort_values("resno")
+    eligible_resnos = prot[
+        (prot["class"].isin(eligible_classes_set))
+        & (~prot["resno"].astype(int).isin(fixed_set))
+    ]["resno"].astype(int).tolist()
+
+    atoms = _read_atoms(Path(seed_pdb))
+    cb_by_resno: dict[int, np.ndarray] = {}
+    ca_by_resno: dict[int, np.ndarray] = {}
+    fixed_sc_atoms: list[np.ndarray] = []
+    for a in atoms:
+        if a["chain_id"] != chain or a["record"] != "ATOM":
+            continue
+        if a["res_seq"] in fixed_set:
+            sc_names = SIDECHAIN_ATOM_NAMES.get(a["res_name"], set())
+            if a["atom_name"] in sc_names:
+                fixed_sc_atoms.append(np.array([a["x"], a["y"], a["z"]]))
+        else:
+            if a["atom_name"] == "CB":
+                cb_by_resno[a["res_seq"]] = np.array([a["x"], a["y"], a["z"]])
+            elif a["atom_name"] == "CA":
+                ca_by_resno[a["res_seq"]] = np.array([a["x"], a["y"], a["z"]])
+
+    L = len(prot)
+    resno_to_idx = {int(r): i for i, r in enumerate(prot["resno"].astype(int))}
+    bias = np.zeros((L, 20), dtype=np.float64)
+    telemetry = {"per_position": {}, "n_positions_biased": 0}
+
+    if not fixed_sc_atoms:
+        return bias, telemetry
+    fixed_arr = np.array(fixed_sc_atoms)
+
+    # Generate stub rotamer tip directions: rotate Cb-Cα vector at chi1,
+    # chi2 deltas (just a coarse grid; we only need the direction).
+    # The grid is chi1 × chi2 (nine combinations).
+    rng = np.random.default_rng(0)
+    rot_directions: list[np.ndarray] = []
+    for c1 in rotamer_grid_chi1:
+        for c2 in rotamer_grid_chi2:
+            # Normalized random direction biased by chi1/chi2 angles
+            # (this is intentionally coarse — we just want diversity of
+            # tip directions; full Dunbrack would be too heavy).
+            phi = np.deg2rad(c1)
+            psi = np.deg2rad(c2)
+            d = np.array([
+                np.cos(phi) * np.cos(psi),
+                np.sin(phi) * np.cos(psi),
+                np.sin(psi),
+            ])
+            d /= np.linalg.norm(d)
+            rot_directions.append(d)
+
+    for resno in eligible_resnos:
+        if resno not in cb_by_resno or resno not in ca_by_resno:
+            continue
+        cb = cb_by_resno[resno]
+        ca = ca_by_resno[resno]
+        # Quick reject: if Cb is too far from ANY fixed sidechain, skip
+        cb_min = float(np.linalg.norm(fixed_arr - cb, axis=1).min())
+        if cb_min >= cb_clearance_threshold:
+            continue
+        # Build a coordinate frame at Cb
+        cb_axis = (cb - ca) / max(np.linalg.norm(cb - ca), 1e-9)
+        # An arbitrary perp vector
+        perp = np.cross(cb_axis, np.array([1.0, 0.0, 0.0]))
+        if np.linalg.norm(perp) < 1e-3:
+            perp = np.cross(cb_axis, np.array([0.0, 1.0, 0.0]))
+        perp /= max(np.linalg.norm(perp), 1e-9)
+        perp2 = np.cross(cb_axis, perp)
+        perp2 /= max(np.linalg.norm(perp2), 1e-9)
+
+        per_aa_clash_pct = {}
+        for aa in bulky_aas:
+            reach = SIDECHAIN_REACH.get(aa, 4.5)
+            n_clash = 0
+            n_total = 0
+            for d in rot_directions:
+                # Build tip = cb + reach * (rotated direction in CB frame)
+                tip = cb + reach * (
+                    d[0] * cb_axis + d[1] * perp + d[2] * perp2
+                )
+                # Min distance from this tip to any fixed sidechain atom
+                d_min = float(np.linalg.norm(fixed_arr - tip, axis=1).min())
+                n_total += 1
+                if d_min < clash_atom_distance:
+                    n_clash += 1
+            pct = n_clash / max(n_total, 1)
+            per_aa_clash_pct[aa] = pct
+            if pct > 0:
+                bias[resno_to_idx[resno], AA_TO_IDX[aa]] -= bias_strength_per_pct_clash * pct
+        telemetry["per_position"][resno] = {
+            "cb_min_to_fixed": cb_min,
+            "per_aa_clash_pct": per_aa_clash_pct,
+        }
+        if any(p > 0 for p in per_aa_clash_pct.values()):
+            telemetry["n_positions_biased"] += 1
+
+    return bias, telemetry
+
+
 def compute_first_shell_diversity_omits(
     *,
     position_table_df,
@@ -1500,21 +1652,30 @@ def main() -> None:
     expression_omit = wt_eng.to_omit_AA_json("A", protein_resnos=protein_resnos)
     LOGGER.info("expression-engine HARD_OMIT JSON: %s", expression_omit)
 
-    # Auto-detect first-shell positions where Cb is too close to a fixed
-    # catalytic sidechain to fit Y/F/W/H/M (per the side-chain-packer
-    # ablation: every learned and rotamer-library packer converges to
-    # clashing rotamers at residues like 35; the only fix is sample-time).
-    clash_prone_omit = compute_clash_prone_first_shell_omits(
+    # Graded clash-aware bias replacing the previous hard-omit. Per the
+    # rotamer-feasibility audit (commit logs + scripts/audit_clash_omits.py),
+    # no (clash-prone-pos, bulky-AA) pair has >50% clashing rotamers in
+    # a 9-rotamer grid stub, so the previous hard-omit was unjustified.
+    # Now: add a per-position per-AA bias proportional to the clash %
+    # to the base PLM-fusion bias (max -3 nats at 100% clash, 0 at 0%).
+    # MPNN can still pick a "clash-prone" AA when other context strongly
+    # favors it; the filter-time severe-clash check (1.5 A) catches the
+    # remaining hard failures.
+    clash_bias, clash_telem = compute_graded_clash_bias(
         seed_pdb=args.seed_pdb,
         position_table_df=pt.df,
         fixed_resnos=DEFAULT_CATRES,
         chain=CHAIN,
         cb_clearance_threshold=5.0,
-        forbid_aas="YFWHM",
+        bulky_aas="YFWHMR",
     )
-    LOGGER.info("clash-prone first-shell omit_AA: %s", clash_prone_omit)
-    omit_AA_per_residue = merge_omit_dicts(expression_omit, clash_prone_omit)
-    LOGGER.info("merged structural omit_AA: %s", omit_AA_per_residue)
+    LOGGER.info(
+        "graded clash bias: %d positions biased, mean magnitude=%.3f nats",
+        clash_telem["n_positions_biased"], float(np.abs(clash_bias).mean()),
+    )
+    base_bias = base_bias + clash_bias   # added to the cycle-0 fusion bias
+    omit_AA_per_residue = expression_omit
+    LOGGER.info("structural omit_AA (from rule engine only): %s", omit_AA_per_residue)
 
     # ---- Cycle schedule ---------------------------------------------
     cycles = default_cycles(

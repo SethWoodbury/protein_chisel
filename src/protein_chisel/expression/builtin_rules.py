@@ -594,11 +594,14 @@ class AaCompositionOutOfDistributionRule(Rule):
     def evaluate(self, ctx: StructureContext, profile: "ExpressionProfile") -> list[RuleHit]:
         from protein_chisel.expression.aa_composition import out_of_distribution_aas
         params = profile.rule_params.get(self.name, {})
-        z_high = params.get("z_high", 2.0)
-        z_low = params.get("z_low_excluded", 9999)   # don't flag under-rep by default
-        reference = params.get("reference", "swissprot_enzyme_2026_01")
-        # Always exclude C (if user is omitting it via --omit_AA) +
-        # whatever the user adds.
+        # SOFT_BIAS at z>3 (was 2; an audit on PTE_i1 top-50 showed 100%
+        # of designs trip z>2 because of the scaffold's required E
+        # excess from --net_charge_max<-10. z>3 is more useful: catches
+        # genuine outliers without auto-rejecting baseline designs.
+        z_high = params.get("z_high", 3.0)
+        # Default reference is the EC-3 hydrolase distribution (n=64,973)
+        # since PTE = EC 3.1.8.1. Override per-scaffold via rule_params.
+        reference = params.get("reference", "swissprot_ec3_hydrolases_2026_01")
         excluded = set(params.get("exclude_aas", "C"))
         sev = self.resolved_severity(profile)
         out_high = out_of_distribution_aas(
@@ -613,6 +616,53 @@ class AaCompositionOutOfDistributionRule(Rule):
                 start=0, end=ctx.L, matched=aa,
                 suggested_omit_AAs=aa,
                 reason=f"{aa} over-represented (z={z:.2f} vs {reference})",
+                metadata={"aa": aa, "z_score": float(z)},
+            ))
+        return hits
+
+
+class AaCompositionExtremeRule(Rule):
+    """HARD_FILTER for AAs with truly outlier composition.
+
+    Distinct from the SOFT_BIAS rule: only fires when a per-design AA
+    z-score exceeds a much higher threshold (default 6.0) AND the
+    log2 enrichment exceeds 0.25. Catches "way way out of distribution"
+    cases without rejecting designs that are merely over-represented
+    on AAs forced by the scaffold (e.g. E in acidic enzymes).
+    """
+    name = "aa_composition_extreme"
+    default_severity = Severity.HARD_FILTER
+
+    def evaluate(self, ctx: StructureContext, profile: "ExpressionProfile") -> list[RuleHit]:
+        from protein_chisel.expression.aa_composition import aa_quality_check
+        params = profile.rule_params.get(self.name, {})
+        fail_z = params.get("fail_z", 6.0)
+        fail_log2 = params.get("fail_log2_enrichment", 0.25)
+        reference = params.get("reference", "swissprot_ec3_hydrolases_2026_01")
+        excluded = params.get("exclude_aas", "C")
+        # "Allow-list" of AAs known to be required by other constraints
+        # (e.g. for PTE_i1 with charge<-10, E is required to be ~20%).
+        # These AAs can't trigger a HARD_FILTER even at extreme z.
+        scaffold_required = set(params.get("scaffold_required_aas", "E"))
+        try:
+            qc = aa_quality_check(
+                ctx.sequence, reference=reference, exclude_aas=excluded,
+                fail_z=fail_z, fail_log2_enrichment=fail_log2,
+            )
+        except ValueError:
+            return []
+        sev = self.resolved_severity(profile)
+        hits: list[RuleHit] = []
+        for aa, z in qc["fail_aas"].items():
+            if aa in scaffold_required:
+                continue
+            hits.append(RuleHit(
+                rule_name=self.name, severity=sev,
+                start=0, end=ctx.L, matched=aa,
+                suggested_omit_AAs=aa,
+                reason=(f"{aa} extreme composition (z={z:.2f}, "
+                        f"log2_enrichment={qc['log2_enrichment'][aa]:.2f}); "
+                        f"way outside {reference} distribution"),
                 metadata={"aa": aa, "z_score": float(z)},
             ))
         return hits
@@ -733,7 +783,8 @@ for _cls in (
     TatSignalMotifRule, LipoboxNTermRule,
     KRNeighborDibasicRule, LongHydrophobicStretchRule, AmpLikePeptideRule,
     PolyprolineStallRule, SecMArrestRule, CytosolicDisulfideOverloadRule,
-    AaCompositionOutOfDistributionRule, MethionineOverrepresentedRule,
+    AaCompositionOutOfDistributionRule, AaCompositionExtremeRule,
+    MethionineOverrepresentedRule,
     RepetitiveSegmentRule, DibasicMotifCountCapRule,
     TEVSiteRule, PreScissionSiteRule, ThrombinSiteRule, EnterokinaseSiteRule,
 ):
@@ -746,7 +797,8 @@ __all__ = [c.__name__ for c in (
     TatSignalMotifRule, LipoboxNTermRule,
     KRNeighborDibasicRule, LongHydrophobicStretchRule, AmpLikePeptideRule,
     PolyprolineStallRule, SecMArrestRule, CytosolicDisulfideOverloadRule,
-    AaCompositionOutOfDistributionRule, MethionineOverrepresentedRule,
+    AaCompositionOutOfDistributionRule, AaCompositionExtremeRule,
+    MethionineOverrepresentedRule,
     RepetitiveSegmentRule, DibasicMotifCountCapRule,
     TEVSiteRule, PreScissionSiteRule, ThrombinSiteRule, EnterokinaseSiteRule,
 )]

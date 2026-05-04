@@ -1,0 +1,1549 @@
+{
+    "SCHEMA_VERSION": "aa_composition_baselines.v2.provenance_annotated",
+    "CREATED_FOR": "MPNN/ProteinMPNN amino-acid composition QC reference constants",
+    "CREATED_DATE": "2026-05-04",
+    "AA_ORDER": "ACDEFGHIKLMNPQRSTVWY",
+    "METHODOLOGY_AND_PROVENANCE": {
+        "purpose": "Reference amino-acid composition baselines for ProteinMPNN/MPNN design QC and descriptive enrichment reporting.",
+        "aa_order": "ACDEFGHIKLMNPQRSTVWY",
+        "standard_amino_acids": [
+            "A",
+            "C",
+            "D",
+            "E",
+            "F",
+            "G",
+            "H",
+            "I",
+            "K",
+            "L",
+            "M",
+            "N",
+            "P",
+            "Q",
+            "R",
+            "S",
+            "T",
+            "V",
+            "W",
+            "Y"
+        ],
+        "baseline_type_definitions": {
+            "sequence_distribution": {
+                "meaning": "Contains pooled global_pct plus per_sequence_mean_pct and per_sequence_sd_pct computed across native sequences.",
+                "allowed_metrics": [
+                    "delta percentage points",
+                    "enrichment ratio",
+                    "log2 enrichment",
+                    "per-AA z-score using per-sequence SD",
+                    "batch-level sanity checks"
+                ],
+                "qc_allowed": true,
+                "caution": "The SD is biological variability across native sequences, not a standard error of the mean and not a bootstrap interval."
+            },
+            "global_only": {
+                "meaning": "Contains only pooled residue-level global percentages from an official release-statistics table.",
+                "allowed_metrics": [
+                    "delta percentage points",
+                    "enrichment ratio",
+                    "log2 enrichment",
+                    "descriptive comparison"
+                ],
+                "qc_allowed": false,
+                "forbidden_metrics": [
+                    "z-score",
+                    "empirical p-value",
+                    "pass/fail threshold",
+                    "Jensen-Shannon null threshold"
+                ],
+                "caution": "Cannot estimate natural per-protein variance or length-matched expected spread."
+            },
+            "size_only": {
+                "meaning": "Contains only entry and residue totals. No amino-acid distribution is available in this JSON.",
+                "allowed_metrics": [],
+                "qc_allowed": false
+            }
+        },
+        "calculation_definitions": {
+            "global_pct": "100 * pooled count of amino acid AA across all selected records / pooled count of the 20 standard amino acids across all selected records, for computed baselines. For TrEMBL, values are official pooled complete-database percentages from the release-statistics page.",
+            "per_sequence_mean_pct": "For each selected sequence, compute 100 * count(AA) / count(20 standard AAs in that sequence); then take the arithmetic mean across selected sequences.",
+            "per_sequence_sd_pct": "Standard deviation across the per-sequence percentages. This describes native protein-to-protein variability; it is not a confidence interval and not a bootstrap-derived SD.",
+            "total_residues": "All residue characters counted in the source records, including nonstandard/ambiguous residues when present.",
+            "total_standard_residues": "Only residues in AA_ORDER. This is the denominator for computed global_pct values.",
+            "nonstandard_counts": "Counts of nonstandard/ambiguous residues observed in computed source sequences; excluded from 20-AA denominators.",
+            "rounding": "Computed percentages are rounded to three decimals. Official TrEMBL global percentages are retained at the precision exposed by the release-statistics table, mostly two decimals."
+        },
+        "enzyme_selection_method": {
+            "ec_annotated_baseline": "Swiss-Prot flatfile records were selected if at least one DE-line contained an EC= annotation.",
+            "ec_class_baselines": "Top-level EC classes were inferred from EC numbers with first component 1-7.",
+            "multi_ec_handling": "Records with EC annotations from multiple top-level classes are counted in each matching class baseline. EC-class baselines are therefore not mutually exclusive and should not be summed.",
+            "recommended_default_for_enzyme_designs": "uniprotkb_swissprot_reviewed_ec_annotated_2026_01"
+        },
+        "qc_policy_recommendation": {
+            "use_for_pass_fail": [
+                "uniprotkb_swissprot_reviewed_2026_01",
+                "uniprotkb_swissprot_reviewed_ec_annotated_2026_01",
+                "uniprotkb_swissprot_reviewed_ec_class_*_2026_01"
+            ],
+            "use_for_descriptive_context_only": [
+                "uniprotkb_trembl_unreviewed_2026_01_global_only"
+            ],
+            "do_not_use_without_recomputing_distributions": [
+                "nr_aa_2026_04_04",
+                "refpep_2026_04_25",
+                "uniref50_2026_01",
+                "uniref90_2026_01",
+                "uniref100_2026_01"
+            ],
+            "recommended_mpnn_workflow": [
+                "Run global and per-sequence amino-acid composition checks against Swiss-Prot EC for enzyme designs.",
+                "If top-level EC class is known, also compare against the matching EC-class baseline.",
+                "Use TrEMBL global-only as a broad unreviewed-protein-space descriptive comparator, not as a statistical gate.",
+                "Exclude fixed catalytic/motif residues from composition QC when they are intentionally constrained.",
+                "Prefer burial/core/surface-stratified checks when structural exposure labels are available."
+            ]
+        },
+        "audit_limitations": [
+            "This JSON preserves numeric values from the supplied baseline file and adds provenance/method metadata; it does not recompute new values.",
+            "Swiss-Prot official release statistics provide rounded pooled global composition; the per-sequence mean/SD fields are computed-derived values, not official UniProt-published tables.",
+            "No trustworthy current public per-sequence mean/SD amino-acid tables were found for UniRef50, UniRef90, UniRef100, nr-aa, or RefSeq peptide, so those entries remain size-only.",
+            "For strict regulatory or publication use, regenerate these constants from release-pinned FASTA/flatfile downloads and store file checksums."
+        ]
+    },
+    "SOURCE_REGISTRY": {
+        "uniprotkb_documentation": {
+            "name": "UniProtKB documentation",
+            "url": "https://www.ebi.ac.uk/training/online/courses/uniprot-quick-tour/the-uniprot-databases/uniprotkb/",
+            "description": "Documents UniProtKB as two sections: reviewed/manual UniProtKB/Swiss-Prot and unreviewed/computational UniProtKB/TrEMBL.",
+            "used_for": [
+                "Definitions of Swiss-Prot reviewed and TrEMBL unreviewed records."
+            ]
+        },
+        "swissprot_relstat_2026_01": {
+            "name": "UniProtKB/Swiss-Prot release 2026_01 statistics",
+            "url": "https://web.expasy.org/docs/relnotes/relstat.html",
+            "release": "2026_01",
+            "release_date": "2026-01-28",
+            "description": "Official Swiss-Prot release statistics page. Provides release totals and rounded pooled amino-acid composition for the complete reviewed database.",
+            "used_for": [
+                "Independent source for Swiss-Prot n_sequences and total_residues.",
+                "Independent check of Swiss-Prot global amino-acid percentages after rounding."
+            ]
+        },
+        "swissprot_fasta_current_release": {
+            "name": "UniProtKB/Swiss-Prot current_release FASTA",
+            "url": "https://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/complete/uniprot_sprot.fasta.gz",
+            "release": "2026_01",
+            "description": "Release-pinned Swiss-Prot FASTA sequence records from the UniProt FTP current_release area at the time these constants were generated.",
+            "used_for": [
+                "Computed all-reviewed Swiss-Prot per-residue pooled composition.",
+                "Computed per-sequence mean and standard deviation of 20-AA composition.",
+                "Counted nonstandard residues B, O, U, X, and Z."
+            ]
+        },
+        "swissprot_flatfile_current_release": {
+            "name": "UniProtKB/Swiss-Prot current_release flatfile",
+            "url": "https://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/complete/uniprot_sprot.dat.gz",
+            "release": "2026_01",
+            "description": "Release-pinned Swiss-Prot flatfile records from the UniProt FTP current_release area at the time these constants were generated.",
+            "used_for": [
+                "Selected enzyme records using DE-line EC= annotations.",
+                "Assigned enzyme records to top-level EC classes 1-7.",
+                "Computed enzyme and EC-class amino-acid composition distributions."
+            ]
+        },
+        "trembl_relstat_2026_01": {
+            "name": "UniProtKB/TrEMBL current release statistics",
+            "parent_url": "https://www.ebi.ac.uk/uniprot/TrEMBLstats",
+            "embedded_stats_url": "https://www.ebi.ac.uk/inc/drupal/uniprot/statistics/relstat.html",
+            "release": "2026_01",
+            "release_date": "2026-01-28",
+            "description": "Official TrEMBL current release statistics page/embedded relstat HTML. Provides pooled residue percentages only; no public per-sequence mean or SD table was found.",
+            "used_for": [
+                "TrEMBL n_sequences and total_residues.",
+                "TrEMBL global pooled amino-acid percentages.",
+                "TrEMBL nonstandard B/Z/X percentages."
+            ]
+        },
+        "genomenet_dbget_release_table": {
+            "name": "GenomeNet DBGET database release information",
+            "url": "https://www.genome.jp/en/info_dbget.html",
+            "description": "Current DBGET table listing database release IDs, entry counts, and residue counts for nr-aa, RefSeq peptide, UniProtKB, TrEMBL, UniRef50, UniRef90, UniRef100, and related databases.",
+            "used_for": [
+                "Independent source for large-dataset entry and residue totals.",
+                "Size-only metadata where no trustworthy public amino-acid distribution table was found."
+            ]
+        },
+        "uniref_documentation": {
+            "name": "UniRef documentation",
+            "url": "https://www.ebi.ac.uk/training/online/courses/uniprot-quick-tour/the-uniprot-databases/uniref/",
+            "description": "Documents UniRef100, UniRef90, and UniRef50 as clustered sequence resources derived from UniProtKB/UniParc sequence space.",
+            "used_for": [
+                "Definition of UniRef clustered datasets; not a source of amino-acid composition percentages."
+            ]
+        }
+    },
+    "AMINO_ACID_BASELINES": {
+        "uniprotkb_swissprot_reviewed_2026_01": {
+            "baseline_type": "sequence_distribution",
+            "release": "2026_01",
+            "release_date": "2026-01-28",
+            "aa_order": "ACDEFGHIKLMNPQRSTVWY",
+            "source_note": "Computed from UniProtKB/Swiss-Prot current_release FASTA; 20 standard amino acids only in denominator.",
+            "n_sequences": 574627,
+            "total_residues": 208482574,
+            "total_standard_residues": 208473776,
+            "nonstandard_counts": {
+                "B": 276,
+                "O": 29,
+                "U": 331,
+                "X": 7913,
+                "Z": 249
+            },
+            "global_pct": {
+                "A": 8.256,
+                "C": 1.389,
+                "D": 5.463,
+                "E": 6.716,
+                "F": 3.869,
+                "G": 7.072,
+                "H": 2.279,
+                "I": 5.906,
+                "K": 5.797,
+                "L": 9.649,
+                "M": 2.412,
+                "N": 4.065,
+                "P": 4.75,
+                "Q": 3.933,
+                "R": 5.529,
+                "S": 6.664,
+                "T": 5.366,
+                "V": 6.855,
+                "W": 1.106,
+                "Y": 2.925
+            },
+            "per_sequence_mean_pct": {
+                "A": 8.443,
+                "C": 1.484,
+                "D": 5.294,
+                "E": 6.593,
+                "F": 3.879,
+                "G": 7.177,
+                "H": 2.232,
+                "I": 6.063,
+                "K": 6.16,
+                "L": 9.574,
+                "M": 2.551,
+                "N": 3.936,
+                "P": 4.536,
+                "Q": 3.775,
+                "R": 5.779,
+                "S": 6.261,
+                "T": 5.258,
+                "V": 7.054,
+                "W": 1.069,
+                "Y": 2.883
+            },
+            "per_sequence_sd_pct": {
+                "A": 3.652,
+                "C": 2.058,
+                "D": 2.104,
+                "E": 2.829,
+                "F": 2.017,
+                "G": 2.863,
+                "H": 1.361,
+                "I": 2.666,
+                "K": 3.417,
+                "L": 3.089,
+                "M": 1.318,
+                "N": 2.126,
+                "P": 2.333,
+                "Q": 2.012,
+                "R": 3.062,
+                "S": 2.637,
+                "T": 1.946,
+                "V": 2.427,
+                "W": 1.059,
+                "Y": 1.581
+            },
+            "statistical_qc_allowed": true,
+            "description": "All reviewed UniProtKB/Swiss-Prot protein sequences in release 2026_01; curated native protein-space baseline.",
+            "method": {
+                "derivation_status": "computed_from_release_sequences",
+                "input_records": "UniProtKB/Swiss-Prot reviewed FASTA records, release 2026_01.",
+                "selection_rule": "All reviewed Swiss-Prot records in the release.",
+                "denominator_rule": "Only the 20 standard amino acids in AA_ORDER are used for global_pct and per-sequence percentage denominators.",
+                "nonstandard_handling": "B, O, U, X, and Z were counted separately in nonstandard_counts and excluded from 20-AA percentages.",
+                "global_pct_formula": "100 * pooled_AA_count / total_standard_residues.",
+                "per_sequence_mean_pct_formula": "Mean over sequences of 100 * sequence_AA_count / sequence_standard_AA_count.",
+                "per_sequence_sd_pct_formula": "Standard deviation over sequences of 100 * sequence_AA_count / sequence_standard_AA_count.",
+                "official_cross_check": "n_sequences, total_residues, and rounded global_pct are consistent with the official Swiss-Prot 2026_01 release-statistics page."
+            },
+            "source_ids": [
+                "swissprot_fasta_current_release",
+                "swissprot_relstat_2026_01",
+                "uniprotkb_documentation"
+            ],
+            "recommended_use": [
+                "General curated native protein-space comparator.",
+                "Statistical QC baseline when enzyme-specific or EC-class-specific baseline is not appropriate."
+            ],
+            "limitations": [
+                "Reviewed Swiss-Prot is curated and nonredundant-ish but much smaller than TrEMBL/UniRef; not representative of all metagenomic/unreviewed sequence space."
+            ],
+            "quality_control": {
+                "sum_global_pct_20_standard_aa_after_rounding": 100.001,
+                "expected_global_pct_sum_after_rounding": "Approximately 100.0; minor deviations reflect rounded percentages."
+            }
+        },
+        "uniprotkb_swissprot_reviewed_ec_annotated_2026_01": {
+            "baseline_type": "sequence_distribution",
+            "release": "2026_01",
+            "release_date": "2026-01-28",
+            "aa_order": "ACDEFGHIKLMNPQRSTVWY",
+            "source_note": "Computed from UniProtKB/Swiss-Prot flatfile records with at least one DE-line EC= annotation; 20 standard amino acids only in denominator.",
+            "n_sequences": 279501,
+            "total_residues": 116053537,
+            "total_standard_residues": 116050827,
+            "nonstandard_counts": {
+                "B": 52,
+                "O": 29,
+                "U": 199,
+                "X": 2391,
+                "Z": 39
+            },
+            "global_pct": {
+                "A": 8.699,
+                "C": 1.275,
+                "D": 5.735,
+                "E": 6.708,
+                "F": 3.887,
+                "G": 7.471,
+                "H": 2.367,
+                "I": 6.118,
+                "K": 5.477,
+                "L": 9.641,
+                "M": 2.445,
+                "N": 3.899,
+                "P": 4.618,
+                "Q": 3.656,
+                "R": 5.486,
+                "S": 5.99,
+                "T": 5.275,
+                "V": 7.118,
+                "W": 1.137,
+                "Y": 3.0
+            },
+            "per_sequence_mean_pct": {
+                "A": 8.963,
+                "C": 1.271,
+                "D": 5.703,
+                "E": 6.675,
+                "F": 3.89,
+                "G": 7.617,
+                "H": 2.381,
+                "I": 6.278,
+                "K": 5.407,
+                "L": 9.72,
+                "M": 2.51,
+                "N": 3.788,
+                "P": 4.528,
+                "Q": 3.569,
+                "R": 5.488,
+                "S": 5.704,
+                "T": 5.194,
+                "V": 7.254,
+                "W": 1.101,
+                "Y": 2.961
+            },
+            "per_sequence_sd_pct": {
+                "A": 3.302,
+                "C": 1.054,
+                "D": 1.585,
+                "E": 2.155,
+                "F": 1.579,
+                "G": 2.148,
+                "H": 1.098,
+                "I": 2.31,
+                "K": 2.558,
+                "L": 2.391,
+                "M": 1.099,
+                "N": 1.781,
+                "P": 1.583,
+                "Q": 1.551,
+                "R": 2.095,
+                "S": 1.943,
+                "T": 1.51,
+                "V": 1.983,
+                "W": 0.918,
+                "Y": 1.336
+            },
+            "statistical_qc_allowed": true,
+            "description": "Reviewed Swiss-Prot proteins with at least one EC annotation; curated enzyme-space baseline.",
+            "method": {
+                "derivation_status": "computed_from_release_sequences_and_ec_annotations",
+                "input_records": "UniProtKB/Swiss-Prot reviewed flatfile records, release 2026_01.",
+                "selection_rule": "Record included if at least one DE-line contained an EC= annotation.",
+                "denominator_rule": "Only the 20 standard amino acids in AA_ORDER are used for global_pct and per-sequence percentage denominators.",
+                "nonstandard_handling": "B, O, U, X, and Z were counted separately in nonstandard_counts and excluded from 20-AA percentages.",
+                "global_pct_formula": "100 * pooled_AA_count / total_standard_residues across EC-annotated records.",
+                "per_sequence_mean_pct_formula": "Mean over EC-annotated sequences of 100 * sequence_AA_count / sequence_standard_AA_count.",
+                "per_sequence_sd_pct_formula": "Standard deviation over EC-annotated sequences of 100 * sequence_AA_count / sequence_standard_AA_count."
+            },
+            "source_ids": [
+                "swissprot_flatfile_current_release",
+                "swissprot_relstat_2026_01",
+                "uniprotkb_documentation"
+            ],
+            "recommended_use": [
+                "Default baseline for enzyme-design MPNN/ProteinMPNN QC.",
+                "Use for z-scores or warning thresholds when no EC-class-specific baseline is more appropriate."
+            ],
+            "limitations": [
+                "Only enzymes that are reviewed and EC-annotated in Swiss-Prot are included; enzyme classes and taxa are not equally represented."
+            ],
+            "quality_control": {
+                "sum_global_pct_20_standard_aa_after_rounding": 100.002,
+                "expected_global_pct_sum_after_rounding": "Approximately 100.0; minor deviations reflect rounded percentages."
+            }
+        },
+        "uniprotkb_swissprot_reviewed_ec_class_1_oxidoreductases_2026_01": {
+            "baseline_type": "sequence_distribution",
+            "release": "2026_01",
+            "release_date": "2026-01-28",
+            "aa_order": "ACDEFGHIKLMNPQRSTVWY",
+            "source_note": "Computed from Swiss-Prot records containing at least one EC=1.* annotation. Multi-EC proteins may appear in multiple class baselines.",
+            "n_sequences": 36118,
+            "total_residues": 14409213,
+            "total_standard_residues": 14408470,
+            "nonstandard_counts": {
+                "B": 7,
+                "U": 160,
+                "X": 570,
+                "Z": 6
+            },
+            "global_pct": {
+                "A": 9.379,
+                "C": 1.32,
+                "D": 5.484,
+                "E": 6.314,
+                "F": 3.989,
+                "G": 7.884,
+                "H": 2.536,
+                "I": 5.856,
+                "K": 5.204,
+                "L": 9.379,
+                "M": 2.42,
+                "N": 3.892,
+                "P": 4.879,
+                "Q": 3.545,
+                "R": 5.257,
+                "S": 5.815,
+                "T": 5.315,
+                "V": 7.268,
+                "W": 1.32,
+                "Y": 2.945
+            },
+            "per_sequence_mean_pct": {
+                "A": 9.446,
+                "C": 1.356,
+                "D": 5.514,
+                "E": 6.369,
+                "F": 3.949,
+                "G": 7.929,
+                "H": 2.538,
+                "I": 5.932,
+                "K": 5.24,
+                "L": 9.317,
+                "M": 2.422,
+                "N": 3.868,
+                "P": 4.786,
+                "Q": 3.501,
+                "R": 5.19,
+                "S": 5.71,
+                "T": 5.328,
+                "V": 7.382,
+                "W": 1.269,
+                "Y": 2.953
+            },
+            "per_sequence_sd_pct": {
+                "A": 3.216,
+                "C": 1.14,
+                "D": 1.486,
+                "E": 1.843,
+                "F": 1.606,
+                "G": 2.124,
+                "H": 1.143,
+                "I": 2.06,
+                "K": 2.383,
+                "L": 2.216,
+                "M": 1.004,
+                "N": 1.604,
+                "P": 1.555,
+                "Q": 1.444,
+                "R": 1.927,
+                "S": 1.723,
+                "T": 1.46,
+                "V": 1.994,
+                "W": 0.929,
+                "Y": 1.292
+            },
+            "statistical_qc_allowed": true,
+            "ec_class": "1",
+            "ec_class_name": "oxidoreductases",
+            "description": "Reviewed Swiss-Prot EC-annotated enzyme subset for top-level EC class 1 (oxidoreductases); curated class-specific enzyme baseline.",
+            "method": {
+                "derivation_status": "computed_from_release_sequences_and_ec_annotations",
+                "input_records": "UniProtKB/Swiss-Prot reviewed flatfile records, release 2026_01.",
+                "selection_rule": "Record included if at least one parsed EC number had top-level class 1 (that is, EC=1.x.x.x). Proteins with EC annotations in multiple top-level classes may appear in multiple EC-class baselines.",
+                "denominator_rule": "Only the 20 standard amino acids in AA_ORDER are used for global_pct and per-sequence percentage denominators.",
+                "nonstandard_handling": "Nonstandard/ambiguous residues listed in nonstandard_counts were excluded from 20-AA percentages.",
+                "global_pct_formula": "100 * pooled_AA_count / total_standard_residues across records in this EC class.",
+                "per_sequence_mean_pct_formula": "Mean over selected EC-class sequences of 100 * sequence_AA_count / sequence_standard_AA_count.",
+                "per_sequence_sd_pct_formula": "Standard deviation over selected EC-class sequences of 100 * sequence_AA_count / sequence_standard_AA_count.",
+                "mutual_exclusivity": "False; EC-class baselines can overlap because multi-EC proteins are included in every matching top-level EC class."
+            },
+            "source_ids": [
+                "swissprot_flatfile_current_release",
+                "swissprot_relstat_2026_01",
+                "uniprotkb_documentation"
+            ],
+            "recommended_use": [
+                "Class-specific comparator for designs whose target enzyme belongs to EC class 1 (oxidoreductases).",
+                "Use alongside the all-EC enzyme baseline rather than as a replacement when sample size is a concern."
+            ],
+            "limitations": [
+                "Not mutually exclusive across EC classes.",
+                "May be biased by Swiss-Prot review/annotation coverage and by overrepresented enzyme families."
+            ],
+            "quality_control": {
+                "sum_global_pct_20_standard_aa_after_rounding": 100.001,
+                "expected_global_pct_sum_after_rounding": "Approximately 100.0; minor deviations reflect rounded percentages."
+            }
+        },
+        "uniprotkb_swissprot_reviewed_ec_class_2_transferases_2026_01": {
+            "baseline_type": "sequence_distribution",
+            "release": "2026_01",
+            "release_date": "2026-01-28",
+            "aa_order": "ACDEFGHIKLMNPQRSTVWY",
+            "source_note": "Computed from Swiss-Prot records containing at least one EC=2.* annotation. Multi-EC proteins may appear in multiple class baselines.",
+            "n_sequences": 98574,
+            "total_residues": 42860933,
+            "total_standard_residues": 42860204,
+            "nonstandard_counts": {
+                "B": 3,
+                "O": 29,
+                "U": 39,
+                "X": 658
+            },
+            "global_pct": {
+                "A": 8.539,
+                "C": 1.349,
+                "D": 5.623,
+                "E": 6.544,
+                "F": 3.85,
+                "G": 7.222,
+                "H": 2.376,
+                "I": 6.15,
+                "K": 5.461,
+                "L": 9.887,
+                "M": 2.429,
+                "N": 3.875,
+                "P": 4.724,
+                "Q": 3.697,
+                "R": 5.69,
+                "S": 6.211,
+                "T": 5.215,
+                "V": 7.127,
+                "W": 1.097,
+                "Y": 2.934
+            },
+            "per_sequence_mean_pct": {
+                "A": 8.975,
+                "C": 1.262,
+                "D": 5.631,
+                "E": 6.588,
+                "F": 3.848,
+                "G": 7.403,
+                "H": 2.352,
+                "I": 6.363,
+                "K": 5.42,
+                "L": 9.993,
+                "M": 2.491,
+                "N": 3.683,
+                "P": 4.591,
+                "Q": 3.576,
+                "R": 5.74,
+                "S": 5.778,
+                "T": 5.084,
+                "V": 7.285,
+                "W": 1.053,
+                "Y": 2.883
+            },
+            "per_sequence_sd_pct": {
+                "A": 3.464,
+                "C": 0.916,
+                "D": 1.54,
+                "E": 2.067,
+                "F": 1.553,
+                "G": 2.098,
+                "H": 1.011,
+                "I": 2.379,
+                "K": 2.548,
+                "L": 2.284,
+                "M": 0.996,
+                "N": 1.811,
+                "P": 1.58,
+                "Q": 1.565,
+                "R": 2.086,
+                "S": 1.95,
+                "T": 1.402,
+                "V": 1.964,
+                "W": 0.887,
+                "Y": 1.303
+            },
+            "statistical_qc_allowed": true,
+            "ec_class": "2",
+            "ec_class_name": "transferases",
+            "description": "Reviewed Swiss-Prot EC-annotated enzyme subset for top-level EC class 2 (transferases); curated class-specific enzyme baseline.",
+            "method": {
+                "derivation_status": "computed_from_release_sequences_and_ec_annotations",
+                "input_records": "UniProtKB/Swiss-Prot reviewed flatfile records, release 2026_01.",
+                "selection_rule": "Record included if at least one parsed EC number had top-level class 2 (that is, EC=2.x.x.x). Proteins with EC annotations in multiple top-level classes may appear in multiple EC-class baselines.",
+                "denominator_rule": "Only the 20 standard amino acids in AA_ORDER are used for global_pct and per-sequence percentage denominators.",
+                "nonstandard_handling": "Nonstandard/ambiguous residues listed in nonstandard_counts were excluded from 20-AA percentages.",
+                "global_pct_formula": "100 * pooled_AA_count / total_standard_residues across records in this EC class.",
+                "per_sequence_mean_pct_formula": "Mean over selected EC-class sequences of 100 * sequence_AA_count / sequence_standard_AA_count.",
+                "per_sequence_sd_pct_formula": "Standard deviation over selected EC-class sequences of 100 * sequence_AA_count / sequence_standard_AA_count.",
+                "mutual_exclusivity": "False; EC-class baselines can overlap because multi-EC proteins are included in every matching top-level EC class."
+            },
+            "source_ids": [
+                "swissprot_flatfile_current_release",
+                "swissprot_relstat_2026_01",
+                "uniprotkb_documentation"
+            ],
+            "recommended_use": [
+                "Class-specific comparator for designs whose target enzyme belongs to EC class 2 (transferases).",
+                "Use alongside the all-EC enzyme baseline rather than as a replacement when sample size is a concern."
+            ],
+            "limitations": [
+                "Not mutually exclusive across EC classes.",
+                "May be biased by Swiss-Prot review/annotation coverage and by overrepresented enzyme families."
+            ],
+            "quality_control": {
+                "sum_global_pct_20_standard_aa_after_rounding": 100.0,
+                "expected_global_pct_sum_after_rounding": "Approximately 100.0; minor deviations reflect rounded percentages."
+            }
+        },
+        "uniprotkb_swissprot_reviewed_ec_class_3_hydrolases_2026_01": {
+            "baseline_type": "sequence_distribution",
+            "release": "2026_01",
+            "release_date": "2026-01-28",
+            "aa_order": "ACDEFGHIKLMNPQRSTVWY",
+            "source_note": "Computed from Swiss-Prot records containing at least one EC=3.* annotation. Multi-EC proteins may appear in multiple class baselines.",
+            "n_sequences": 64973,
+            "total_residues": 27046814,
+            "total_standard_residues": 27046141,
+            "nonstandard_counts": {
+                "B": 11,
+                "X": 658,
+                "Z": 4
+            },
+            "global_pct": {
+                "A": 8.007,
+                "C": 1.435,
+                "D": 5.835,
+                "E": 6.54,
+                "F": 3.892,
+                "G": 7.208,
+                "H": 2.474,
+                "I": 5.901,
+                "K": 5.652,
+                "L": 9.441,
+                "M": 2.312,
+                "N": 4.215,
+                "P": 4.745,
+                "Q": 3.833,
+                "R": 5.387,
+                "S": 6.463,
+                "T": 5.482,
+                "V": 6.831,
+                "W": 1.196,
+                "Y": 3.151
+            },
+            "per_sequence_mean_pct": {
+                "A": 8.392,
+                "C": 1.402,
+                "D": 5.802,
+                "E": 6.589,
+                "F": 3.852,
+                "G": 7.513,
+                "H": 2.512,
+                "I": 6.109,
+                "K": 5.529,
+                "L": 9.52,
+                "M": 2.397,
+                "N": 4.041,
+                "P": 4.605,
+                "Q": 3.753,
+                "R": 5.498,
+                "S": 6.009,
+                "T": 5.28,
+                "V": 6.992,
+                "W": 1.148,
+                "Y": 3.057
+            },
+            "per_sequence_sd_pct": {
+                "A": 3.183,
+                "C": 1.332,
+                "D": 1.605,
+                "E": 2.406,
+                "F": 1.539,
+                "G": 2.258,
+                "H": 1.157,
+                "I": 2.358,
+                "K": 2.702,
+                "L": 2.366,
+                "M": 1.071,
+                "N": 1.966,
+                "P": 1.739,
+                "Q": 1.664,
+                "R": 2.269,
+                "S": 2.195,
+                "T": 1.706,
+                "V": 1.995,
+                "W": 1.001,
+                "Y": 1.483
+            },
+            "statistical_qc_allowed": true,
+            "ec_class": "3",
+            "ec_class_name": "hydrolases",
+            "description": "Reviewed Swiss-Prot EC-annotated enzyme subset for top-level EC class 3 (hydrolases); curated class-specific enzyme baseline.",
+            "method": {
+                "derivation_status": "computed_from_release_sequences_and_ec_annotations",
+                "input_records": "UniProtKB/Swiss-Prot reviewed flatfile records, release 2026_01.",
+                "selection_rule": "Record included if at least one parsed EC number had top-level class 3 (that is, EC=3.x.x.x). Proteins with EC annotations in multiple top-level classes may appear in multiple EC-class baselines.",
+                "denominator_rule": "Only the 20 standard amino acids in AA_ORDER are used for global_pct and per-sequence percentage denominators.",
+                "nonstandard_handling": "Nonstandard/ambiguous residues listed in nonstandard_counts were excluded from 20-AA percentages.",
+                "global_pct_formula": "100 * pooled_AA_count / total_standard_residues across records in this EC class.",
+                "per_sequence_mean_pct_formula": "Mean over selected EC-class sequences of 100 * sequence_AA_count / sequence_standard_AA_count.",
+                "per_sequence_sd_pct_formula": "Standard deviation over selected EC-class sequences of 100 * sequence_AA_count / sequence_standard_AA_count.",
+                "mutual_exclusivity": "False; EC-class baselines can overlap because multi-EC proteins are included in every matching top-level EC class."
+            },
+            "source_ids": [
+                "swissprot_flatfile_current_release",
+                "swissprot_relstat_2026_01",
+                "uniprotkb_documentation"
+            ],
+            "recommended_use": [
+                "Class-specific comparator for designs whose target enzyme belongs to EC class 3 (hydrolases).",
+                "Use alongside the all-EC enzyme baseline rather than as a replacement when sample size is a concern."
+            ],
+            "limitations": [
+                "Not mutually exclusive across EC classes.",
+                "May be biased by Swiss-Prot review/annotation coverage and by overrepresented enzyme families."
+            ],
+            "quality_control": {
+                "sum_global_pct_20_standard_aa_after_rounding": 100.0,
+                "expected_global_pct_sum_after_rounding": "Approximately 100.0; minor deviations reflect rounded percentages."
+            }
+        },
+        "uniprotkb_swissprot_reviewed_ec_class_4_lyases_2026_01": {
+            "baseline_type": "sequence_distribution",
+            "release": "2026_01",
+            "release_date": "2026-01-28",
+            "aa_order": "ACDEFGHIKLMNPQRSTVWY",
+            "source_note": "Computed from Swiss-Prot records containing at least one EC=4.* annotation. Multi-EC proteins may appear in multiple class baselines.",
+            "n_sequences": 26812,
+            "total_residues": 9746586,
+            "total_standard_residues": 9746138,
+            "nonstandard_counts": {
+                "B": 30,
+                "X": 389,
+                "Z": 29
+            },
+            "global_pct": {
+                "A": 9.615,
+                "C": 1.353,
+                "D": 5.868,
+                "E": 6.614,
+                "F": 3.694,
+                "G": 8.017,
+                "H": 2.469,
+                "I": 6.087,
+                "K": 5.239,
+                "L": 9.414,
+                "M": 2.606,
+                "N": 3.691,
+                "P": 4.475,
+                "Q": 3.37,
+                "R": 5.379,
+                "S": 5.593,
+                "T": 5.349,
+                "V": 7.204,
+                "W": 1.058,
+                "Y": 2.905
+            },
+            "per_sequence_mean_pct": {
+                "A": 9.767,
+                "C": 1.315,
+                "D": 5.902,
+                "E": 6.651,
+                "F": 3.697,
+                "G": 8.062,
+                "H": 2.547,
+                "I": 6.306,
+                "K": 5.258,
+                "L": 9.358,
+                "M": 2.629,
+                "N": 3.613,
+                "P": 4.43,
+                "Q": 3.331,
+                "R": 5.388,
+                "S": 5.334,
+                "T": 5.316,
+                "V": 7.324,
+                "W": 0.989,
+                "Y": 2.78
+            },
+            "per_sequence_sd_pct": {
+                "A": 3.23,
+                "C": 0.83,
+                "D": 1.519,
+                "E": 1.727,
+                "F": 1.365,
+                "G": 2.088,
+                "H": 1.181,
+                "I": 2.155,
+                "K": 2.328,
+                "L": 2.181,
+                "M": 1.076,
+                "N": 1.733,
+                "P": 1.541,
+                "Q": 1.436,
+                "R": 1.947,
+                "S": 1.808,
+                "T": 1.517,
+                "V": 1.892,
+                "W": 0.786,
+                "Y": 1.285
+            },
+            "statistical_qc_allowed": true,
+            "ec_class": "4",
+            "ec_class_name": "lyases",
+            "description": "Reviewed Swiss-Prot EC-annotated enzyme subset for top-level EC class 4 (lyases); curated class-specific enzyme baseline.",
+            "method": {
+                "derivation_status": "computed_from_release_sequences_and_ec_annotations",
+                "input_records": "UniProtKB/Swiss-Prot reviewed flatfile records, release 2026_01.",
+                "selection_rule": "Record included if at least one parsed EC number had top-level class 4 (that is, EC=4.x.x.x). Proteins with EC annotations in multiple top-level classes may appear in multiple EC-class baselines.",
+                "denominator_rule": "Only the 20 standard amino acids in AA_ORDER are used for global_pct and per-sequence percentage denominators.",
+                "nonstandard_handling": "Nonstandard/ambiguous residues listed in nonstandard_counts were excluded from 20-AA percentages.",
+                "global_pct_formula": "100 * pooled_AA_count / total_standard_residues across records in this EC class.",
+                "per_sequence_mean_pct_formula": "Mean over selected EC-class sequences of 100 * sequence_AA_count / sequence_standard_AA_count.",
+                "per_sequence_sd_pct_formula": "Standard deviation over selected EC-class sequences of 100 * sequence_AA_count / sequence_standard_AA_count.",
+                "mutual_exclusivity": "False; EC-class baselines can overlap because multi-EC proteins are included in every matching top-level EC class."
+            },
+            "source_ids": [
+                "swissprot_flatfile_current_release",
+                "swissprot_relstat_2026_01",
+                "uniprotkb_documentation"
+            ],
+            "recommended_use": [
+                "Class-specific comparator for designs whose target enzyme belongs to EC class 4 (lyases).",
+                "Use alongside the all-EC enzyme baseline rather than as a replacement when sample size is a concern."
+            ],
+            "limitations": [
+                "Not mutually exclusive across EC classes.",
+                "May be biased by Swiss-Prot review/annotation coverage and by overrepresented enzyme families."
+            ],
+            "quality_control": {
+                "sum_global_pct_20_standard_aa_after_rounding": 100.0,
+                "expected_global_pct_sum_after_rounding": "Approximately 100.0; minor deviations reflect rounded percentages."
+            }
+        },
+        "uniprotkb_swissprot_reviewed_ec_class_5_isomerases_2026_01": {
+            "baseline_type": "sequence_distribution",
+            "release": "2026_01",
+            "release_date": "2026-01-28",
+            "aa_order": "ACDEFGHIKLMNPQRSTVWY",
+            "source_note": "Computed from Swiss-Prot records containing at least one EC=5.* annotation. Multi-EC proteins may appear in multiple class baselines.",
+            "n_sequences": 16846,
+            "total_residues": 6731948,
+            "total_standard_residues": 6731902,
+            "nonstandard_counts": {
+                "X": 46
+            },
+            "global_pct": {
+                "A": 9.327,
+                "C": 1.017,
+                "D": 5.964,
+                "E": 7.349,
+                "F": 3.703,
+                "G": 7.906,
+                "H": 2.112,
+                "I": 6.129,
+                "K": 6.172,
+                "L": 9.208,
+                "M": 2.43,
+                "N": 3.923,
+                "P": 4.094,
+                "Q": 3.609,
+                "R": 5.155,
+                "S": 5.454,
+                "T": 5.28,
+                "V": 7.472,
+                "W": 0.931,
+                "Y": 2.766
+            },
+            "per_sequence_mean_pct": {
+                "A": 9.519,
+                "C": 1.072,
+                "D": 5.94,
+                "E": 7.209,
+                "F": 3.663,
+                "G": 8.161,
+                "H": 2.2,
+                "I": 6.213,
+                "K": 5.979,
+                "L": 9.119,
+                "M": 2.427,
+                "N": 3.829,
+                "P": 4.152,
+                "Q": 3.529,
+                "R": 5.112,
+                "S": 5.274,
+                "T": 5.227,
+                "V": 7.68,
+                "W": 0.962,
+                "Y": 2.732
+            },
+            "per_sequence_sd_pct": {
+                "A": 3.301,
+                "C": 0.821,
+                "D": 1.52,
+                "E": 2.231,
+                "F": 1.561,
+                "G": 2.336,
+                "H": 1.182,
+                "I": 2.234,
+                "K": 2.836,
+                "L": 1.975,
+                "M": 1.016,
+                "N": 1.63,
+                "P": 1.451,
+                "Q": 1.557,
+                "R": 2.022,
+                "S": 1.765,
+                "T": 1.456,
+                "V": 2.073,
+                "W": 0.852,
+                "Y": 1.243
+            },
+            "statistical_qc_allowed": true,
+            "ec_class": "5",
+            "ec_class_name": "isomerases",
+            "description": "Reviewed Swiss-Prot EC-annotated enzyme subset for top-level EC class 5 (isomerases); curated class-specific enzyme baseline.",
+            "method": {
+                "derivation_status": "computed_from_release_sequences_and_ec_annotations",
+                "input_records": "UniProtKB/Swiss-Prot reviewed flatfile records, release 2026_01.",
+                "selection_rule": "Record included if at least one parsed EC number had top-level class 5 (that is, EC=5.x.x.x). Proteins with EC annotations in multiple top-level classes may appear in multiple EC-class baselines.",
+                "denominator_rule": "Only the 20 standard amino acids in AA_ORDER are used for global_pct and per-sequence percentage denominators.",
+                "nonstandard_handling": "Nonstandard/ambiguous residues listed in nonstandard_counts were excluded from 20-AA percentages.",
+                "global_pct_formula": "100 * pooled_AA_count / total_standard_residues across records in this EC class.",
+                "per_sequence_mean_pct_formula": "Mean over selected EC-class sequences of 100 * sequence_AA_count / sequence_standard_AA_count.",
+                "per_sequence_sd_pct_formula": "Standard deviation over selected EC-class sequences of 100 * sequence_AA_count / sequence_standard_AA_count.",
+                "mutual_exclusivity": "False; EC-class baselines can overlap because multi-EC proteins are included in every matching top-level EC class."
+            },
+            "source_ids": [
+                "swissprot_flatfile_current_release",
+                "swissprot_relstat_2026_01",
+                "uniprotkb_documentation"
+            ],
+            "recommended_use": [
+                "Class-specific comparator for designs whose target enzyme belongs to EC class 5 (isomerases).",
+                "Use alongside the all-EC enzyme baseline rather than as a replacement when sample size is a concern."
+            ],
+            "limitations": [
+                "Not mutually exclusive across EC classes.",
+                "May be biased by Swiss-Prot review/annotation coverage and by overrepresented enzyme families."
+            ],
+            "quality_control": {
+                "sum_global_pct_20_standard_aa_after_rounding": 100.001,
+                "expected_global_pct_sum_after_rounding": "Approximately 100.0; minor deviations reflect rounded percentages."
+            }
+        },
+        "uniprotkb_swissprot_reviewed_ec_class_6_ligases_2026_01": {
+            "baseline_type": "sequence_distribution",
+            "release": "2026_01",
+            "release_date": "2026-01-28",
+            "aa_order": "ACDEFGHIKLMNPQRSTVWY",
+            "source_note": "Computed from Swiss-Prot records containing at least one EC=6.* annotation. Multi-EC proteins may appear in multiple class baselines.",
+            "n_sequences": 29365,
+            "total_residues": 15693966,
+            "total_standard_residues": 15693701,
+            "nonstandard_counts": {
+                "X": 265
+            },
+            "global_pct": {
+                "A": 8.774,
+                "C": 1.081,
+                "D": 6.197,
+                "E": 7.545,
+                "F": 3.944,
+                "G": 7.435,
+                "H": 2.272,
+                "I": 6.056,
+                "K": 5.721,
+                "L": 9.42,
+                "M": 2.316,
+                "N": 3.696,
+                "P": 4.432,
+                "Q": 3.577,
+                "R": 5.626,
+                "S": 5.305,
+                "T": 5.08,
+                "V": 7.201,
+                "W": 1.166,
+                "Y": 3.156
+            },
+            "per_sequence_mean_pct": {
+                "A": 8.794,
+                "C": 1.083,
+                "D": 6.218,
+                "E": 7.621,
+                "F": 3.941,
+                "G": 7.521,
+                "H": 2.252,
+                "I": 6.131,
+                "K": 5.772,
+                "L": 9.481,
+                "M": 2.348,
+                "N": 3.721,
+                "P": 4.355,
+                "Q": 3.556,
+                "R": 5.612,
+                "S": 5.128,
+                "T": 5.024,
+                "V": 7.2,
+                "W": 1.076,
+                "Y": 3.167
+            },
+            "per_sequence_sd_pct": {
+                "A": 2.965,
+                "C": 0.673,
+                "D": 1.238,
+                "E": 1.809,
+                "F": 1.164,
+                "G": 1.906,
+                "H": 0.828,
+                "I": 1.986,
+                "K": 2.387,
+                "L": 1.634,
+                "M": 0.809,
+                "N": 1.571,
+                "P": 1.138,
+                "Q": 1.373,
+                "R": 1.803,
+                "S": 1.471,
+                "T": 1.179,
+                "V": 1.765,
+                "W": 0.748,
+                "Y": 1.099
+            },
+            "statistical_qc_allowed": true,
+            "ec_class": "6",
+            "ec_class_name": "ligases",
+            "description": "Reviewed Swiss-Prot EC-annotated enzyme subset for top-level EC class 6 (ligases); curated class-specific enzyme baseline.",
+            "method": {
+                "derivation_status": "computed_from_release_sequences_and_ec_annotations",
+                "input_records": "UniProtKB/Swiss-Prot reviewed flatfile records, release 2026_01.",
+                "selection_rule": "Record included if at least one parsed EC number had top-level class 6 (that is, EC=6.x.x.x). Proteins with EC annotations in multiple top-level classes may appear in multiple EC-class baselines.",
+                "denominator_rule": "Only the 20 standard amino acids in AA_ORDER are used for global_pct and per-sequence percentage denominators.",
+                "nonstandard_handling": "Nonstandard/ambiguous residues listed in nonstandard_counts were excluded from 20-AA percentages.",
+                "global_pct_formula": "100 * pooled_AA_count / total_standard_residues across records in this EC class.",
+                "per_sequence_mean_pct_formula": "Mean over selected EC-class sequences of 100 * sequence_AA_count / sequence_standard_AA_count.",
+                "per_sequence_sd_pct_formula": "Standard deviation over selected EC-class sequences of 100 * sequence_AA_count / sequence_standard_AA_count.",
+                "mutual_exclusivity": "False; EC-class baselines can overlap because multi-EC proteins are included in every matching top-level EC class."
+            },
+            "source_ids": [
+                "swissprot_flatfile_current_release",
+                "swissprot_relstat_2026_01",
+                "uniprotkb_documentation"
+            ],
+            "recommended_use": [
+                "Class-specific comparator for designs whose target enzyme belongs to EC class 6 (ligases).",
+                "Use alongside the all-EC enzyme baseline rather than as a replacement when sample size is a concern."
+            ],
+            "limitations": [
+                "Not mutually exclusive across EC classes.",
+                "May be biased by Swiss-Prot review/annotation coverage and by overrepresented enzyme families."
+            ],
+            "quality_control": {
+                "sum_global_pct_20_standard_aa_after_rounding": 100.0,
+                "expected_global_pct_sum_after_rounding": "Approximately 100.0; minor deviations reflect rounded percentages."
+            }
+        },
+        "uniprotkb_swissprot_reviewed_ec_class_7_translocases_2026_01": {
+            "baseline_type": "sequence_distribution",
+            "release": "2026_01",
+            "release_date": "2026-01-28",
+            "aa_order": "ACDEFGHIKLMNPQRSTVWY",
+            "source_note": "Computed from Swiss-Prot records containing at least one EC=7.* annotation. Multi-EC proteins may appear in multiple class baselines.",
+            "n_sequences": 14972,
+            "total_residues": 5989247,
+            "total_standard_residues": 5989075,
+            "nonstandard_counts": {
+                "B": 1,
+                "X": 171
+            },
+            "global_pct": {
+                "A": 8.44,
+                "C": 0.978,
+                "D": 4.826,
+                "E": 6.126,
+                "F": 4.386,
+                "G": 7.605,
+                "H": 1.876,
+                "I": 7.307,
+                "K": 4.531,
+                "L": 11.066,
+                "M": 3.148,
+                "N": 3.547,
+                "P": 4.208,
+                "Q": 3.71,
+                "R": 5.136,
+                "S": 6.049,
+                "T": 5.408,
+                "V": 7.482,
+                "W": 1.104,
+                "Y": 3.065
+            },
+            "per_sequence_mean_pct": {
+                "A": 8.383,
+                "C": 1.158,
+                "D": 4.515,
+                "E": 5.708,
+                "F": 4.662,
+                "G": 7.514,
+                "H": 1.856,
+                "I": 7.419,
+                "K": 4.129,
+                "L": 11.713,
+                "M": 3.429,
+                "N": 3.534,
+                "P": 4.314,
+                "Q": 3.466,
+                "R": 4.979,
+                "S": 6.043,
+                "T": 5.295,
+                "V": 7.52,
+                "W": 1.199,
+                "Y": 3.165
+            },
+            "per_sequence_sd_pct": {
+                "A": 3.005,
+                "C": 1.251,
+                "D": 1.932,
+                "E": 2.476,
+                "F": 2.384,
+                "G": 2.051,
+                "H": 1.15,
+                "I": 2.59,
+                "K": 2.189,
+                "L": 3.798,
+                "M": 1.883,
+                "N": 1.546,
+                "P": 1.696,
+                "Q": 1.581,
+                "R": 2.352,
+                "S": 2.038,
+                "T": 1.824,
+                "V": 2.29,
+                "W": 1.119,
+                "Y": 1.419
+            },
+            "statistical_qc_allowed": true,
+            "ec_class": "7",
+            "ec_class_name": "translocases",
+            "description": "Reviewed Swiss-Prot EC-annotated enzyme subset for top-level EC class 7 (translocases); curated class-specific enzyme baseline.",
+            "method": {
+                "derivation_status": "computed_from_release_sequences_and_ec_annotations",
+                "input_records": "UniProtKB/Swiss-Prot reviewed flatfile records, release 2026_01.",
+                "selection_rule": "Record included if at least one parsed EC number had top-level class 7 (that is, EC=7.x.x.x). Proteins with EC annotations in multiple top-level classes may appear in multiple EC-class baselines.",
+                "denominator_rule": "Only the 20 standard amino acids in AA_ORDER are used for global_pct and per-sequence percentage denominators.",
+                "nonstandard_handling": "Nonstandard/ambiguous residues listed in nonstandard_counts were excluded from 20-AA percentages.",
+                "global_pct_formula": "100 * pooled_AA_count / total_standard_residues across records in this EC class.",
+                "per_sequence_mean_pct_formula": "Mean over selected EC-class sequences of 100 * sequence_AA_count / sequence_standard_AA_count.",
+                "per_sequence_sd_pct_formula": "Standard deviation over selected EC-class sequences of 100 * sequence_AA_count / sequence_standard_AA_count.",
+                "mutual_exclusivity": "False; EC-class baselines can overlap because multi-EC proteins are included in every matching top-level EC class."
+            },
+            "source_ids": [
+                "swissprot_flatfile_current_release",
+                "swissprot_relstat_2026_01",
+                "uniprotkb_documentation"
+            ],
+            "recommended_use": [
+                "Class-specific comparator for designs whose target enzyme belongs to EC class 7 (translocases).",
+                "Use alongside the all-EC enzyme baseline rather than as a replacement when sample size is a concern."
+            ],
+            "limitations": [
+                "Not mutually exclusive across EC classes.",
+                "May be biased by Swiss-Prot review/annotation coverage and by overrepresented enzyme families."
+            ],
+            "quality_control": {
+                "sum_global_pct_20_standard_aa_after_rounding": 99.998,
+                "expected_global_pct_sum_after_rounding": "Approximately 100.0; minor deviations reflect rounded percentages."
+            }
+        },
+        "uniprotkb_trembl_unreviewed_2026_01_global_only": {
+            "baseline_type": "global_only",
+            "release": "2026_01",
+            "release_date": "2026-01-28",
+            "aa_order": "ACDEFGHIKLMNPQRSTVWY",
+            "source_note": "Official UniProtKB/TrEMBL Current Release Statistics embedded relstat.html. Pooled residue frequencies only; no per-sequence mean/SD available from the public stats page.",
+            "n_sequences": 202556314,
+            "total_residues": 75514137419,
+            "total_standard_residues": null,
+            "nonstandard_pct": {
+                "B": 0.0,
+                "Z": 0.0,
+                "X": 0.02
+            },
+            "global_pct": {
+                "A": 8.69,
+                "C": 1.41,
+                "D": 5.44,
+                "E": 6.27,
+                "F": 3.84,
+                "G": 7.07,
+                "H": 2.3,
+                "I": 5.32,
+                "K": 5.05,
+                "L": 9.76,
+                "M": 2.32,
+                "N": 3.86,
+                "P": 5.15,
+                "Q": 3.92,
+                "R": 5.81,
+                "S": 7.2,
+                "T": 5.59,
+                "V": 6.74,
+                "W": 1.3,
+                "Y": 2.84
+            },
+            "per_sequence_mean_pct": null,
+            "per_sequence_sd_pct": null,
+            "statistical_qc_allowed": false,
+            "description": "All unreviewed UniProtKB/TrEMBL protein sequences in release 2026_01; huge unreviewed protein-space global composition comparator only.",
+            "method": {
+                "derivation_status": "official_pooled_release_statistics_only",
+                "input_records": "No local per-sequence computation was performed for this JSON entry.",
+                "selection_rule": "All UniProtKB/TrEMBL records represented in the official 2026_01 release-statistics table.",
+                "denominator_rule": "Official complete-database pooled percentages as reported by the TrEMBL release-statistics page.",
+                "nonstandard_handling": "Official release-statistics page reports B, Z, and X percentages; no per-residue count table or per-sequence distribution is included here.",
+                "global_pct_formula": "Official pooled residue percentage from UniProtKB/TrEMBL release statistics, not recomputed here.",
+                "per_sequence_mean_pct_formula": null,
+                "per_sequence_sd_pct_formula": null,
+                "qc_rule": "Descriptive enrichment comparison only; do not use for z-scores, empirical p-values, or pass/fail QC."
+            },
+            "source_ids": [
+                "trembl_relstat_2026_01",
+                "genomenet_dbget_release_table",
+                "uniprotkb_documentation"
+            ],
+            "recommended_use": [
+                "Broad descriptive comparison against huge unreviewed protein space.",
+                "Useful to show whether a design batch is globally enriched/depleted relative to TrEMBL."
+            ],
+            "limitations": [
+                "Global-only; no sequence-level variance.",
+                "Unreviewed TrEMBL is more redundant and more computationally annotated than Swiss-Prot.",
+                "Not length-matched, enzyme-matched, taxonomy-matched, or structure-context-matched."
+            ],
+            "quality_control": {
+                "sum_global_pct_20_standard_aa_after_rounding": 99.88,
+                "expected_global_pct_sum_after_rounding": "Approximately 100.0; minor deviations reflect rounded percentages."
+            }
+        }
+    },
+    "DATASET_SIZE_ONLY": {
+        "nr_aa_2026_04_04": {
+            "release": "26-04-04 (Apr 2026)",
+            "n_entries": 542810538,
+            "n_residues": 224616733303,
+            "distribution_available": false,
+            "baseline_type": "size_only",
+            "statistical_qc_allowed": false,
+            "source_ids": [
+                "genomenet_dbget_release_table"
+            ],
+            "description": "Large protein sequence database size metadata only; no amino-acid composition distribution included in this JSON.",
+            "method": {
+                "derivation_status": "size_metadata_only",
+                "input_records": "No sequence-level or amino-acid-count computation was performed for this JSON entry.",
+                "source_of_counts": "GenomeNet DBGET database release information table.",
+                "available_fields": [
+                    "release",
+                    "n_entries",
+                    "n_residues"
+                ],
+                "missing_fields": [
+                    "global_pct",
+                    "per_sequence_mean_pct",
+                    "per_sequence_sd_pct"
+                ],
+                "qc_rule": "Do not use for composition comparison or statistical QC until amino-acid distributions are recomputed from sequence files."
+            },
+            "recommended_use": [
+                "Provenance/scale context only.",
+                "Use to decide whether a future local streaming recomputation is worth doing."
+            ],
+            "limitations": [
+                "No amino-acid percentages are included.",
+                "Cannot compute enrichment, z-scores, empirical p-values, or pass/fail QC from this entry alone."
+            ]
+        },
+        "refpep_2026_04_25": {
+            "release": "26-04-25 (Apr 2026)",
+            "n_entries": 512831255,
+            "n_residues": 200480844752,
+            "distribution_available": false,
+            "baseline_type": "size_only",
+            "statistical_qc_allowed": false,
+            "source_ids": [
+                "genomenet_dbget_release_table"
+            ],
+            "description": "Large protein sequence database size metadata only; no amino-acid composition distribution included in this JSON.",
+            "method": {
+                "derivation_status": "size_metadata_only",
+                "input_records": "No sequence-level or amino-acid-count computation was performed for this JSON entry.",
+                "source_of_counts": "GenomeNet DBGET database release information table.",
+                "available_fields": [
+                    "release",
+                    "n_entries",
+                    "n_residues"
+                ],
+                "missing_fields": [
+                    "global_pct",
+                    "per_sequence_mean_pct",
+                    "per_sequence_sd_pct"
+                ],
+                "qc_rule": "Do not use for composition comparison or statistical QC until amino-acid distributions are recomputed from sequence files."
+            },
+            "recommended_use": [
+                "Provenance/scale context only.",
+                "Use to decide whether a future local streaming recomputation is worth doing."
+            ],
+            "limitations": [
+                "No amino-acid percentages are included.",
+                "Cannot compute enrichment, z-scores, empirical p-values, or pass/fail QC from this entry alone."
+            ]
+        },
+        "uniprotkb_all_2026_01": {
+            "release": "2026_01 (Jan 2026)",
+            "n_entries": 203130941,
+            "n_residues": 75722619993,
+            "distribution_available": "global can be approximated from Swiss-Prot + TrEMBL, but no official public per-AA table found",
+            "baseline_type": "size_only",
+            "statistical_qc_allowed": false,
+            "source_ids": [
+                "genomenet_dbget_release_table",
+                "uniprotkb_documentation"
+            ],
+            "description": "Large protein sequence database size metadata only; no amino-acid composition distribution included in this JSON.",
+            "method": {
+                "derivation_status": "size_metadata_only",
+                "input_records": "No sequence-level or amino-acid-count computation was performed for this JSON entry.",
+                "source_of_counts": "GenomeNet DBGET database release information table.",
+                "available_fields": [
+                    "release",
+                    "n_entries",
+                    "n_residues"
+                ],
+                "missing_fields": [
+                    "global_pct",
+                    "per_sequence_mean_pct",
+                    "per_sequence_sd_pct"
+                ],
+                "qc_rule": "Do not use for composition comparison or statistical QC until amino-acid distributions are recomputed from sequence files."
+            },
+            "recommended_use": [
+                "Provenance/scale context only.",
+                "Use to decide whether a future local streaming recomputation is worth doing."
+            ],
+            "limitations": [
+                "No amino-acid percentages are included.",
+                "Cannot compute enrichment, z-scores, empirical p-values, or pass/fail QC from this entry alone."
+            ]
+        },
+        "uniprotkb_trembl_2026_01": {
+            "release": "2026_01 (Jan 2026)",
+            "n_entries": 202556314,
+            "n_residues": 75514137419,
+            "distribution_available": "global_only",
+            "baseline_type": "size_only",
+            "statistical_qc_allowed": false,
+            "source_ids": [
+                "genomenet_dbget_release_table",
+                "uniprotkb_documentation"
+            ],
+            "description": "Large protein sequence database size metadata only; no amino-acid composition distribution included in this JSON.",
+            "method": {
+                "derivation_status": "size_metadata_only",
+                "input_records": "No sequence-level or amino-acid-count computation was performed for this JSON entry.",
+                "source_of_counts": "GenomeNet DBGET database release information table.",
+                "available_fields": [
+                    "release",
+                    "n_entries",
+                    "n_residues"
+                ],
+                "missing_fields": [
+                    "global_pct",
+                    "per_sequence_mean_pct",
+                    "per_sequence_sd_pct"
+                ],
+                "qc_rule": "Do not use for composition comparison or statistical QC until amino-acid distributions are recomputed from sequence files."
+            },
+            "recommended_use": [
+                "Provenance/scale context only.",
+                "Use to decide whether a future local streaming recomputation is worth doing."
+            ],
+            "limitations": [
+                "No amino-acid percentages are included.",
+                "Cannot compute enrichment, z-scores, empirical p-values, or pass/fail QC from this entry alone."
+            ]
+        },
+        "uniref50_2026_01": {
+            "release": "2026_01 (Jan 2026)",
+            "n_entries": 60315044,
+            "n_residues": 17282055793,
+            "distribution_available": false,
+            "baseline_type": "size_only",
+            "statistical_qc_allowed": false,
+            "source_ids": [
+                "genomenet_dbget_release_table",
+                "uniref_documentation"
+            ],
+            "description": "Large protein sequence database size metadata only; no amino-acid composition distribution included in this JSON.",
+            "method": {
+                "derivation_status": "size_metadata_only",
+                "input_records": "No sequence-level or amino-acid-count computation was performed for this JSON entry.",
+                "source_of_counts": "GenomeNet DBGET database release information table.",
+                "available_fields": [
+                    "release",
+                    "n_entries",
+                    "n_residues"
+                ],
+                "missing_fields": [
+                    "global_pct",
+                    "per_sequence_mean_pct",
+                    "per_sequence_sd_pct"
+                ],
+                "qc_rule": "Do not use for composition comparison or statistical QC until amino-acid distributions are recomputed from sequence files."
+            },
+            "recommended_use": [
+                "Provenance/scale context only.",
+                "Use to decide whether a future local streaming recomputation is worth doing."
+            ],
+            "limitations": [
+                "No amino-acid percentages are included.",
+                "Cannot compute enrichment, z-scores, empirical p-values, or pass/fail QC from this entry alone."
+            ]
+        },
+        "uniref90_2026_01": {
+            "release": "2026_01 (Jan 2026)",
+            "n_entries": 188848220,
+            "n_residues": 66359825357,
+            "distribution_available": false,
+            "baseline_type": "size_only",
+            "statistical_qc_allowed": false,
+            "source_ids": [
+                "genomenet_dbget_release_table",
+                "uniref_documentation"
+            ],
+            "description": "Large protein sequence database size metadata only; no amino-acid composition distribution included in this JSON.",
+            "method": {
+                "derivation_status": "size_metadata_only",
+                "input_records": "No sequence-level or amino-acid-count computation was performed for this JSON entry.",
+                "source_of_counts": "GenomeNet DBGET database release information table.",
+                "available_fields": [
+                    "release",
+                    "n_entries",
+                    "n_residues"
+                ],
+                "missing_fields": [
+                    "global_pct",
+                    "per_sequence_mean_pct",
+                    "per_sequence_sd_pct"
+                ],
+                "qc_rule": "Do not use for composition comparison or statistical QC until amino-acid distributions are recomputed from sequence files."
+            },
+            "recommended_use": [
+                "Provenance/scale context only.",
+                "Use to decide whether a future local streaming recomputation is worth doing."
+            ],
+            "limitations": [
+                "No amino-acid percentages are included.",
+                "Cannot compute enrichment, z-scores, empirical p-values, or pass/fail QC from this entry alone."
+            ]
+        },
+        "uniref100_2026_01": {
+            "release": "2026_01 (Jan 2026)",
+            "n_entries": 475217233,
+            "n_residues": 186451559337,
+            "distribution_available": false,
+            "baseline_type": "size_only",
+            "statistical_qc_allowed": false,
+            "source_ids": [
+                "genomenet_dbget_release_table",
+                "uniref_documentation"
+            ],
+            "description": "Large protein sequence database size metadata only; no amino-acid composition distribution included in this JSON.",
+            "method": {
+                "derivation_status": "size_metadata_only",
+                "input_records": "No sequence-level or amino-acid-count computation was performed for this JSON entry.",
+                "source_of_counts": "GenomeNet DBGET database release information table.",
+                "available_fields": [
+                    "release",
+                    "n_entries",
+                    "n_residues"
+                ],
+                "missing_fields": [
+                    "global_pct",
+                    "per_sequence_mean_pct",
+                    "per_sequence_sd_pct"
+                ],
+                "qc_rule": "Do not use for composition comparison or statistical QC until amino-acid distributions are recomputed from sequence files."
+            },
+            "recommended_use": [
+                "Provenance/scale context only.",
+                "Use to decide whether a future local streaming recomputation is worth doing."
+            ],
+            "limitations": [
+                "No amino-acid percentages are included.",
+                "Cannot compute enrichment, z-scores, empirical p-values, or pass/fail QC from this entry alone."
+            ]
+        }
+    },
+    "CODEX_IMPLEMENTATION_NOTES": {
+        "baseline_selection_priority": [
+            "If enzyme design and EC class is known: use matching uniprotkb_swissprot_reviewed_ec_class_*_2026_01 plus uniprotkb_swissprot_reviewed_ec_annotated_2026_01.",
+            "If enzyme design but EC class is unknown: use uniprotkb_swissprot_reviewed_ec_annotated_2026_01.",
+            "If general protein design: use uniprotkb_swissprot_reviewed_2026_01.",
+            "Use uniprotkb_trembl_unreviewed_2026_01_global_only only as a descriptive huge-database comparator."
+        ],
+        "hard_rules": [
+            "Only compute z-scores or pass/fail thresholds when baseline_type == sequence_distribution and statistical_qc_allowed == true.",
+            "For baseline_type == global_only, compute only descriptive metrics such as delta_pp, enrichment_ratio, and log2_enrichment.",
+            "For DATASET_SIZE_ONLY entries, do not compute amino-acid composition metrics.",
+            "Always exclude nonstandard residues from the 20-AA denominator and report them separately.",
+            "Do not silently compare designed catalytic/fixed motifs against native global composition; support masks for excluded positions."
+        ],
+        "suggested_default_thresholds": {
+            "warn_if_abs_z_gt": 2.0,
+            "fail_if_abs_z_gt": 3.0,
+            "also_require_abs_log2_enrichment_gt_for_fail": 0.25,
+            "note": "These are pragmatic starting thresholds, not derived from the JSON itself. Prefer bootstrapped length-matched nulls if implementing a full QC pipeline."
+        }
+    }
+}
