@@ -3,6 +3,27 @@
 **Status:** Planning only. Execute under user direction.
 **Author:** Claude (Opus 4.7), 2026-05-04 ~05:55am.
 
+## Revisions after codex review (2026-05-04 06:00am)
+
+Codex flagged 3 quantitative errors in the original plan; corrected here:
+
+- **fpocket cost:** plan said "0.3 s/design"; actual is **~0.9 s/design**
+  (76s for 79 designs in cycle 0). Real fpocket fraction of total wall
+  is **~41%, not ~37%**. Upside: fpocket parallelization savings are
+  ~3× larger than the original estimate (~100s/run, not ~30s).
+- **CPU slowdown:** plan said "3.6×"; apples-to-apples per-cycle
+  measurement is **~6.4×** (GPU cycle-0 MPNN = 83s for n=500;
+  CPU cycle-0 MPNN = 535s for n=500). The 3.6× number divided
+  full GPU run (3 cycles, 1200 samples) by full CPU run (1 cycle,
+  500 samples) — different cycle counts polluted the ratio.
+  CPU is still viable, just slower than originally claimed.
+- **Resource contradiction:** plan said `--cpus-per-task=2` AND
+  recommended fpocket `Pool(8)` parallelization. Inconsistent.
+  Resolution: cpus=2 if no fpocket parallelism; cpus=8 if
+  parallelism is enabled. Use cpus=4 as a safe default.
+- Memory headroom: 8 GB has only ~17% slack on a 6.8 GB peak.
+  Bumping to **--mem=10G** gives 47% slack — safer.
+
 ## Empirical baseline (this session)
 
 GPU sweep (g2157, A100-style): 3 cycles, 1200 samples, full pipeline → **8.2 min wall**.
