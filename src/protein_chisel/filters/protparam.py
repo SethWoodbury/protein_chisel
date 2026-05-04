@@ -36,6 +36,13 @@ class ProtParamResult:
     aromaticity: float
     charge_at_pH7: float
     charge_at_pH7_no_HIS: float
+    # Conservative HIS-half model: count each HIS as +0.5 charge (assumes
+    # a HIS pKa near 7.0 — half-protonated at physiological pH). This is
+    # a middle ground between charge_at_pH7_no_HIS (HIS=0) and the
+    # Henderson-Hasselbalch value (HIS pKa 6.0 → ~+0.09/HIS at pH 7).
+    # Useful when the buried/loop HIS pKa is unknown but suspected
+    # higher than the textbook 6.0 free-amino-acid value.
+    charge_at_pH7_HIS_half: float = 0.0
     flexibility_mean: Optional[float] = None
     helix_frac_seq: float = 0.0  # ProtParam's secondary-structure-from-sequence
     turn_frac_seq: float = 0.0
@@ -53,6 +60,7 @@ class ProtParamResult:
             f"{prefix}aromaticity": self.aromaticity,
             f"{prefix}charge_at_pH7": self.charge_at_pH7,
             f"{prefix}charge_at_pH7_no_HIS": self.charge_at_pH7_no_HIS,
+            f"{prefix}charge_at_pH7_HIS_half": self.charge_at_pH7_HIS_half,
             f"{prefix}flexibility_mean": self.flexibility_mean if self.flexibility_mean is not None else float("nan"),
             f"{prefix}helix_frac_seq": self.helix_frac_seq,
             f"{prefix}turn_frac_seq": self.turn_frac_seq,
@@ -99,6 +107,10 @@ def protparam_metrics(sequence: str, ph: float = 7.0) -> ProtParamResult:
         aromaticity=float(pa.aromaticity()),
         charge_at_pH7=float(pa.charge_at_pH(ph)),
         charge_at_pH7_no_HIS=float(_charge_at_ph_no_his(canonical, ph)),
+        charge_at_pH7_HIS_half=float(
+            _charge_at_ph_no_his(canonical, ph)
+            + 0.5 * canonical.count("H")
+        ),
         flexibility_mean=flex_mean,
         helix_frac_seq=float(helix),
         turn_frac_seq=float(turn),

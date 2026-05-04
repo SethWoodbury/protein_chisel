@@ -789,6 +789,8 @@ def stage_seq_filter(
             **row.to_dict(),
             "length": len(seq),
             "net_charge_no_HIS": pp.charge_at_pH7_no_HIS,
+            "net_charge_with_HIS_HH": pp.charge_at_pH7,        # HH HIS pKa 6.0
+            "net_charge_HIS_half": pp.charge_at_pH7_HIS_half,  # HIS = +0.5
             "instability_index": pp.instability_index,
             "gravy": pp.gravy,
             "pi": pp.pi,
@@ -2210,11 +2212,18 @@ def run_cycle(
                 cycle_cfg.cycle_idx, bias_AA_str, len(balance_telem.swaps),
             )
             for sw in balance_telem.swaps:
-                LOGGER.info(
-                    "  swap[%s]: %s(z=%+.2f)->%+.2f  %s(z=%+.2f)->%+.2f",
-                    sw["class"], sw["down_aa"], sw["down_z"], sw["down_bias"],
-                    sw["up_aa"], sw["up_z"], sw["up_bias"],
-                )
+                if sw.get("up_aa") is not None:
+                    LOGGER.info(
+                        "  swap[%s]: %s(z=%+.2f)->%+.2f  %s(z=%+.2f)->%+.2f",
+                        sw["class"], sw["down_aa"], sw["down_z"], sw["down_bias"],
+                        sw["up_aa"], sw["up_z"], sw["up_bias"],
+                    )
+                else:
+                    # downweight_only (extreme over with no swap partner)
+                    LOGGER.info(
+                        "  downweight[%s]: %s(z=%+.2f)->%+.2f (no partner)",
+                        sw["class"], sw["down_aa"], sw["down_z"], sw["down_bias"],
+                    )
         else:
             LOGGER.info("cycle %d class-balanced bias_AA: (no swaps triggered)",
                          cycle_cfg.cycle_idx)
@@ -2400,16 +2409,18 @@ def main() -> None:
                         "only when one class member is over-rep > +z AND "
                         "another is under-rep < -z (default 2.0; the user "
                         "noted 2-3 is reasonable, ≤1.5 is too aggressive).")
-    p.add_argument("--plm_strength", type=float, default=1.0,
+    p.add_argument("--plm_strength", type=float, default=1.25,
                    help="Global multiplier on PLM fusion class weights "
                         "(applied uniformly to ESM-C and SaProt at every "
-                        "position). 1.0 = use FusionConfig defaults "
-                        "(active=0.05, first_shell=0.15, pocket=0.20, "
-                        "buried=0.35, surface=0.55). Pass e.g. 1.3 to "
-                        "amplify PLM influence (more active-site "
-                        "diversification, higher fitness ceiling, lower "
-                        "MPNN structural fidelity); 0.7 to soften. "
-                        "Must be non-negative; 0.0 disables PLM bias.")
+                        "position). Default 1.25 — empirical sweep across "
+                        "rounds 1–5 (2026-05-04) on PTE_i1 found 1.2–1.3 "
+                        "the sweet spot: best fitness recovery, tightest "
+                        "druggability distribution, and best primary-shell "
+                        "diversity, without saturating PLM signal. Pass "
+                        "0.7 to soften (more MPNN structural fidelity), "
+                        "1.5+ for maximum PLM influence (diminishing "
+                        "returns; charge SD inflates). Must be ≥ 0; 0.0 "
+                        "disables PLM bias entirely.")
     args = p.parse_args()
     if args.plm_strength < 0:
         p.error("--plm_strength must be >= 0 "
