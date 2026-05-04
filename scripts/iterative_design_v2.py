@@ -756,13 +756,16 @@ def stage_seq_filter(
         if len(seq) != wt_length:
             reasons.append(f"length {len(seq)} != WT {wt_length}")
         pp = protparam_metrics(seq, ph=design_ph)
-        if pp.charge_at_pH7_no_HIS >= net_charge_max:
+        # Filter on the ROBUST full-HH charge (all 7 ionizables + termini).
+        # The minimalist 'no_HIS' (still computed below as a diagnostic
+        # column) is too lenient because it misses Cys/Tyr at high pH.
+        if pp.charge_at_pH_full_HH >= net_charge_max:
             reasons.append(
-                f"net_charge_no_HIS={pp.charge_at_pH7_no_HIS:.2f} >= {net_charge_max}"
+                f"net_charge_full_HH={pp.charge_at_pH_full_HH:.2f} >= {net_charge_max}"
             )
-        if pp.charge_at_pH7_no_HIS <= net_charge_min:
+        if pp.charge_at_pH_full_HH <= net_charge_min:
             reasons.append(
-                f"net_charge_no_HIS={pp.charge_at_pH7_no_HIS:.2f} <= {net_charge_min}"
+                f"net_charge_full_HH={pp.charge_at_pH_full_HH:.2f} <= {net_charge_min}"
             )
         if not (pi_min <= pp.pi <= pi_max):
             reasons.append(f"pI={pp.pi:.2f} outside [{pi_min}, {pi_max}]")
@@ -789,9 +792,14 @@ def stage_seq_filter(
         rows.append({
             **row.to_dict(),
             "length": len(seq),
+            # Robust filter charge (all 7 ionizable groups).
+            "net_charge_full_HH": pp.charge_at_pH_full_HH,
+            # Diagnostic charge variants for back-compat / sensitivity analysis.
             "net_charge_no_HIS": pp.charge_at_pH7_no_HIS,
-            "net_charge_with_HIS_HH": pp.charge_at_pH7,        # HH HIS pKa 6.0
+            "net_charge_with_HIS_HH": pp.charge_at_pH7,        # Biopython
             "net_charge_HIS_half": pp.charge_at_pH7_HIS_half,  # HIS = +0.5
+            "net_charge_DE_KR_only": pp.charge_at_pH_DE_KR_only,  # legacy
+            "design_ph": design_ph,
             "instability_index": pp.instability_index,
             "gravy": pp.gravy,
             "pi": pp.pi,
@@ -2407,14 +2415,15 @@ def main() -> None:
                         "Rosetta no-repack metrics panel (DDG + interface "
                         "energy + ...) on the top-K only. ~30-60 s/design, "
                         "needs pyrosetta.sif. Default OFF.")
-    p.add_argument("--design_ph", type=float, default=7.5,
+    p.add_argument("--design_ph", type=float, default=7.8,
                    help="pH at which net charge / pI / etc. are computed. "
-                        "Default 7.5 (compromise between physiological 7.0 "
-                        "and the typical PTE assay condition pH 8.0). The "
-                        "Henderson-Hasselbalch model uses Pace 1999 / "
-                        "Bjellqvist 1994 textbook pKa values, including "
-                        "Cys (pKa 8.3) and Tyr (pKa 10.5) so calculations "
-                        "stay accurate up to pH ~9.")
+                        "Default 7.8 (close to PTE assay buffer pH 8.0, "
+                        "with a small safety margin). The robust filter "
+                        "charge uses Henderson-Hasselbalch on K/R/H + D/E/"
+                        "C/Y + N/C termini (Pace 1999 / Bjellqvist 1994 "
+                        "pKas). Four diagnostic variants are also recorded "
+                        "(no_HIS, HIS_half, DE_KR_only, Biopython) for "
+                        "comparison/sensitivity analysis.")
     p.add_argument("--balance_z_threshold", type=float, default=2.0,
                    help="Class-balanced bias_AA z-cutoff. A swap fires "
                         "only when one class member is over-rep > +z AND "

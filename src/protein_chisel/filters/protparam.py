@@ -15,16 +15,22 @@ from typing import Optional
 from Bio.SeqUtils.ProtParam import ProteinAnalysis  # type: ignore[import-not-found]
 
 
-# Side-chain pKa values used for the no-HIS variant. Standard textbook
-# values from Pace 1999 / Bjellqvist 1994. We include Cys and Tyr so the
-# no-HIS calculation stays accurate up to pH ≈ 9 (Cys pKa 8.3 is non-
-# negligible at pH 7.5–8 where most expression / activity assays run).
-# HIS (pKa 6.0 free, but highly context-dependent in proteins) is
-# excluded from the no-HIS variant; see charge_at_pH_HIS_half for an
-# alternative model that adds +0.5 per HIS.
-_PKA_POS = {"K": 10.5, "R": 12.5}              # excludes H
-_PKA_NEG = {"D": 3.65, "E": 4.25,
-            "C":  8.3, "Y": 10.5}              # NEW: thiolate / phenolate
+# Side-chain pKa values from Pace 1999 / Bjellqvist 1994 textbook values.
+# The "robust" variant (charge_at_pH_full_HH) uses ALL of these: K, R, H
+# on the positive side; D, E, C, Y on the negative side; plus N/C termini.
+# This is the canonical Henderson-Hasselbalch model.
+#
+# Three diagnostic variants are also recorded:
+#   - charge_at_pH_DE_KR_only: minimalist (just D/E and K/R + termini),
+#                              matches the legacy Rosetta NetCharge filter
+#   - charge_at_pH_no_HIS:     same as full but EXCLUDES HIS (HIS pKa 6.0
+#                              is highly context-dependent in proteins)
+#   - charge_at_pH_HIS_half:   no_HIS + 0.5 × n_HIS (assumes HIS pKa ≈ 7.0)
+_PKA_POS_FULL = {"K": 10.5, "R": 12.5, "H": 6.0}
+_PKA_POS_NO_H = {"K": 10.5, "R": 12.5}
+_PKA_POS_DE_KR = {"K": 10.5, "R": 12.5}        # minimalist
+_PKA_NEG_FULL = {"D": 3.65, "E": 4.25, "C": 8.3, "Y": 10.5}
+_PKA_NEG_DE_KR = {"D": 3.65, "E": 4.25}        # minimalist
 _NTERM_PKA = 9.0
 _CTERM_PKA = 2.0
 
@@ -38,15 +44,24 @@ class ProtParamResult:
     instability_index: float
     gravy: float
     aromaticity: float
-    charge_at_pH7: float
-    charge_at_pH7_no_HIS: float
-    # Conservative HIS-half model: count each HIS as +0.5 charge (assumes
-    # a HIS pKa near 7.0 — half-protonated at physiological pH). This is
-    # a middle ground between charge_at_pH7_no_HIS (HIS=0) and the
-    # Henderson-Hasselbalch value (HIS pKa 6.0 → ~+0.09/HIS at pH 7).
-    # Useful when the buried/loop HIS pKa is unknown but suspected
-    # higher than the textbook 6.0 free-amino-acid value.
+    # ROBUST default: full Henderson-Hasselbalch on all 7 ionizable
+    # residues (K, R, H, D, E, C, Y) + N/C termini. Used as the
+    # filter charge in the v2 driver.
+    charge_at_pH_full_HH: float = 0.0
+    # DIAGNOSTIC: legacy Biopython value (similar to full_HH but
+    # uses Bjellqvist 1994 pKa scale; tiny numeric differences).
+    charge_at_pH7: float = 0.0
+    # DIAGNOSTIC: HH excluding HIS (Cys/Tyr included). Useful when the
+    # HIS protonation state is uncertain (metal-coordinating cat-HIS
+    # are typically deprotonated at physiological pH regardless of
+    # textbook pKa).
+    charge_at_pH7_no_HIS: float = 0.0
+    # DIAGNOSTIC: no_HIS + 0.5 × n_HIS (assumes HIS pKa ≈ 7.0,
+    # half-protonated at pH 7).
     charge_at_pH7_HIS_half: float = 0.0
+    # DIAGNOSTIC: minimalist legacy variant — only D/E/K/R + termini
+    # (no H/C/Y). Matches the legacy Rosetta NetCharge filter.
+    charge_at_pH_DE_KR_only: float = 0.0
     flexibility_mean: Optional[float] = None
     helix_frac_seq: float = 0.0  # ProtParam's secondary-structure-from-sequence
     turn_frac_seq: float = 0.0
@@ -62,9 +77,11 @@ class ProtParamResult:
             f"{prefix}instability_index": self.instability_index,
             f"{prefix}gravy": self.gravy,
             f"{prefix}aromaticity": self.aromaticity,
+            f"{prefix}charge_at_pH_full_HH": self.charge_at_pH_full_HH,
             f"{prefix}charge_at_pH7": self.charge_at_pH7,
             f"{prefix}charge_at_pH7_no_HIS": self.charge_at_pH7_no_HIS,
             f"{prefix}charge_at_pH7_HIS_half": self.charge_at_pH7_HIS_half,
+            f"{prefix}charge_at_pH_DE_KR_only": self.charge_at_pH_DE_KR_only,
             f"{prefix}flexibility_mean": self.flexibility_mean if self.flexibility_mean is not None else float("nan"),
             f"{prefix}helix_frac_seq": self.helix_frac_seq,
             f"{prefix}turn_frac_seq": self.turn_frac_seq,
@@ -74,15 +91,21 @@ class ProtParamResult:
         }
 
 
-def protparam_metrics(sequence: str, ph: float = 7.5) -> ProtParamResult:
+def protparam_metrics(sequence: str, ph: float = 7.8) -> ProtParamResult:
     """Compute Biopython ProtParam metrics + multiple charge variants.
 
-    Default pH 7.5 (compromise between physiological 7.0 and the typical
-    enzyme-assay condition pH 8.0). Pass ``ph=8.0`` for higher-pH assays
-    or ``ph=7.0`` for textbook physiological calculations.
+    Default pH 7.8 (close to the user's typical PTE assay buffer at
+    pH 8.0, slightly under for safety margin).
 
-    The 'pH7' suffix in the result fields is historical and refers to
-    "near-neutral pH"; the actual pH used is whatever was passed.
+    Returns five charge variants — pick whichever fits your context:
+      - ``charge_at_pH_full_HH``   ROBUST default: HH on K/R/H/D/E/C/Y + termini
+      - ``charge_at_pH7``          Biopython HH (Bjellqvist 1994 pKas)
+      - ``charge_at_pH7_no_HIS``   HH excluding HIS (cat-HIS coord metals)
+      - ``charge_at_pH7_HIS_half`` no_HIS + 0.5 × n_HIS (HIS pKa ≈ 7.0)
+      - ``charge_at_pH_DE_KR_only`` minimalist legacy (D/E + K/R + termini)
+
+    The "pH7" suffix on three fields is historical (predates this rewrite);
+    the actual pH used in all five is whatever ``ph`` is passed.
     """
     seq = sequence.replace("*", "").upper()
     # ProtParam fails on non-canonical AAs. Strip them; warn implicitly via
@@ -117,12 +140,14 @@ def protparam_metrics(sequence: str, ph: float = 7.5) -> ProtParamResult:
         instability_index=float(pa.instability_index()),
         gravy=float(pa.gravy()),
         aromaticity=float(pa.aromaticity()),
+        charge_at_pH_full_HH=float(_charge_at_ph_full_hh(canonical, ph)),
         charge_at_pH7=float(pa.charge_at_pH(ph)),
         charge_at_pH7_no_HIS=float(_charge_at_ph_no_his(canonical, ph)),
         charge_at_pH7_HIS_half=float(
             _charge_at_ph_no_his(canonical, ph)
             + 0.5 * canonical.count("H")
         ),
+        charge_at_pH_DE_KR_only=float(_charge_at_ph_de_kr_only(canonical, ph)),
         flexibility_mean=flex_mean,
         helix_frac_seq=float(helix),
         turn_frac_seq=float(turn),
@@ -132,15 +157,42 @@ def protparam_metrics(sequence: str, ph: float = 7.5) -> ProtParamResult:
     )
 
 
+def _charge_at_ph_full_hh(sequence: str, ph: float) -> float:
+    """Henderson-Hasselbalch net charge — ROBUST: all 7 ionizables + termini.
+
+    Includes K, R, H on the positive side; D, E, C, Y on the negative
+    side; plus N/C termini. Standard textbook model; what most
+    publications use as "net charge at pH X."
+    """
+    n_pos = sum(_hh_pos(ph, _PKA_POS_FULL[aa]) for aa in sequence if aa in _PKA_POS_FULL)
+    n_neg = sum(_hh_neg(ph, _PKA_NEG_FULL[aa]) for aa in sequence if aa in _PKA_NEG_FULL)
+    nterm = _hh_pos(ph, _NTERM_PKA)
+    cterm = _hh_neg(ph, _CTERM_PKA)
+    return n_pos + nterm - n_neg - cterm
+
+
 def _charge_at_ph_no_his(sequence: str, ph: float) -> float:
     """Henderson-Hasselbalch net charge excluding histidine.
 
-    Matches the legacy Rosetta NetCharge filter convention used by the
-    lab. HIS is excluded because its pKa (~6.0) lies near physiological
-    pH and makes the value highly sensitive to local environment.
+    Excludes H (uncertain pKa in proteins). Includes K, R on the
+    positive side; D, E, C, Y on the negative side; plus N/C termini.
     """
-    n_pos = sum(_hh_pos(ph, _PKA_POS[aa]) for aa in sequence if aa in _PKA_POS)
-    n_neg = sum(_hh_neg(ph, _PKA_NEG[aa]) for aa in sequence if aa in _PKA_NEG)
+    n_pos = sum(_hh_pos(ph, _PKA_POS_NO_H[aa]) for aa in sequence if aa in _PKA_POS_NO_H)
+    n_neg = sum(_hh_neg(ph, _PKA_NEG_FULL[aa]) for aa in sequence if aa in _PKA_NEG_FULL)
+    nterm = _hh_pos(ph, _NTERM_PKA)
+    cterm = _hh_neg(ph, _CTERM_PKA)
+    return n_pos + nterm - n_neg - cterm
+
+
+def _charge_at_ph_de_kr_only(sequence: str, ph: float) -> float:
+    """Minimalist legacy net charge: ONLY D, E, K, R + termini.
+
+    Matches the legacy Rosetta NetCharge filter convention used in
+    older lab scripts (no HIS, no Cys, no Tyr). Useful for back-compat
+    comparison with prior runs.
+    """
+    n_pos = sum(_hh_pos(ph, _PKA_POS_DE_KR[aa]) for aa in sequence if aa in _PKA_POS_DE_KR)
+    n_neg = sum(_hh_neg(ph, _PKA_NEG_DE_KR[aa]) for aa in sequence if aa in _PKA_NEG_DE_KR)
     nterm = _hh_pos(ph, _NTERM_PKA)
     cterm = _hh_neg(ph, _CTERM_PKA)
     return n_pos + nterm - n_neg - cterm
