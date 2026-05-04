@@ -725,6 +725,7 @@ def stage_seq_filter(
     seed_position_class: Optional[list[str]] = None,
     seed_protein_resnos: Optional[list[int]] = None,
     catalytic_resnos: Iterable[int] = (),
+    design_ph: float = 7.5,
     fixed_resnos: Iterable[int] = (),
     pi_min: float = 0.0,
     pi_max: float = 14.0,
@@ -754,7 +755,7 @@ def stage_seq_filter(
         reasons: list[str] = []
         if len(seq) != wt_length:
             reasons.append(f"length {len(seq)} != WT {wt_length}")
-        pp = protparam_metrics(seq)
+        pp = protparam_metrics(seq, ph=design_ph)
         if pp.charge_at_pH7_no_HIS >= net_charge_max:
             reasons.append(
                 f"net_charge_no_HIS={pp.charge_at_pH7_no_HIS:.2f} >= {net_charge_max}"
@@ -2125,6 +2126,7 @@ def run_cycle(
     omit_AA_per_residue: Optional[dict[str, str]] = None,
     catalytic_his_resnos: Iterable[int] = CATALYTIC_HIS_RESNOS,
     balance_z_threshold: float = 2.0,
+    design_ph: float = 7.5,
 ) -> tuple[Optional[pd.DataFrame], dict[str, Path]]:
     """Run ONE iteration cycle. Returns (ranked DataFrame, pdb_map)."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -2291,6 +2293,7 @@ def run_cycle(
         fixed_resnos=fixed_resnos,
         pi_min=cycle_cfg.pi_min,
         pi_max=cycle_cfg.pi_max,
+        design_ph=design_ph,
     )
 
     # ---- 4. Struct filter -------------------------------------------
@@ -2404,6 +2407,14 @@ def main() -> None:
                         "Rosetta no-repack metrics panel (DDG + interface "
                         "energy + ...) on the top-K only. ~30-60 s/design, "
                         "needs pyrosetta.sif. Default OFF.")
+    p.add_argument("--design_ph", type=float, default=7.5,
+                   help="pH at which net charge / pI / etc. are computed. "
+                        "Default 7.5 (compromise between physiological 7.0 "
+                        "and the typical PTE assay condition pH 8.0). The "
+                        "Henderson-Hasselbalch model uses Pace 1999 / "
+                        "Bjellqvist 1994 textbook pKa values, including "
+                        "Cys (pKa 8.3) and Tyr (pKa 10.5) so calculations "
+                        "stay accurate up to pH ~9.")
     p.add_argument("--balance_z_threshold", type=float, default=2.0,
                    help="Class-balanced bias_AA z-cutoff. A swap fires "
                         "only when one class member is over-rep > +z AND "
@@ -2686,6 +2697,7 @@ def main() -> None:
             position_table_df=pt.df,
             omit_AA_per_residue=omit_AA_per_residue,
             balance_z_threshold=args.balance_z_threshold,
+            design_ph=args.design_ph,
         )
         if ranked_df is not None and len(ranked_df) > 0:
             ranked_df = ranked_df.copy()

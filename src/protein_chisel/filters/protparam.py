@@ -15,12 +15,16 @@ from typing import Optional
 from Bio.SeqUtils.ProtParam import ProteinAnalysis  # type: ignore[import-not-found]
 
 
-# Side-chain pKa values used for the no-HIS variant. The standard
-# ProteinAnalysis.charge_at_pH includes histidine (pKa ~6.0), which makes
-# net charge depend strongly on assumed protonation. The no-HIS variant
-# matches Rosetta's NetCharge filter behavior used in our legacy scripts.
-_PKA_POS = {"K": 10.5, "R": 12.5}    # excludes H
-_PKA_NEG = {"D": 3.65, "E": 4.25}
+# Side-chain pKa values used for the no-HIS variant. Standard textbook
+# values from Pace 1999 / Bjellqvist 1994. We include Cys and Tyr so the
+# no-HIS calculation stays accurate up to pH ≈ 9 (Cys pKa 8.3 is non-
+# negligible at pH 7.5–8 where most expression / activity assays run).
+# HIS (pKa 6.0 free, but highly context-dependent in proteins) is
+# excluded from the no-HIS variant; see charge_at_pH_HIS_half for an
+# alternative model that adds +0.5 per HIS.
+_PKA_POS = {"K": 10.5, "R": 12.5}              # excludes H
+_PKA_NEG = {"D": 3.65, "E": 4.25,
+            "C":  8.3, "Y": 10.5}              # NEW: thiolate / phenolate
 _NTERM_PKA = 9.0
 _CTERM_PKA = 2.0
 
@@ -70,8 +74,16 @@ class ProtParamResult:
         }
 
 
-def protparam_metrics(sequence: str, ph: float = 7.0) -> ProtParamResult:
-    """Compute Biopython ProtParam metrics + charge_at_pH7_no_HIS variant."""
+def protparam_metrics(sequence: str, ph: float = 7.5) -> ProtParamResult:
+    """Compute Biopython ProtParam metrics + multiple charge variants.
+
+    Default pH 7.5 (compromise between physiological 7.0 and the typical
+    enzyme-assay condition pH 8.0). Pass ``ph=8.0`` for higher-pH assays
+    or ``ph=7.0`` for textbook physiological calculations.
+
+    The 'pH7' suffix in the result fields is historical and refers to
+    "near-neutral pH"; the actual pH used is whatever was passed.
+    """
     seq = sequence.replace("*", "").upper()
     # ProtParam fails on non-canonical AAs. Strip them; warn implicitly via
     # length difference if the caller cares.
