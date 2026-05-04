@@ -290,7 +290,10 @@ def _freesasa_per_residue(
     structure = _fs.Structure(str(pdb_path))
     params = _fs.Parameters({"algorithm": _fs.ShrakeRupley,
                               "probe-radius": float(probe_radius),
-                              "n-points": 100})
+                              # 960 matches Rosetta DAlphaBall density;
+                              # default 100 was too coarse for residue
+                              # fractions used as classification thresholds.
+                              "n-points": 960})
     result = _fs.calc(structure, params)
     out: dict[int, float] = {}
     seqpos = 0
@@ -366,15 +369,23 @@ def classify_positions(
     pdb_info = pose.pdb_info()
 
     # ---- Per-residue features (inherited) -------------------------------
-    # SASA: Rosetta's get_surf_vol depends on the DAlphaBall binary, which
-    # fails in some apptainer containers (libgfortran.so.5 missing). Fall
-    # back to freesasa (Shrake-Rupley) on failure — accurate enough for
-    # the buried/surface classification.
+    # SASA: prefer Rosetta's get_surf_vol (DAlphaBall analytical, ~960
+    # dot density). Falls back to freesasa Shrake-Rupley with 960 points
+    # if DAlphaBall fails (e.g. libgfortran missing in some containers).
+    # Both paths return TOTAL residue SASA (backbone + sidechain heavy);
+    # we divide by Tien 2013 max-residue SASA so the resulting
+    # `sasa_residue_fraction` is on a 0-1 scale comparable across AAs.
+    sasa_source: str
     try:
         sasa = get_per_residue_sasa(pose, probe_radius=cfg.sasa_probe)
+        sasa_source = "rosetta"
     except Exception as exc:
-        LOGGER.warning("Rosetta SASA failed (%s); falling back to freesasa.", exc)
+        LOGGER.warning(
+            "Rosetta SASA failed (%s); falling back to freesasa Shrake-Rupley.",
+            exc,
+        )
         sasa = _freesasa_per_residue(pdb_path, probe_radius=cfg.sasa_probe)
+        sasa_source = "freesasa"
     pp = phi_psi(pose)
     ss_full = dssp(pose, reduced=False)
     ss_red = dssp(pose, reduced=True)
@@ -404,7 +415,13 @@ def classify_positions(
             if elem in _METAL_ELEMENTS:
                 xyz = r.atom(i).xyz()
                 lig_atom_pts.append(np.array([xyz.x, xyz.y, xyz.z]))
-                lig_polar_flags.append(True)
+                # Codex review: metals must NOT count as H-bond polar
+                # atoms — they coordinate via lone-pair donation from
+                # ligands, not classical H-bonds. False here so the
+                # explicit-H-bond gate (`_explicit_backbone_hbond_to_ligand`)
+                # cannot wrongly trigger primary_sphere on a backbone
+                # atom that's just close to a metal.
+                lig_polar_flags.append(False)
     if not lig_atom_pts:
         LOGGER.warning("classify_positions: no ligand atoms; everything → distal_*")
         ligand_atom_pts = np.zeros((0, 3))
@@ -856,9 +873,16 @@ def classify_positions(
         df[df["is_protein"]]["class"].value_counts().to_dict(),
     )
 
-    # Stash config snapshot in df.attrs (parquet preserves via pyarrow if
-    # supported; fallback at to_parquet adds a sidecar).
-    df.attrs["classify_config"] = json.dumps(asdict(cfg))
+    # Persist schema version + config + SASA source as actual columns
+    # so they survive parquet round-trips (codex flagged df.attrs is not
+    # round-trip-safe via pyarrow). Also lets users compare designs in
+    # the same parquet that may have different SASA backends.
+    df["schema_version"] = POSITION_TABLE_SCHEMA_VERSION
+    df["classify_preset"] = cfg.preset_name
+    df["classify_config_json"] = json.dumps(asdict(cfg))
+    df["sasa_source"] = sasa_source
+    # Also stash on attrs for in-memory access (best-effort).
+    df.attrs["classify_config"] = df["classify_config_json"].iloc[0]
     df.attrs["schema_version"] = POSITION_TABLE_SCHEMA_VERSION
 
     return PositionTable(df=df)

@@ -121,14 +121,16 @@ def biased_sample(
             ]
         )
     if cfg.fix_first_shell:
-        # In the new taxonomy "first_shell" maps to primary_sphere; we
-        # also include secondary_sphere (literature 2nd shell) since
-        # that's where direct-contact preorganization residues live.
+        # Maintain legacy semantics: fix_first_shell == fix the direct
+        # ligand-contact shell only (legacy "first_shell" ≈ new
+        # "primary_sphere"). secondary_sphere (preorganization) is a
+        # separate concern; if a caller wants to also fix it they should
+        # pass it explicitly. Codex review flagged that broadening this
+        # would silently over-fix existing configs.
         fixed_resnos.update(
             int(r) for r in protein_rows.loc[
-                protein_rows["class"].isin(
-                    ["first_shell", "primary_sphere", "secondary_sphere"]
-                ), "resno"
+                protein_rows["class"].isin(["first_shell", "primary_sphere"]),
+                "resno"
             ]
         )
     # Force REMARK 666 catalytic residues into fixed set even if their
