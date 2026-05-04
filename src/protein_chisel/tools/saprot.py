@@ -112,8 +112,22 @@ def _load_saprot(model_name: str = "saprot_35m", device: str = "auto"):
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    tokenizer = AutoTokenizer.from_pretrained(repo)
-    model = EsmForMaskedLM.from_pretrained(repo, torch_dtype=torch.float32).to(device).eval()
+    # SaProt's HF cache lives at /net/databases/huggingface/saprot/hub/.
+    # When this code is invoked from a pipeline that set HF_HUB_CACHE
+    # to the ESM-C cache (where most SaProt variants are NOT present),
+    # AutoTokenizer.from_pretrained tries to download to that cache —
+    # which is read-only. Resolve by passing cache_dir explicitly.
+    saprot_cache = os.environ.get(
+        "SAPROT_HF_CACHE",
+        "/net/databases/huggingface/saprot/hub",
+    )
+    kwargs = {}
+    if os.path.isdir(saprot_cache):
+        kwargs["cache_dir"] = saprot_cache
+    tokenizer = AutoTokenizer.from_pretrained(repo, **kwargs)
+    model = EsmForMaskedLM.from_pretrained(
+        repo, torch_dtype=torch.float32, **kwargs,
+    ).to(device).eval()
     return tokenizer, model, device
 
 

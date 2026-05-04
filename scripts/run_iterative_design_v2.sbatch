@@ -108,6 +108,7 @@ apptainer exec --nv \
     --env "PYTHONPATH=/code/src" \
     --env "HF_HOME=/net/databases/huggingface/esmc" \
     --env "HF_HUB_CACHE=/net/databases/huggingface/esmc/hub" \
+    --env "SAPROT_HF_CACHE=/net/databases/huggingface/saprot/hub" \
     /net/software/containers/users/woodbuse/esmc.sif \
     python "$REPO/scripts/precompute_plm_artifacts.py" \
         --seed_pdb "$SEED_PDB" \
