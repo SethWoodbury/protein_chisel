@@ -32,6 +32,15 @@ N_CYCLES="${N_CYCLES:-3}"
 # exclude C as well as X (UNK) by default. Override per-scaffold.
 OMIT_AA="${OMIT_AA:-CX}"
 
+# LigandMPNN side-chain-context flag. 0 (default) = MPNN sees only
+# backbone + ligand atoms (more first-shell diversity per ablation).
+# 1 = MPNN sees catalytic sidechain rotamers (WT-conservative).
+USE_SIDE_CHAIN_CONTEXT="${USE_SIDE_CHAIN_CONTEXT:-0}"
+
+# Optional pLDDT-enhanced fused_mpnn checkpoint name (without .pth);
+# empty string = disabled. Adds ~+0.02 nats/residue mean fitness.
+ENHANCE="${ENHANCE:-}"
+
 # Working dir for this job
 TS=$(date +%Y%m%d-%H%M%S)
 WORK_ROOT=/net/scratch/woodbuse
@@ -97,6 +106,8 @@ apptainer exec --nv \
         --target_k "$TARGET_K" \
         --min_hamming "$MIN_HAMMING" \
         --cycles "$N_CYCLES" \
-        --omit_AA "$OMIT_AA"
+        --omit_AA "$OMIT_AA" \
+        --use_side_chain_context "$USE_SIDE_CHAIN_CONTEXT" \
+        ${ENHANCE:+--enhance "$ENHANCE"}
 
 echo "=== DONE -- $WORK_DIR ==="

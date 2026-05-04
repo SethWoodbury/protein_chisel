@@ -105,6 +105,13 @@ class CycleConfig:
     # catalytic in this scaffold). If your scaffold has a catalytic Cys,
     # pass "" or list only the ones you actually want to forbid.
     omit_AA: str = "X"
+    # MPNN flags (4-condition ablation showed sc=0 substantially boosts
+    # first-shell diversity at no fitness cost; pLDDT enhance gives +0.02
+    # nats fitness at a small diversity cost). Defaults below are the
+    # diversity-first settings; pass --use_side_chain_context 1 or
+    # --enhance plddt_residpo_alpha_<tag> to override.
+    use_side_chain_context: int = 0
+    enhance: Optional[str] = None
 
 
 @dataclass
@@ -116,26 +123,36 @@ class IterativeRunConfig:
     fix_remark_666: bool = True
 
 
-def default_cycles(omit_AA: str = "X") -> list[CycleConfig]:
+def default_cycles(
+    omit_AA: str = "X",
+    use_side_chain_context: int = 0,
+    enhance: Optional[str] = None,
+) -> list[CycleConfig]:
     """Three-cycle exploration → exploitation schedule.
 
-    ``omit_AA`` is the AAs MPNN may never sample, threaded through to
-    every cycle. The default is just "X" (UNK token); pass e.g. "CX" to
-    also forbid cysteine. Catalytic AAs are NOT controlled by this knob
-    — they're frozen by ``--fixed_residues_multi`` regardless.
+    ``omit_AA`` is the AAs MPNN may never sample.
+    ``use_side_chain_context``: 0 (default) for diverse first-shell
+    sampling (per ablation); pass 1 to give MPNN the catalytic
+    sidechain rotamers (more WT-conservative).
+    ``enhance``: optional fused_mpnn enhancer checkpoint name e.g.
+    ``"plddt_residpo_alpha_20250116-aec4d0c4"``. Boosts mean fitness
+    by ~0.02 nats/residue at a diversity cost.
     """
     return [
         CycleConfig(
             cycle_idx=0, n_samples=500, sampling_temperature=0.20,
             net_charge_max=-10.0, sap_max_threshold=15.0, omit_AA=omit_AA,
+            use_side_chain_context=use_side_chain_context, enhance=enhance,
         ),
         CycleConfig(
             cycle_idx=1, n_samples=400, sampling_temperature=0.18,
             net_charge_max=-11.0, sap_max_threshold=13.0, omit_AA=omit_AA,
+            use_side_chain_context=use_side_chain_context, enhance=enhance,
         ),
         CycleConfig(
             cycle_idx=2, n_samples=300, sampling_temperature=0.15,
             net_charge_max=-12.0, sap_max_threshold=12.0, omit_AA=omit_AA,
+            use_side_chain_context=use_side_chain_context, enhance=enhance,
         ),
     ]
 
@@ -299,7 +316,8 @@ def stage_sample(
         batch_size=10,
         repack_everything=0,        # CRITICAL: keep catalytic rotamers intact
         pack_side_chains=1,         # write packed PDBs
-        ligand_mpnn_use_side_chain_context=1,
+        ligand_mpnn_use_side_chain_context=cycle_cfg.use_side_chain_context,
+        enhance=cycle_cfg.enhance,
         omit_AA=cycle_cfg.omit_AA,
         # No global bias_AA -- per-residue bias is the whole point.
         extra_flags=tuple(extra_flags),
@@ -1230,6 +1248,19 @@ def main() -> None:
                    help="Comma-sep rule_name=SEVERITY overrides, e.g. "
                         "'kr_neighbor_dibasic=HARD_OMIT,polyproline_stall=WARN_ONLY'. "
                         "SEVERITY in {WARN_ONLY,SOFT_BIAS,HARD_OMIT,HARD_FILTER}.")
+    p.add_argument("--use_side_chain_context", type=int, default=0,
+                   choices=[0, 1],
+                   help="LigandMPNN flag. 0 (default) = MPNN sees only "
+                        "backbone + ligand atoms (more diverse first-shell "
+                        "sampling). 1 = MPNN sees catalytic sidechain "
+                        "rotamers (more WT-conservative). 4-condition "
+                        "ablation showed sc=0 raises first-shell unique "
+                        "AAs/pos from 2.14 -> 2.93 at no fitness cost.")
+    p.add_argument("--enhance", type=str, default=None,
+                   help="Optional pLDDT-enhanced fused_mpnn checkpoint, e.g. "
+                        "'plddt_residpo_alpha_20250116-aec4d0c4'. Adds "
+                        "~+0.02 nats/residue mean fitness at small "
+                        "diversity cost.")
     args = p.parse_args()
 
     logging.basicConfig(
@@ -1318,7 +1349,11 @@ def main() -> None:
     LOGGER.info("expression-engine HARD_OMIT JSON: %s", omit_AA_per_residue)
 
     # ---- Cycle schedule ---------------------------------------------
-    cycles = default_cycles(omit_AA=args.omit_AA)
+    cycles = default_cycles(
+        omit_AA=args.omit_AA,
+        use_side_chain_context=args.use_side_chain_context,
+        enhance=args.enhance,
+    )
     if args.cycles == 1:
         cycles = cycles[:1]   # short-test mode
     elif args.cycles != 3:
