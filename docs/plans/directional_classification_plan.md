@@ -13,6 +13,7 @@ Codex flagged 5 hard blockers + 5 soft blockers; all addressed below.
 - §4: `secondary_sasa_max_fraction` raised 0.30 → 0.40 (avoids demoting true 2nd-shell residues on flexible loops).
 - §4: oxyanion-hole detection narrowed to backbone-N donors only (was any backbone atom).
 - §4 (post-user feedback): backbone polar contact now covers BOTH N (donor, e.g. oxyanion hole) AND O (acceptor, e.g. substrate-orienting backbone carbonyls). Codex narrowed it too far; donor-only would miss real acceptor-side H-bonds. CA and C still excluded (not polar atoms).
+- §4 (post-user-feedback v2): added a directional GATE on backbone polar proximity to fix the helix-against-ligand back-side false positive. A backbone N or O within 4.5 Å of a ligand atom now only triggers primary_sphere if EITHER (a) the residue's CB vector points roughly toward the ligand (θ ≤ 110°), OR (b) explicit H-bond geometry (donor/acceptor angles via `tools/geometric_interactions.py` antecedent tables) confirms a real H-bond. Path (a) catches the user's helix scenario; path (b) is the oxyanion-hole escape hatch. Sidechain-reach paths (`d_sidechain_lig`, `d_sidechain_catshell`) do NOT need this gate -- reaching is already directional.
 - §4: precondition added — assert `min(d_sidechain_lig over catalytic residues) < 5` before classifying; loud warning if not (catches poorly-placed ligand poses).
 - §4: empty `catalytic_resnos` → loud warning + return all-distal classification (no silent demotion).
 - §5 phantom Cβ: chirality marked as PROVISIONAL — implementation must compute both `cross(â, b̂)` and `cross(b̂, â)`, test against real Cβ on a non-Gly residue, pick the one with mean deviation < 0.15 Å. The 54.7356° tilt is canonical (`acos(1/√3)`). Codex flagged the cross-product order; the unit test is the source of truth.
@@ -112,9 +113,31 @@ def classify(residue, ligand_atoms, catalytic_resnos, cfg):
     # O (H-bond acceptor, e.g. substrate-orienting backbone carbonyls).
     # Excludes CA (sp3, not polar) and C (sp2 carbonyl carbon -- the
     # polar atom is its O, already covered).
-    is_backbone_polar_contact = (
+    is_backbone_polar_contact_proximity = (
         any(||r.atom('N') - lig|| <= 4.5 for lig in ligand_atoms) OR
         any(||r.atom('O') - lig|| <= 4.5 for lig in ligand_atoms)
+    )
+    # GUARD against helix-against-ligand back-side false positives:
+    # backbone polar proximity alone is not enough -- a residue on the
+    # back of a helix can have its backbone N/O at 4.4 Å of the ligand
+    # purely because the helix runs parallel, with no real H-bond and
+    # the sidechain pointing into solvent. Require either:
+    #   (a) the residue's CB vector points roughly toward the ligand
+    #       (θ ≤ 110°) -- signals the residue is on the "facing" side
+    #       of secondary structure, OR
+    #   (b) explicit H-bond geometry (donor/acceptor angles consistent
+    #       with the antecedent chemistry tables in
+    #       tools/geometric_interactions.py) -- this is the oxyanion-
+    #       hole escape hatch where the backbone NH is in true H-bond
+    #       distance + angle to a ligand acceptor regardless of where
+    #       Cβ sits.
+    is_backbone_polar_contact = (
+        is_backbone_polar_contact_proximity
+        AND (
+            theta_orient_deg <= 110.0   # path (a): CB not strongly outward
+            OR has_explicit_backbone_hbond_to_ligand(r, ligand_atoms)
+                                          # path (b): real H-bond geometry
+        )
     )
     if (d_sidechain_lig <= cfg.primary_distance
         OR d_sidechain_catshell <= cfg.primary_distance
