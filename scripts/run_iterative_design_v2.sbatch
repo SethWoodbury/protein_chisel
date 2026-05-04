@@ -46,6 +46,23 @@ OMIT_AA="${OMIT_AA:-CX}"
 # detected per-residue omits.
 USE_SIDE_CHAIN_CONTEXT="${USE_SIDE_CHAIN_CONTEXT:-0}"
 
+# Optional pLDDT-enhanced LigandMPNN checkpoint (--enhance flag).
+# Empty string = use the standard ligand_mpnn checkpoint. Available
+# names listed in iterative_design_v2.py AVAILABLE_ENHANCE_CHECKPOINTS;
+# enhance can boost mean fitness ~+0.02 nats/residue at a small
+# diversity cost. Pass via env: ENHANCE=plddt_residpo_alpha_20250116-aec4d0c4
+ENHANCE="${ENHANCE:-}"
+
+# PLM model variants (only matter for stage 2 — precompute_plm_artifacts).
+# Defaults are the smallest+fastest in each family.
+#   ESMC_MODEL  : esmc_300m (default, ~46s) | esmc_600m
+#   SAPROT_MODEL: saprot_35m (default, ~10s) | saprot_650m | saprot_1.3b
+# Larger models give marginally better masked-LM probs but cost more
+# VRAM and time. Stage 2 runs ONCE per scaffold so the time cost is
+# amortized across all subsequent design runs.
+ESMC_MODEL="${ESMC_MODEL:-esmc_300m}"
+SAPROT_MODEL="${SAPROT_MODEL:-saprot_35m}"
+
 # Optional pLDDT-enhanced fused_mpnn checkpoint name (without .pth);
 # empty string = disabled. Adds ~+0.02 nats/residue mean fitness.
 ENHANCE="${ENHANCE:-}"
@@ -95,7 +112,9 @@ apptainer exec --nv \
     python "$REPO/scripts/precompute_plm_artifacts.py" \
         --seed_pdb "$SEED_PDB" \
         --position_table "$CLASSIFY_DIR/positions.tsv" \
-        --out_dir "$PLM_DIR"
+        --out_dir "$PLM_DIR" \
+        --esmc_model "$ESMC_MODEL" \
+        --saprot_model "$SAPROT_MODEL"
 
 echo "=== STAGE 3: iterative driver (universal.sif) ==="
 apptainer exec --nv \

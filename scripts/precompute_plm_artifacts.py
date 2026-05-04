@@ -44,9 +44,26 @@ def main() -> None:
                    help="parquet/tsv from classify_positions")
     p.add_argument("--chain", default="A")
     p.add_argument("--out_dir", type=Path, required=True)
-    p.add_argument("--esmc_model", default="esmc_300m")
-    p.add_argument("--saprot_model", default="saprot_35m")
-    p.add_argument("--device", default="auto")
+    p.add_argument(
+        "--esmc_model", default="esmc_300m",
+        choices=["esmc_300m", "esmc_600m"],
+        help="ESM-C model variant. esmc_300m (default, ~46s on H100, "
+             "fits in ~2 GB VRAM) | esmc_600m (~2× slower, ~4 GB VRAM, "
+             "marginally better masked-LM probs). Cached at "
+             "/net/databases/huggingface/esmc/hub.",
+    )
+    p.add_argument(
+        "--saprot_model", default="saprot_35m",
+        choices=["saprot_35m", "saprot_650m", "saprot_1.3b"],
+        help="SaProt model variant. saprot_35m (default, ~10s on H100; "
+             "AF2-trained) | saprot_650m (PDB-trained, ~3× slower, "
+             "structure-aware sharper) | saprot_1.3b (AFDB+OMG+NCBI, "
+             "~10× slower, ~6 GB VRAM, broadest pretraining). All "
+             "cached at /net/databases/huggingface/saprot/hub.",
+    )
+    p.add_argument("--device", default="auto",
+                   help="'auto' picks cuda if available else cpu. Pass "
+                        "'cpu' to force CPU even on a GPU node.")
     args = p.parse_args()
 
     logging.basicConfig(
