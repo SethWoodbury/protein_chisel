@@ -4,11 +4,12 @@
 **Author:** Claude (Opus 4.7) on behalf of Seth, 2026-05-04.
 **Tag to revert:** `pre-plm-bump-2026-05-04` (or HEAD of `main` if before merge).
 
-## Changelog after codex review
+## Changelog after codex + 3 rounds of user review
 
-Codex flagged 5 hard blockers + 5 soft blockers; all addressed below.
+Codex flagged 5 hard blockers + 5 soft blockers; user added 4 more conceptual fixes. All addressed below.
 
-- §4 decision tree: secondary tier now also fires on `d_sidechain_catshell ≤ 6` (catches H-bond networks like PTE Asp301↔His254 that don't directly contact ligand).
+- §4 (post-user-feedback v3): TWO-PASS algorithm. Primary = substrate contact only (literature definition: Tawfik HG3 / Markin PafA / Warshel preorganization). Secondary = coordinates a primary-sphere residue. The previous "d_sidechain_catshell ≤ 4.5 → primary" was wrong: contacting a catalytic His's sidechain at 3 Å but being 8 Å from substrate is *secondary* by the standard definition, not primary.
+- §3 / §3b (post-user-feedback v3): orientation now uses CA→sidechain centroid by default (better proxy for long flexible sidechains than CA→CB). Three orientation columns recorded (CB, centroid, functional-atom) so we can experiment without re-classifying. Soft membership scores (sigmoid over each cutoff) added so we can apply gradient PLM weights or re-bin offline.
 - §4: `d_ca_ligand` redefined as `min(CA → any ligand atom)` instead of CA→centroid (better for elongated substrates like paraoxon).
 - §4: `secondary_sasa_max_fraction` raised 0.30 → 0.40 (avoids demoting true 2nd-shell residues on flexible loops).
 - §4: oxyanion-hole detection narrowed to backbone-N donors only (was any backbone atom).
@@ -72,98 +73,149 @@ Keep computing the underlying continuous metrics and **store them as separate co
 - **Continuous metrics** are available for advanced uses (e.g. smooth PLM weight modulation, ranking, ML features).
 - **Auditable**: every class assignment can be back-explained from the metrics.
 
-New columns to add to PositionTable (alongside existing ones):
+New columns to add to PositionTable. All distances Å, angles deg, scores [0, 1]. Recording everything continuous so we can re-bin offline without re-classifying:
 
-| Column                  | Type    | Definition                                                              |
-| ----------------------- | ------- | ----------------------------------------------------------------------- |
-| `d_sidechain_lig`       | float   | min(sidechain heavy atom → any ligand heavy atom or catalytic-metal or μ-OH bridge) |
-| `d_sidechain_catshell`  | float   | min(sidechain heavy atom → any catalytic-residue sidechain heavy atom) |
-| `d_ca_ligand`           | float   | CA → ligand-centroid distance (renamed from current `dist_ligand`)      |
-| `theta_orient_deg`      | float   | angle between (CA → CB_or_phantom) and (CA → ligand-centroid), 0–180°   |
-| `sasa_sc_fraction`      | float   | sidechain SASA / max sidechain SASA for this AA type (Tien 2013 max)   |
-| `is_backbone_polar_contact` | bool | Backbone N (donor) OR O (acceptor) ≤ 4.5 Å of ligand. Captures oxyanion-hole NH AND substrate-orienting backbone C=O. CA + C excluded as non-polar. |
-| `is_rim_ambiguous`      | bool    | rotamer-library scan finds rotamers in BOTH primary and secondary buckets (optional, see §10) |
+| Column | Type | Definition |
+| --- | --- | --- |
+| `d_sidechain_lig` | float | min(sidechain heavy atom → any ligand heavy atom OR catalytic metal OR μ-OH bridge) |
+| `d_sidechain_catshell` | float | min(sidechain heavy atom → any catalytic-residue sidechain heavy atom). Diagnostic only — does NOT trigger primary anymore (codex + user feedback: that's secondary by literature definition) |
+| `d_sidechain_primary` | float | min(sidechain heavy atom → any **primary-sphere** residue's sidechain). Computed in pass 2 after primary set is known. The actual secondary trigger |
+| `d_backbone_N_lig` | float | min(backbone N → any ligand atom) — donor-side polar proximity |
+| `d_backbone_O_lig` | float | min(backbone O → any ligand atom) — acceptor-side polar proximity |
+| `d_ca_ligand` | float | min(CA → any ligand atom) (NOT centroid; codex finding for elongated paraoxon-like substrates) |
+| `theta_orient_cb_deg` | float | angle((CA→CB or phantom_CB), (CA→ligand-centroid)). Rotamer-stable. EXIA literature reference |
+| `theta_orient_centroid_deg` | float | angle((CA→sidechain_centroid), (CA→ligand-centroid)). Better proxy than CB for long flexible sidechains (Arg/Lys/Met/Glu/Gln). **This is what the directional gate uses.** Gly: phantom CB. Pro: CB-CG-CD centroid |
+| `theta_orient_functional_deg` | float | angle((CA→functional_atom), (CA→ligand-centroid)) — chemical-tip orientation. Defined per AA: NZ (Lys), NH1/NH2 mean (Arg), OG/OG1 (Ser/Thr), ND1/NE2 (His tautomer-aware), OH (Tyr), CZ (Phe), OE1/OE2 mean (Glu), OD1/OD2 mean (Asp), OE1+NE2 mean (Gln), OD1+ND2 mean (Asn), SD (Met), SG (Cys), CG (Trp ring centroid alt). NaN for Gly/Ala/short residues without a clear functional atom |
+| `sasa_sc_fraction` | float | sidechain SASA / max sidechain SASA for this AA type (Tien 2013 max-SASA values, doi:10.1371/journal.pone.0080635) |
+| `is_backbone_polar_proximity` | bool | backbone N OR O ≤ 4.5 Å of ligand — RAW proximity flag |
+| `is_backbone_polar_contact` | bool | proximity AND (`theta_orient_centroid_deg ≤ 110°` OR explicit H-bond geometry) — the actual primary-trigger flag |
+| `is_explicit_hbond_to_ligand` | bool | Real H-bond geometry (donor/acceptor angles + distances) via `tools/geometric_interactions.py` antecedent tables |
+| `is_rim_ambiguous` | bool | rotamer scan finds rotamers in BOTH primary and secondary buckets (deferred to v2 unless user requests) |
+| `primary_score` | float | sigmoid soft-membership in primary_sphere — see §3b |
+| `secondary_score` | float | sigmoid soft-membership in secondary_sphere |
+| `nearby_score` | float | sigmoid soft-membership in nearby_surface |
 
-The legacy `dist_ligand` and `dist_catalytic` are kept verbatim for backwards compat with downstream code that reads them.
+Legacy `dist_ligand` and `dist_catalytic` kept verbatim for back-compat.
 
-## 4. Decision algorithm
+## 3b. Soft membership scores (gradient classification option)
 
-Pseudocode (revised post-codex):
+Discrete labels are useful for filters and audit. But the cutoff boundaries (4.5 / 6.0 / 10.0 Å + 70° / 110° + 0.40 SASA) are arbitrary breaks on continuous physical metrics, and we don't want a residue at 4.49 vs 4.51 Å to get opposite treatment. So in addition to the discrete `class`, we compute a continuous score per tier:
 
 ```python
-def classify(residue, ligand_atoms, catalytic_resnos, cfg):
-    # ----- Sanity gates (codex finding 4) -----
-    if not catalytic_resnos:
-        log.warning("classify_positions: no catalytic residues; "
-                    "all residues will be distal_*")
-    else:
-        d_check = min(d_sidechain_lig[c] for c in catalytic_resnos)
-        if d_check > 5.0:
-            log.warning("classify_positions: catalytic residue %s has "
-                        "d_sidechain_lig=%.1f Å (>5). Likely poorly-placed "
-                        "ligand; classification may be garbage.",
-                        worst_cat, d_check)
+def sigmoid(x):
+    return 1.0 / (1.0 + exp(-x))
 
-    # ----- Force-include catalytic -----
+primary_score = sigmoid((cfg.primary_distance - d_sidechain_lig) / cfg.primary_halfwidth)
+# primary_halfwidth = 0.5 Å — score is 0.5 at d=4.5, 0.88 at d=4.0, 0.12 at d=5.0
+
+secondary_score = (
+    sigmoid((cfg.secondary_distance - d_sidechain_lig) / cfg.secondary_halfwidth)
+    * (1 - primary_score)            # don't double-count if already primary
+)
+# secondary_halfwidth = 0.7 Å — softer ramp at the loose cutoff
+
+nearby_score = (
+    sigmoid((cfg.nearby_ca_distance - d_ca_ligand) / cfg.nearby_halfwidth)
+    * (1 - primary_score - secondary_score)
+)
+```
+
+These scores let us:
+- **Apply gradient PLM weights** without re-classifying. Future option:
+  `effective_class_weight = primary_score * 0.05 + secondary_score * 0.20 + nearby_score * 0.30 + (1 - sum) * 0.55`. Smoother gradient, no step function. Not adopted by default; available behind a flag.
+- **Re-bin offline** with different cutoffs. Recompute scores from the metric columns in numpy, no re-classification needed.
+- **Audit edge cases.** A residue with `primary_score = 0.45` is a borderline call — flag it for human review.
+
+## 4. Decision algorithm — two-pass
+
+The literature draws primary vs secondary as **substrate-contact** vs **coordinates-substrate-contact**. The first draft conflated these by putting `d_sidechain_catshell ≤ 4.5 Å` into primary; that's actually the secondary-sphere definition. Fixed below with two passes.
+
+### Pass 1: identify primary_sphere (substrate contact only)
+
+```python
+def is_primary(residue, ligand_atoms, catalytic_resnos, cfg):
+    # Force-include catalytic
     if residue.resno in catalytic_resnos:
-        return "primary_sphere"
+        return True
 
-    # ----- Tier 1 — primary contact -----
-    # Backbone polar contact: N (H-bond donor, e.g. oxyanion hole) OR
-    # O (H-bond acceptor, e.g. substrate-orienting backbone carbonyls).
-    # Excludes CA (sp3, not polar) and C (sp2 carbonyl carbon -- the
-    # polar atom is its O, already covered).
-    is_backbone_polar_contact_proximity = (
-        any(||r.atom('N') - lig|| <= 4.5 for lig in ligand_atoms) OR
-        any(||r.atom('O') - lig|| <= 4.5 for lig in ligand_atoms)
-    )
-    # GUARD against helix-against-ligand back-side false positives:
-    # backbone polar proximity alone is not enough -- a residue on the
-    # back of a helix can have its backbone N/O at 4.4 Å of the ligand
-    # purely because the helix runs parallel, with no real H-bond and
-    # the sidechain pointing into solvent. Require either:
-    #   (a) the residue's CB vector points roughly toward the ligand
-    #       (θ ≤ 110°) -- signals the residue is on the "facing" side
-    #       of secondary structure, OR
-    #   (b) explicit H-bond geometry (donor/acceptor angles consistent
-    #       with the antecedent chemistry tables in
-    #       tools/geometric_interactions.py) -- this is the oxyanion-
-    #       hole escape hatch where the backbone NH is in true H-bond
-    #       distance + angle to a ligand acceptor regardless of where
-    #       Cβ sits.
-    is_backbone_polar_contact = (
-        is_backbone_polar_contact_proximity
-        AND (
-            theta_orient_deg <= 110.0   # path (a): CB not strongly outward
-            OR has_explicit_backbone_hbond_to_ligand(r, ligand_atoms)
-                                          # path (b): real H-bond geometry
-        )
-    )
-    if (d_sidechain_lig <= cfg.primary_distance
-        OR d_sidechain_catshell <= cfg.primary_distance
-        OR is_backbone_polar_contact):
-        return "primary_sphere"
+    # Sidechain reach to ligand/cofactor/metal/μ-OH
+    if residue.d_sidechain_lig <= cfg.primary_distance:
+        return True
 
-    # ----- Tier 2 — secondary sphere (codex: also catshell-only path) -----
-    in_secondary_distance = (
-        d_sidechain_lig <= cfg.secondary_distance
-        OR d_sidechain_catshell <= cfg.secondary_distance   # NEW: catches Asp301↔His254
+    # Backbone polar contact to ligand WITH directional gate
+    bb_proximity = (
+        residue.d_backbone_N_lig <= cfg.primary_distance
+        OR residue.d_backbone_O_lig <= cfg.primary_distance
     )
-    if (in_secondary_distance
-        AND theta_orient_deg <= cfg.orient_inward_max_deg
-        AND sasa_sc_fraction < cfg.secondary_sasa_max_fraction):
-        return "secondary_sphere"
+    if bb_proximity and (
+        residue.theta_orient_centroid_deg <= 110.0    # path (a)
+        OR has_explicit_backbone_hbond(residue, ligand_atoms)  # path (b)
+    ):
+        return True
 
-    # ----- Tier 3 — nearby surface -----
-    # d_ca_ligand uses min(CA → any ligand atom), not centroid (codex)
-    if d_ca_ligand <= cfg.nearby_ca_distance:
+    return False
+```
+
+### Pass 2: secondary_sphere = coordinates primary
+
+```python
+def is_secondary(residue, primary_residues, ligand_atoms, cfg):
+    # Path A: contacts a primary residue's sidechain (preorganization).
+    # This is the literature definition — "second shell coordinates first."
+    if any(
+        residue.min_dist_sidechain_to(p.sidechain_atoms) <= cfg.primary_distance
+        for p in primary_residues
+    ):
+        return True   # Includes the Asp301↔His254-catalytic case
+
+    # Path B: near-pocket residues pointing inward (preorganize from a
+    # distance via VDW packing or 2nd-shell H-bond networks).
+    if (residue.d_sidechain_lig <= cfg.secondary_distance
+        AND residue.theta_orient_centroid_deg <= cfg.orient_inward_max_deg
+        AND residue.sasa_sc_fraction < cfg.secondary_sasa_max_fraction):
+        return True
+
+    return False
+```
+
+### Tiers 3–4: same as before
+
+```python
+def classify_outer(residue, cfg):
+    if residue.d_ca_ligand <= cfg.nearby_ca_distance:
         return "nearby_surface"
-
-    # ----- Tier 4 — distal -----
-    if sasa_sc_fraction < cfg.distal_buried_sasa_max_fraction:
+    if residue.sasa_sc_fraction < cfg.distal_buried_sasa_max_fraction:
         return "distal_buried"
     return "distal_surface"
 ```
+
+### Driver
+
+```python
+def classify_all(residues, ligand_atoms, catalytic_resnos, cfg):
+    # Sanity gates
+    if not catalytic_resnos:
+        log.warning("no catalytic residues; all → distal_*")
+    elif min(r.d_sidechain_lig for r in residues if r.resno in catalytic_resnos) > 5.0:
+        log.warning("catalytic residue too far from ligand; bad ligand pose?")
+
+    # Pass 1
+    primary = {r.resno: True for r in residues if is_primary(r, ligand_atoms, catalytic_resnos, cfg)}
+    primary_residues = [r for r in residues if r.resno in primary]
+
+    # Pass 2 (excludes already-primary)
+    classes = {}
+    for r in residues:
+        if r.resno in primary:
+            classes[r.resno] = "primary_sphere"
+        elif is_secondary(r, primary_residues, ligand_atoms, cfg):
+            classes[r.resno] = "secondary_sphere"
+        else:
+            classes[r.resno] = classify_outer(r, cfg)
+    return classes
+```
+
+This matches Tawfik HG3 / Markin PafA / Warshel preorganization terminology cleanly.
 
 `ClassifyConfig` (post-codex defaults):
 
