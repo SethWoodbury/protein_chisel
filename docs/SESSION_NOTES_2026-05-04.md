@@ -138,6 +138,34 @@ due to fpocket parallelization).
 For "thousands of jobs" workflow: CPU is fully viable. Trade ~6× wall
 time for unlimited concurrent slurm slots.
 
+## Update 2:10 PM — round 2 efficiency wins + empirical lesson on threading
+
+**The empirical lesson** (codex r2 was theoretically right but empirically wrong on GPU):
+
+Codex round-2 review suggested "always set torch threads to slurm
+allocation." Theoretically correct (oversubscription is bad). But on a
+GPU run with `--cpus-per-task=4`:
+
+  - configure_torch_threads(4) → parent process pinned to 4 threads
+  - When stage_struct_filter forks Pool(4), each worker INHERITS torch
+    threads=4 → 4 workers × 4 threads = 16 threads on a 4-CPU allocation
+  - Net: ~30s per cycle slowdown on GPU (5m41s vs 3m49s round-1 baseline)
+
+Also: setting OMP_NUM_THREADS=cpus_per_task in the fused_mpnn subprocess
+hurt GPU sample time (CPU helpers / data loading were over-constrained).
+
+**Final fix** (commit `102d67a`): both threading constraints now apply
+ONLY when `n_gpus == 0`. On GPU runs, defaults; on CPU runs, the
+allocation-pinning gives the OMP win we want.
+
+GPU re-test (job 14122804, after revert): 5m12s — partial recovery.
+The remaining gap vs round 1 is mostly stochastic sampling variance
+(different g-node speeds, different random sequences). Per-stage
+breakdown shows struct_filter Pool itself is fast (4s for 80 designs).
+
+CPU validation (job 14122546) still in flight; will reveal whether
+the OMP threading control gives the expected speedup on CPU pipeline.
+
 ## Update 1:25 PM — round 2 efficiency landed
 
 User asked for delta_fitness_vs_wt + further parallelization + auto-detect.
