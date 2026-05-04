@@ -2606,7 +2606,7 @@ def main() -> None:
                         "across cycle-k survivors required to 'agree' "
                         "before that AA's bias is reinforced. Default 0.85. "
                         "Raise to 0.90+ to require stronger agreement and "
-                        "preserve diversity. Round-6/7 with 0.85 lost ~50% "
+                        "preserve diversity. Round-6/7 with 0.85 lost ~50%% "
                         "of pairwise hamming vs rounds 1-5 (when consensus "
                         "was silently dead due to a class-name bug).")
     p.add_argument("--consensus_strength", type=float, default=2.0,
