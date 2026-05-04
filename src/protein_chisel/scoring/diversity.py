@@ -96,7 +96,13 @@ def select_diverse(
 
 def mask_from_position_table(
     pt_df: pd.DataFrame,
-    mutable_classes: Iterable[str] = ("buried", "surface", "first_shell", "pocket"),
+    mutable_classes: Iterable[str] = (
+        # Legacy 5-class names:
+        "buried", "surface", "first_shell", "pocket",
+        # New directional 6-class names (post 2026-05-04 rewrite):
+        "primary_sphere", "secondary_sphere", "nearby_surface",
+        "distal_buried", "distal_surface",
+    ),
 ) -> list[bool]:
     """Build a per-position bool mask from a PositionTable DataFrame.
 

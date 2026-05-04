@@ -194,10 +194,23 @@ def _run_one_pose(
         pt = classify_positions(pdb, pose_id=pose_id, catres=catres, params=params)
         pt.to_parquet(per_dir / "positions.tsv")
         row["positions__n_residues"] = int((pt.df["is_protein"]).sum())
-        row["positions__n_active_site"] = int((pt.df["class"] == "active_site").sum())
-        row["positions__n_first_shell"] = int((pt.df["class"] == "first_shell").sum())
-        row["positions__n_buried"] = int((pt.df["class"] == "buried").sum())
-        row["positions__n_surface"] = int((pt.df["class"] == "surface").sum())
+        # Count BOTH new (directional 6-class) and legacy (5-class) names
+        # so the column set stays stable across the rewrite. The new
+        # classifier emits new names in `class` and legacy names in
+        # `class_legacy`; legacy PositionTables only have `class`.
+        cls_col = pt.df["class"]
+        legacy_col = pt.df.get("class_legacy", cls_col)
+        # Legacy buckets (back-compat).
+        row["positions__n_active_site"] = int((legacy_col == "active_site").sum())
+        row["positions__n_first_shell"] = int((legacy_col == "first_shell").sum())
+        row["positions__n_buried"] = int((legacy_col == "buried").sum())
+        row["positions__n_surface"] = int((legacy_col == "surface").sum())
+        # Directional buckets (new).
+        row["positions__n_primary_sphere"]   = int((cls_col == "primary_sphere").sum())
+        row["positions__n_secondary_sphere"] = int((cls_col == "secondary_sphere").sum())
+        row["positions__n_nearby_surface"]   = int((cls_col == "nearby_surface").sum())
+        row["positions__n_distal_buried"]    = int((cls_col == "distal_buried").sum())
+        row["positions__n_distal_surface"]   = int((cls_col == "distal_surface").sum())
 
     # Backbone sanity
     if cfg.run_backbone_sanity:

@@ -49,24 +49,31 @@ class FusionConfig:
     # Per-position-class weights (β = γ = base_weights[class]). Keys map to
     # the `class` column from classify_positions.
     #
-    # Bumped 2026-05-04 (was: active=0.0, first=0.05, pocket=0.10,
-    # buried=0.30, surface=0.50). The previous values gave LigandMPNN
-    # essentially no PLM signal in the active site and first shell, where
-    # MPNN's structure-conditioned distribution collapses heavily toward a
-    # few WT-like rotamers. Adding a small but non-zero PLM nudge there
-    # lets the language models diversify catalytic-vicinity sampling
-    # without overwhelming MPNN's geometric reasoning. active_site is
-    # also non-zero now for documentation; in the PTE_i1 driver those
-    # positions are fixed_residues so the bias is moot in practice, but
-    # any non-fixed active_site residue (e.g. if the user expands the
-    # designable set) will get the bump.
+    # Defaults track the directional 6-class taxonomy from
+    # tools/classify_positions.py (post 2026-05-04 rewrite). Legacy
+    # 5-class keys (active_site / first_shell / pocket / buried /
+    # surface) are auto-remapped via LEGACY_CLASS_REMAP at lookup
+    # time, so old PositionTables continue to work but emit a
+    # DeprecationWarning. Tunable per-class:
+    #   primary_sphere   = catalytic + direct ligand contact
+    #   secondary_sphere = coordinates a primary_sphere residue
+    #                      (preorganization; literature 2nd shell)
+    #   nearby_surface   = close to pocket but pointing out / exposed
+    #   distal_buried    = far + buried (folding/stability — PLM useful)
+    #   distal_surface   = far + surface (solubility — PLM most useful)
     class_weights: dict[str, float] = field(default_factory=lambda: {
-        "active_site": 0.05,
-        "first_shell": 0.15,
-        "pocket": 0.20,
-        "buried": 0.35,
-        "surface": 0.55,
-        "ligand": 0.0,
+        "primary_sphere":   0.05,
+        "secondary_sphere": 0.20,
+        "nearby_surface":   0.30,
+        "distal_buried":    0.40,
+        "distal_surface":   0.55,
+        "ligand":           0.0,
+        # Legacy keys kept so old configs still load — DEPRECATED:
+        "active_site":      0.05,
+        "first_shell":      0.15,
+        "pocket":           0.20,
+        "buried":           0.35,
+        "surface":          0.55,
     })
     # Global multiplier on top of class_weights. Lets the driver expose
     # a single --plm_strength knob (default 1.0). Set < 1.0 to soften
@@ -198,10 +205,23 @@ def fuse_plm_logits(
         if m_s > 0:
             lo_saprot = lo_saprot * m_s
 
-    # 3. Per-position class weights
-    base_weights = np.array([
-        cfg.class_weights.get(cls, 0.0) for cls in position_classes
-    ], dtype=np.float64) * float(cfg.global_strength)  # (L,)
+    # 3. Per-position class weights. Auto-remap legacy class names to
+    # the new directional taxonomy so old PositionTables still work.
+    from protein_chisel.tools.classify_positions import (
+        LEGACY_CLASS_REMAP, NEW_CLASSES,
+    )
+    def _lookup(cls: str) -> float:
+        # Direct hit (new vocabulary).
+        if cls in cfg.class_weights:
+            return cfg.class_weights[cls]
+        # Legacy → new remap.
+        new_cls = LEGACY_CLASS_REMAP.get(cls)
+        if new_cls is not None and new_cls in cfg.class_weights:
+            return cfg.class_weights[new_cls]
+        return 0.0
+    base_weights = np.array(
+        [_lookup(cls) for cls in position_classes], dtype=np.float64,
+    ) * float(cfg.global_strength)  # (L,)
     # Same weight for both models initially; can be specialized later.
     beta = base_weights.copy()
     gamma = base_weights.copy()

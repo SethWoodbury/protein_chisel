@@ -111,13 +111,25 @@ def biased_sample(
     )
 
     fixed_resnos: set[int] = set()
+    # Accept BOTH legacy and new (directional) class names so existing
+    # callers and PositionTables keep working through the rewrite.
     if cfg.fix_active_site:
         fixed_resnos.update(
-            int(r) for r in protein_rows.loc[protein_rows["class"] == "active_site", "resno"]
+            int(r) for r in protein_rows.loc[
+                protein_rows["class"].isin(["active_site", "primary_sphere"]),
+                "resno"
+            ]
         )
     if cfg.fix_first_shell:
+        # In the new taxonomy "first_shell" maps to primary_sphere; we
+        # also include secondary_sphere (literature 2nd shell) since
+        # that's where direct-contact preorganization residues live.
         fixed_resnos.update(
-            int(r) for r in protein_rows.loc[protein_rows["class"] == "first_shell", "resno"]
+            int(r) for r in protein_rows.loc[
+                protein_rows["class"].isin(
+                    ["first_shell", "primary_sphere", "secondary_sphere"]
+                ), "resno"
+            ]
         )
     # Force REMARK 666 catalytic residues into fixed set even if their
     # class somehow drifted.

@@ -37,16 +37,24 @@ def test_classify_positions_design_pdb():
     # 208 protein + 1 YYE = 209 rows
     assert len(df) == 209
 
-    # Catalytic residues from REMARK 666 are tagged active_site
+    # Catalytic residues from REMARK 666 are tagged primary_sphere (new)
+    # or active_site (legacy). Accept either so the test is resilient
+    # across the directional-classifier rewrite.
     catalytic_resnos = {41, 64, 148, 184, 187, 188}
     cat_rows = df[df["resno"].isin(catalytic_resnos)]
-    assert all(cat_rows["class"] == "active_site")
+    assert all(cat_rows["class"].isin(["active_site", "primary_sphere"]))
     assert all(cat_rows["is_catalytic"])
     assert len(cat_rows) == 6
 
-    # All non-catalytic protein rows are one of {first_shell, pocket, buried, surface}
+    # All non-catalytic protein rows are one of the known class strings
+    # (legacy or new vocabulary).
     non_cat_protein = df[df["is_protein"] & ~df["is_catalytic"]]
-    assert all(non_cat_protein["class"].isin(["first_shell", "pocket", "buried", "surface"]))
+    valid_classes = {
+        "first_shell", "pocket", "buried", "surface",   # legacy
+        "primary_sphere", "secondary_sphere", "nearby_surface",
+        "distal_buried", "distal_surface",              # new
+    }
+    assert all(non_cat_protein["class"].isin(valid_classes))
 
     # Ligand row is class=ligand
     lig_rows = df[~df["is_protein"]]
@@ -67,13 +75,17 @@ def test_classify_positions_apo_pdb():
     pt = classify_positions(AF3_APO_PDB)
     df = pt.df
 
-    # No catalytic, no ligand, no first_shell
+    # No catalytic, no ligand → no primary/secondary sphere either.
     assert df["is_catalytic"].sum() == 0
     assert (df["class"] == "ligand").sum() == 0
-    assert (df["class"] == "first_shell").sum() == 0
-    assert (df["class"] == "active_site").sum() == 0
-    # All rows are buried or surface
-    assert all(df["class"].isin(["buried", "surface"]))
+    assert (df["class"].isin(["first_shell", "primary_sphere"])).sum() == 0
+    assert (df["class"].isin(["active_site", "primary_sphere"])).sum() == 0
+    # All rows fall into a buried/surface bucket (legacy or distal_*).
+    valid_no_lig = {
+        "buried", "surface",                    # legacy
+        "distal_buried", "distal_surface",      # new
+    }
+    assert all(df["class"].isin(valid_no_lig))
 
 
 def test_classify_positions_persistence(tmp_path: Path):

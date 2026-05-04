@@ -275,7 +275,10 @@ def compute_clash_prone_first_shell_omits(
     chain: str = CHAIN,
     cb_clearance_threshold: float = 5.0,
     forbid_aas: str = "YFWHM",
-    eligible_classes: tuple[str, ...] = ("first_shell", "buried"),
+    eligible_classes: tuple[str, ...] = (
+        "first_shell", "buried",                                  # legacy
+        "primary_sphere", "secondary_sphere", "distal_buried",    # new
+    ),
 ) -> dict[str, str]:
     """Auto-detect first-shell positions where MPNN cannot place bulky
     side-chains without clashing with fixed catalytic atoms.
@@ -335,7 +338,10 @@ def compute_graded_clash_bias(
     fixed_resnos: Iterable[int],
     chain: str = CHAIN,
     cb_clearance_threshold: float = 5.0,
-    eligible_classes: tuple[str, ...] = ("first_shell", "buried"),
+    eligible_classes: tuple[str, ...] = (
+        "first_shell", "buried",                                  # legacy
+        "primary_sphere", "secondary_sphere", "distal_buried",    # new
+    ),
     bulky_aas: str = "YFWHMRK",   # K is as long as R (Cb->NZ ~6 A)
     # Per-AA bias = -bias_strength_per_pct_clash * clash_pct.
     # Crude 9-stub rotamer grid produces small clash percentages
@@ -512,7 +518,10 @@ def compute_first_shell_diversity_omits(
     fixed_resnos: Iterable[int],
     chain: str = CHAIN,
     fraction_to_diversify: float = 0.30,
-    eligible_classes: tuple[str, ...] = ("first_shell",),
+    eligible_classes: tuple[str, ...] = (
+        "first_shell",                            # legacy
+        "primary_sphere", "secondary_sphere",     # new
+    ),
     seed: Optional[int] = None,
 ) -> dict[str, str]:
     """Build a per-residue omit dict that forbids the WT AA at a random
@@ -2424,6 +2433,30 @@ def main() -> None:
     from protein_chisel.sampling.plm_fusion import FusionConfig, fuse_plm_logits
 
     pt = PositionTable.from_parquet(args.position_table)
+    # Detect legacy (5-class) PositionTable and re-classify with the new
+    # directional 6-class taxonomy if so. Cheap (~50 ms) and gives the
+    # PLM-fusion + diagnostic columns access to the new metrics.
+    legacy_classes_set = {"active_site", "first_shell", "pocket", "buried", "surface"}
+    pt_classes = set(pt.df.loc[pt.df["is_protein"], "class"].astype(str).unique())
+    if pt_classes & legacy_classes_set and "primary_sphere" not in pt_classes:
+        from protein_chisel.tools.classify_positions import (
+            classify_positions, ClassifyConfig,
+        )
+        LOGGER.info(
+            "position_table is legacy 5-class; re-classifying with directional "
+            "6-class taxonomy. Original classes: %s",
+            sorted(pt_classes),
+        )
+        pt = classify_positions(
+            pdb_path=args.seed_pdb,
+            params=[args.ligand_params],
+            config=ClassifyConfig(),
+        )
+        # Also save a sidecar so subsequent runs can skip the re-classify.
+        sidecar = run_dir / "position_table_v2.parquet"
+        pt.to_parquet(sidecar)
+        LOGGER.info("re-classified PositionTable saved to %s", sidecar)
+
     protein_rows = pt.df[pt.df["is_protein"]].sort_values("resno").reset_index(drop=True)
     position_classes = protein_rows["class"].tolist()
     protein_resnos = protein_rows["resno"].astype(int).tolist()
