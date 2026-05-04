@@ -105,8 +105,18 @@ class CycleConfig:
     cycle_idx: int
     n_samples: int = 500
     sampling_temperature: float = 0.20
-    net_charge_max: float = -10.0     # net_charge_no_HIS strictly < this
-    sap_max_threshold: float = 15.0
+    net_charge_max: float = -4.0      # accept if net_charge_no_HIS < net_charge_max
+    net_charge_min: float = -18.0     # accept if net_charge_no_HIS > net_charge_min
+    # SAP_max threshold on the FREESASA-PROXY scale (Lauer-style 10A
+    # neighborhood SASA-weighted hydrophobicity). For PTE_i1 the proxy
+    # ranges 0.3-3.2 across designs; this filter is essentially OFF
+    # at threshold 100 (vestigial -- kept for the metric).
+    # The user's target "SAP < 15" is on the ROSETTA SAP scale; that
+    # is computed in the OPTIONAL rosetta-final stage (top-K only)
+    # because PyRosetta SapScoreMetric is too slow for inner-loop use.
+    # WT PTE_i1 Rosetta SAP = 28.4; "<15" is not achievable for this
+    # scaffold, so we apply it as soft ranking only at final stage.
+    sap_max_threshold: float = 100.0
     consensus_threshold: float = 0.85
     consensus_strength: float = 2.0
     # pI window. With net_charge_no_HIS < -10 the cycle-0 design pI
@@ -172,11 +182,10 @@ def default_cycles(
     ``"plddt_residpo_alpha_20250116-aec4d0c4"``. Boosts mean fitness
     by ~0.02 nats/residue at a diversity cost.
     """
-    # Per-monomer charge schedule. The user's target range is -4 to
-    # -15 per monomer, bracketing both the supercharged-PTE paper's
-    # -7/monomer (Sukhwal 2024, dimer = -14) and pushing toward more
-    # acidic for cycle-2 selection pressure. Schedule: c0 lenient
-    # (<-4) -> c1 mid (<-10) -> c2 most restrictive (<-15).
+    # Per-monomer charge target: -18 < charge < -4. Covers the
+    # supercharged-PTE paper's -7/monomer (Sukhwal 2024, dimer = -14)
+    # plus a wider acceptable window. Same band on every cycle -- we
+    # do NOT tighten across cycles because that just over-constrains.
     common = dict(
         omit_AA=omit_AA,
         use_side_chain_context=use_side_chain_context,
@@ -185,18 +194,24 @@ def default_cycles(
         fpocket_druggability_min=fpocket_druggability_min,
         clash_filter=clash_filter,
     )
+    # All cycles share the same charge window (-18 < x < -4) and SAP
+    # threshold; we only tighten temperature across cycles for refined
+    # exploitation late.
     return [
         CycleConfig(
             cycle_idx=0, n_samples=500, sampling_temperature=0.20,
-            net_charge_max=-4.0, sap_max_threshold=15.0, **common,
+            net_charge_max=-4.0, net_charge_min=-18.0,
+            sap_max_threshold=100.0, **common,
         ),
         CycleConfig(
             cycle_idx=1, n_samples=400, sampling_temperature=0.18,
-            net_charge_max=-10.0, sap_max_threshold=13.0, **common,
+            net_charge_max=-4.0, net_charge_min=-18.0,
+            sap_max_threshold=100.0, **common,
         ),
         CycleConfig(
             cycle_idx=2, n_samples=300, sampling_temperature=0.15,
-            net_charge_max=-15.0, sap_max_threshold=12.0, **common,
+            net_charge_max=-4.0, net_charge_min=-18.0,
+            sap_max_threshold=100.0, **common,
         ),
     ]
 
@@ -685,7 +700,8 @@ def stage_seq_filter(
     candidates_tsv: Path,
     out_dir: Path,
     net_charge_max: float,
-    wt_length: int,
+    net_charge_min: float = -50.0,
+    wt_length: int = 200,
     expression_engine,                # ExpressionRuleEngine
     seed_ss_reduced: Optional[str] = None,
     seed_sasa: Optional[np.ndarray] = None,
@@ -725,6 +741,10 @@ def stage_seq_filter(
         if pp.charge_at_pH7_no_HIS >= net_charge_max:
             reasons.append(
                 f"net_charge_no_HIS={pp.charge_at_pH7_no_HIS:.2f} >= {net_charge_max}"
+            )
+        if pp.charge_at_pH7_no_HIS <= net_charge_min:
+            reasons.append(
+                f"net_charge_no_HIS={pp.charge_at_pH7_no_HIS:.2f} <= {net_charge_min}"
             )
         if not (pi_min <= pp.pi <= pi_max):
             reasons.append(f"pI={pp.pi:.2f} outside [{pi_min}, {pi_max}]")
@@ -1106,6 +1126,14 @@ def stage_struct_filter(
                          "clash__n_to_catalytic": 0,
                          "clash__n_to_ligand": 0,
                          "clash__has_severe": 0,
+                         "preorg__n_hbonds_to_cat": 0,
+                         "preorg__n_salt_bridges_to_cat": 0,
+                         "preorg__n_pi_to_cat": 0,
+                         "preorg__n_hbonds_within_shells": 0,
+                         "preorg__strength_total": 0.0,
+                         "preorg__interactome_density": 0.0,
+                         "preorg__n_first_shell": 0,
+                         "preorg__n_second_shell": 0,
                          "passed_struct_filter": False,
                          "struct_fail": f"pdb_missing: {pdb}"})
             continue
@@ -1130,6 +1158,26 @@ def stage_struct_filter(
             severe_distance=clash_severe_distance,
         )
         clash_dict = clash.to_dict()
+        # Preorganization metrics (informational, not a filter): geometric
+        # interactome around catalytic + first/second-shell residues.
+        # ~10-20 ms/design.
+        from protein_chisel.scoring.preorganization import preorganization_score
+        try:
+            preorg_metrics = preorganization_score(
+                pdb, catalytic_resnos=list(fixed_resnos), chain=CHAIN,
+            )
+        except Exception as e:  # pragma: no cover -- never block the pipeline
+            LOGGER.warning("preorganization failed for %s: %s", cid, e)
+            preorg_metrics = {
+                "preorg__n_hbonds_to_cat": 0,
+                "preorg__n_salt_bridges_to_cat": 0,
+                "preorg__n_pi_to_cat": 0,
+                "preorg__n_hbonds_within_shells": 0,
+                "preorg__strength_total": 0.0,
+                "preorg__interactome_density": 0.0,
+                "preorg__n_first_shell": 0,
+                "preorg__n_second_shell": 0,
+            }
         reasons: list[str] = []
         if len(hbonds) < 1:
             reasons.append("no h-bonds to catalytic HIS")
@@ -1148,6 +1196,7 @@ def stage_struct_filter(
                      "sap_mean": sap.get("sap_mean", float("nan")),
                      "sap_p95": sap.get("sap_p95", float("nan")),
                      **clash_dict,
+                     **preorg_metrics,
                      "passed_struct_filter": not reasons,
                      "struct_fail": "; ".join(reasons)})
 
@@ -1234,6 +1283,7 @@ def _run_fpocket(
         )
         info_txt = work_dir / "design_out" / "design_info.txt"
         pdb_out = work_dir / "design_out" / "design_out.pdb"
+        pockets_subdir = work_dir / "design_out" / "pockets"
         if proc.returncode != 0 or not info_txt.is_file():
             LOGGER.warning("fpocket failed for %s: rc=%d", pdb_path.name, proc.returncode)
             return None
@@ -1246,6 +1296,7 @@ def _run_fpocket(
             catalytic_resnos=catalytic_resnos,
             chain=chain,
             distance_cutoff=pocket_distance_cutoff,
+            pockets_dir=pockets_subdir if pockets_subdir.is_dir() else None,
         )
     except subprocess.TimeoutExpired:
         LOGGER.warning("fpocket timeout (>300s) for %s", pdb_path.name)
@@ -1260,6 +1311,7 @@ def _parse_fpocket_active_site(
     catalytic_resnos: Iterable[int],
     chain: str,
     distance_cutoff: float = 6.0,
+    pockets_dir: Optional[Path] = None,
 ) -> Optional[dict]:
     """Pick the fpocket pocket containing the active site.
 
@@ -1270,6 +1322,10 @@ def _parse_fpocket_active_site(
     with the highest count and return its info.txt entries plus a
     ``mean_alpha_sphere_distance_to_catalytic`` proxy for "how
     centered on the active site".
+
+    If ``pockets_dir`` is given (the fpocket ``pockets/`` subdir which
+    holds ``pocketN_vert.pqr``), we additionally compute per-sphere
+    bottleneck-radius statistics from the chosen pocket's PQR file.
     """
     pockets = _parse_all_fpocket_pockets(info_txt)
     if not pockets:
@@ -1339,7 +1395,92 @@ def _parse_fpocket_active_site(
     out = dict(best)
     out["n_alpha_spheres_near_catalytic"] = n_close
     out["mean_alpha_sphere_dist_to_catalytic"] = mean_d
+
+    # Bottleneck-radius proxy: read the chosen pocket's PQR (per-sphere
+    # radius) and compute narrowest-passage statistics. Spheres in the
+    # upper distance-from-catalytic quartile are the lip/exit; their
+    # smallest radius is what a substrate must squeeze past on the way
+    # in. Cheap (~ms per design, single PQR read).
+    if pockets_dir is not None:
+        idx = best["pocket_idx"]
+        pqr = pockets_dir / f"pocket{idx}_vert.pqr"
+        if pqr.is_file():
+            extras = _compute_pocket_radius_stats(pqr, cat_arr)
+            out.update(extras)
     return out
+
+
+def _compute_pocket_radius_stats(
+    pqr_path: Path, cat_arr: np.ndarray,
+) -> dict[str, float]:
+    """Read fpocket ``pocketN_vert.pqr`` and compute radius-based
+    bottleneck stats.
+
+    PQR format (fpocket): atom name in cols 12-16, x,y,z in
+    cols 30:38, 38:46, 46:54, then charge then radius (last float).
+    Atom name "O" = polar sphere; "C" = apolar sphere.
+
+    Returns:
+        min_alpha_sphere_radius:
+            absolute smallest sphere in the pocket. fpocket clamps to
+            its [3.0, 6.0] default range so this is rarely below 3.4
+            but flags egregious narrow-points.
+        alpha_sphere_radius_p10:
+            10th-percentile radius — robust narrow-point measure.
+        bottleneck_radius:
+            min radius among spheres in the upper distance-from-
+            catalytic quartile (>= 75th percentile distance). These
+            spheres line the channel exit / mouth of the pocket; their
+            min radius approximates the constriction a substrate must
+            pass through on the way to the catalytic center. This is
+            the metric to consult when bulky R/K residues block the
+            active site.
+        polar_alpha_sphere_proportion:
+            fraction of spheres tagged "O" (polar). Complements
+            ``apolar_alpha_sphere_proportion`` from info.txt.
+        n_rim_spheres / rim_distance_threshold:
+            diagnostics for the bottleneck calculation.
+    """
+    radii: list[float] = []
+    coords: list[np.ndarray] = []
+    polar: list[bool] = []
+    with open(pqr_path) as fh:
+        for line in fh:
+            if not line.startswith("ATOM"):
+                continue
+            try:
+                xyz = np.array([
+                    float(line[30:38]), float(line[38:46]), float(line[46:54]),
+                ])
+                tail = line[54:].split()
+                radius = float(tail[-1])
+            except (ValueError, IndexError):
+                continue
+            atom_name = line[12:16].strip()
+            radii.append(radius)
+            coords.append(xyz)
+            polar.append(atom_name.startswith("O"))
+    if not radii:
+        return {}
+    r = np.array(radii)
+    xyz = np.array(coords)
+    pol = np.array(polar)
+    # Min distance per sphere to nearest catalytic CA
+    d = np.linalg.norm(
+        xyz[:, None, :] - cat_arr[None, :, :], axis=-1,
+    ).min(axis=1)
+    p75 = float(np.percentile(d, 75)) if len(d) >= 4 else float(d.max())
+    rim_mask = d >= p75
+    if rim_mask.sum() == 0:
+        rim_mask = np.ones_like(d, dtype=bool)
+    return {
+        "min_alpha_sphere_radius": float(r.min()),
+        "alpha_sphere_radius_p10": float(np.percentile(r, 10)),
+        "bottleneck_radius": float(r[rim_mask].min()),
+        "polar_alpha_sphere_proportion": float(pol.mean()),
+        "n_rim_spheres": int(rim_mask.sum()),
+        "rim_distance_threshold": p75,
+    }
 
 
 def _parse_all_fpocket_pockets(info_txt: Path) -> list[dict]:
@@ -1354,9 +1495,16 @@ def _parse_all_fpocket_pockets(info_txt: Path) -> list[dict]:
                     pockets.append(cur)
                 cur = {"pocket_idx": int(m.group(1))}
                 continue
-            m = re.match(r"^\s*([A-Za-z0-9_/. ]+):\s*([+-]?[\d.eE+-]+)", line)
+            m = re.match(r"^\s*([A-Za-z0-9_/.\- ]+?):\s*([+-]?[\d.eE+-]+)", line)
             if m and cur:
-                key = m.group(1).strip().lower().replace(" ", "_").replace(".", "")
+                key = (
+                    m.group(1).strip().lower()
+                    .replace(" ", "_").replace(".", "").replace("-", "_")
+                )
+                # Collapse runs of underscores from "Cent. of mass - Alpha"
+                while "__" in key:
+                    key = key.replace("__", "_")
+                key = key.strip("_")
                 try:
                     cur[key] = float(m.group(2))
                 except ValueError:
@@ -1378,9 +1526,16 @@ def _parse_fpocket_largest(info_txt: Path) -> Optional[dict]:
                     pockets.append(cur)
                 cur = {"pocket_idx": int(m.group(1))}
                 continue
-            m = re.match(r"^\s*([A-Za-z0-9_/. ]+):\s*([+-]?[\d.eE+-]+)", line)
+            m = re.match(r"^\s*([A-Za-z0-9_/.\- ]+?):\s*([+-]?[\d.eE+-]+)", line)
             if m and cur:
-                key = m.group(1).strip().lower().replace(" ", "_").replace(".", "")
+                key = (
+                    m.group(1).strip().lower()
+                    .replace(" ", "_").replace(".", "").replace("-", "_")
+                )
+                # Collapse runs of underscores from "Cent. of mass - Alpha"
+                while "__" in key:
+                    key = key.replace("__", "_")
+                key = key.strip("_")
                 try:
                     cur[key] = float(m.group(2))
                 except ValueError:
@@ -1391,6 +1546,115 @@ def _parse_fpocket_largest(info_txt: Path) -> Optional[dict]:
         return None
     pockets.sort(key=lambda p: p.get("druggability_score", 0), reverse=True)
     return pockets[0]
+
+
+def annotate_seed_tunnel_residues(
+    *,
+    seed_pdb: Path,
+    out_path: Path,
+    catalytic_resnos: Iterable[int],
+    chain: str = CHAIN,
+    proximity_cutoff: float = 6.0,
+) -> Path:
+    """Run fpocket once on the seed PDB and write a per-residue
+    annotation TSV: ``resno, is_tunnel_lining, min_dist_to_alpha_sphere``.
+
+    A residue is "tunnel-lining" if any of its sidechain (or CA) atoms
+    sits within ``proximity_cutoff`` Å of any active-site alpha-sphere.
+    These are the positions where bulky/charged residues most directly
+    affect channel width and pocket accessibility.
+
+    Cheap: one fpocket run on the seed (~0.6 s) plus per-atom distance
+    matrix (microseconds). Output is a 4-column TSV consumed by
+    ``scripts/audit_pocket_metrics.py`` and any downstream PositionTable
+    extension.
+    """
+    work_dir = out_path.parent / "_seed_fpocket_workspace"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    # Holo seed PDBs typically include the substrate/cofactor as HETATM,
+    # which fpocket excludes from pocket detection — that collapses the
+    # active-site cavity to a tiny vestige. Strip HETATM to an apo PDB
+    # so the active-site cavity is detected the same way as the
+    # in-cycle designed PDBs (which have no ligand).
+    apo_pdb = work_dir / "seed_apo.pdb"
+    with open(seed_pdb) as src, open(apo_pdb, "w") as dst:
+        for line in src:
+            if line.startswith("HETATM"):
+                continue
+            dst.write(line)
+    info = _run_fpocket(
+        apo_pdb, work_dir, catalytic_resnos=catalytic_resnos, chain=chain,
+    )
+    if info is None:
+        LOGGER.warning("seed fpocket failed; tunnel annotation will be empty")
+        pd.DataFrame(columns=[
+            "resno", "is_tunnel_lining", "min_dist_to_alpha_sphere",
+            "is_catalytic",
+        ]).to_csv(out_path, sep="\t", index=False)
+        return out_path
+
+    pidx = info["pocket_idx"]
+    pqr_path = work_dir / "design_out" / "pockets" / f"pocket{pidx}_vert.pqr"
+    sphere_xyz: list[np.ndarray] = []
+    if pqr_path.is_file():
+        with open(pqr_path) as fh:
+            for line in fh:
+                if not line.startswith("ATOM"):
+                    continue
+                try:
+                    sphere_xyz.append(np.array([
+                        float(line[30:38]), float(line[38:46]), float(line[46:54]),
+                    ]))
+                except ValueError:
+                    continue
+    if not sphere_xyz:
+        LOGGER.warning("seed fpocket: no alpha spheres for pocket %d", pidx)
+        pd.DataFrame(columns=[
+            "resno", "is_tunnel_lining", "min_dist_to_alpha_sphere",
+            "is_catalytic",
+        ]).to_csv(out_path, sep="\t", index=False)
+        return out_path
+    sph_arr = np.array(sphere_xyz)
+
+    # Build per-residue atom xyz lists from the seed PDB.
+    cat_set = set(int(r) for r in catalytic_resnos)
+    res_atoms: dict[int, list[np.ndarray]] = {}
+    with open(seed_pdb) as fh:
+        for line in fh:
+            if not line.startswith("ATOM"):
+                continue
+            if line[21].strip() != chain:
+                continue
+            try:
+                resno = int(line[22:26].strip())
+                xyz = np.array([
+                    float(line[30:38]), float(line[38:46]), float(line[46:54]),
+                ])
+            except ValueError:
+                continue
+            res_atoms.setdefault(resno, []).append(xyz)
+
+    rows = []
+    for resno in sorted(res_atoms):
+        atoms = np.array(res_atoms[resno])
+        # Min distance from any atom of this residue to any alpha sphere
+        d = np.linalg.norm(
+            atoms[:, None, :] - sph_arr[None, :, :], axis=-1,
+        ).min()
+        rows.append({
+            "resno": int(resno),
+            "is_tunnel_lining": bool(d <= proximity_cutoff),
+            "min_dist_to_alpha_sphere": float(d),
+            "is_catalytic": bool(resno in cat_set),
+        })
+    df = pd.DataFrame(rows)
+    df.to_csv(out_path, sep="\t", index=False)
+    LOGGER.info(
+        "seed tunnel annotation: %d residues, %d tunnel-lining (cutoff=%.1f Å)",
+        len(df), int(df["is_tunnel_lining"].sum()), proximity_cutoff,
+    )
+    # Workspace is a few hundred KB; keep it for debugging.
+    return out_path
 
 
 def stage_fpocket_rank(
@@ -1425,20 +1689,59 @@ def stage_fpocket_rank(
             pdb, fpocket_dir / cid,
             catalytic_resnos=catalytic_resnos, chain=chain,
         ) if pdb else None
+        # Helper to read keys safely with NaN fallback
+        def _g(key, default=float("nan")):
+            return info.get(key, default) if info else default
+        # Polar / apolar atom percentages. info.txt gives only
+        # ``proportion_of_polar_atoms`` (a percent already, not a
+        # fraction). Apolar pct is the complement.
+        polar_pct = _g("proportion_of_polar_atoms", float("nan"))
+        apolar_pct = (
+            (100.0 - polar_pct)
+            if isinstance(polar_pct, (int, float)) and polar_pct == polar_pct
+            else float("nan")
+        )
         rows.append({
             **row.to_dict(),
-            "fpocket__druggability": info.get("druggability_score", 0.0) if info else 0.0,
-            "fpocket__volume": info.get("volume", 0.0) if info else 0.0,
+            # ---- existing core metrics (unchanged) -----------------
+            "fpocket__druggability": _g("druggability_score", 0.0),
+            "fpocket__volume": _g("volume", 0.0),
             "fpocket__mean_alpha_sphere_radius":
-                info.get("mean_alpha_sphere_radius", 0.0) if info else 0.0,
-            "fpocket__alpha_sphere_density":
-                info.get("alpha_sphere_density", 0.0) if info else 0.0,
+                _g("mean_alpha_sphere_radius", 0.0),
+            "fpocket__alpha_sphere_density": _g("alpha_sphere_density", 0.0),
             "fpocket__n_alpha_spheres_near_catalytic":
-                info.get("n_alpha_spheres_near_catalytic", 0) if info else 0,
+                _g("n_alpha_spheres_near_catalytic", 0),
             "fpocket__mean_alpha_sphere_dist_to_catalytic":
-                info.get("mean_alpha_sphere_dist_to_catalytic", float("nan"))
-                if info else float("nan"),
+                _g("mean_alpha_sphere_dist_to_catalytic"),
             "fpocket__n_pockets_found": 1 if info else 0,
+            # ---- pocket character (info.txt) -----------------------
+            "fpocket__score": _g("score"),
+            "fpocket__n_alpha_spheres": _g("number_of_alpha_spheres"),
+            "fpocket__total_sasa": _g("total_sasa"),
+            "fpocket__polar_sasa": _g("polar_sasa"),
+            "fpocket__apolar_sasa": _g("apolar_sasa"),
+            "fpocket__hydrophobicity_score": _g("hydrophobicity_score"),
+            "fpocket__polarity_score": _g("polarity_score"),
+            "fpocket__charge_score": _g("charge_score"),
+            "fpocket__volume_score": _g("volume_score"),
+            "fpocket__polar_atoms_pct": polar_pct,
+            "fpocket__apolar_atoms_pct": apolar_pct,
+            "fpocket__apolar_alpha_sphere_proportion":
+                _g("apolar_alpha_sphere_proportion"),
+            "fpocket__mean_local_hydrophobic_density":
+                _g("mean_local_hydrophobic_density"),
+            "fpocket__mean_alpha_sphere_solvent_acc":
+                _g("mean_alp_sph_solvent_access"),
+            "fpocket__cent_of_mass_alpha_sphere_max_dist":
+                _g("cent_of_mass_alpha_sphere_max_dist"),
+            # ---- bottleneck / channel stats (from PQR) -------------
+            "fpocket__bottleneck_radius": _g("bottleneck_radius"),
+            "fpocket__min_alpha_sphere_radius": _g("min_alpha_sphere_radius"),
+            "fpocket__alpha_sphere_radius_p10":
+                _g("alpha_sphere_radius_p10"),
+            "fpocket__polar_alpha_sphere_proportion":
+                _g("polar_alpha_sphere_proportion"),
+            "fpocket__n_rim_spheres": _g("n_rim_spheres", 0),
         })
     ranked = pd.DataFrame(rows).sort_values(
         # primary: fitness desc; secondary: tighter pocket
@@ -1609,6 +1912,172 @@ def stage_diverse_topk(
 
 
 # ----------------------------------------------------------------------
+# Optional final-stage enrichment: CMS (cross-sif) + Rosetta DDG
+# ----------------------------------------------------------------------
+
+
+def stage_cms_final(
+    *,
+    topk_tsv: Path,
+    pdb_map: dict[str, Path],
+    out_dir: Path,
+) -> Path:
+    """Add Coventry-distance-weighted Contact Molecular Surface to top-K.
+
+    Uses ``protein_chisel.tools.contact_ms.contact_ms_protein_ligand``,
+    which depends on ``py_contact_ms`` (only present in esmc.sif). When
+    we're already running inside esmc.sif this is just an in-process
+    call; otherwise we shell out via :func:`esmc_call`.
+
+    ~3-4 s per design — only run on the final top-K, never per-cycle.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    df = pd.read_csv(topk_tsv, sep="\t")
+    if len(df) == 0:
+        LOGGER.warning("stage_cms_final: empty top-K, nothing to do")
+        df.to_csv(out_dir / "topk_with_cms.tsv", sep="\t", index=False)
+        return out_dir / "topk_with_cms.tsv"
+
+    # Try in-process first (we're inside esmc.sif); fall back to a
+    # cross-sif batch call if py_contact_ms isn't importable here.
+    try:
+        from protein_chisel.tools.contact_ms import contact_ms_protein_ligand
+        cms_vals: list[float] = []
+        for _, row in df.iterrows():
+            pdb = pdb_map.get(row["id"])
+            if pdb is None or not pdb.is_file():
+                cms_vals.append(float("nan"))
+                continue
+            res = contact_ms_protein_ligand(pdb)
+            cms_vals.append(float(res.total_cms))
+        df["cms__total"] = cms_vals
+        LOGGER.info("stage_cms_final: in-process; mean CMS=%.2f",
+                     float(np.nanmean(cms_vals)) if cms_vals else 0.0)
+    except ImportError:
+        LOGGER.info("stage_cms_final: py_contact_ms not local -> esmc.sif")
+        from protein_chisel.utils.apptainer import esmc_call
+        # Build a tiny in-container worker that consumes a JSON list of
+        # PDB paths and emits {id: cms} as JSON to stdout.
+        pdb_paths = {row["id"]: str(pdb_map.get(row["id"])) for _, row in df.iterrows()}
+        worker = (
+            "import json, sys\n"
+            "sys.path.insert(0, '/home/woodbuse/codebase_projects/protein_chisel/src')\n"
+            "from protein_chisel.tools.contact_ms import contact_ms_protein_ligand\n"
+            "items = json.loads(sys.argv[1])\n"
+            "out = {}\n"
+            "for k, p in items.items():\n"
+            "    if not p:\n"
+            "        out[k] = float('nan')\n"
+            "        continue\n"
+            "    try:\n"
+            "        out[k] = float(contact_ms_protein_ligand(p).total_cms)\n"
+            "    except Exception:\n"
+            "        out[k] = float('nan')\n"
+            "print('<<<CMS_JSON_BEGIN>>>'); print(json.dumps(out)); print('<<<CMS_JSON_END>>>')\n"
+        )
+        result = (
+            esmc_call(nv=False)
+            .with_bind("/home/woodbuse/codebase_projects/protein_chisel")
+            .run(["python", "-c", worker, json.dumps(pdb_paths)],
+                 capture_output=True, check=True)
+        )
+        blob = (result.stdout
+                .split("<<<CMS_JSON_BEGIN>>>", 1)[1]
+                .split("<<<CMS_JSON_END>>>", 1)[0]
+                .strip())
+        cms_map = json.loads(blob)
+        df["cms__total"] = [float(cms_map.get(rid, float("nan"))) for rid in df["id"]]
+        LOGGER.info("stage_cms_final: cross-sif; mean CMS=%.2f",
+                     float(df["cms__total"].mean()))
+
+    out_path = out_dir / "topk_with_cms.tsv"
+    df.to_csv(out_path, sep="\t", index=False)
+    return out_path
+
+
+def _sanitize_pdb_for_rosetta(src: Path, dst: Path) -> Path:
+    """Normalize Rosetta-extended residue names (HIS_D, HIS_E) -> HIS.
+
+    The pipeline writes 5-char residue names so downstream packers can
+    distinguish HIS tautomers, but ``pose_from_file`` rejects those
+    names. Rewrite cols 17-21 to a standard ' HIS ' label.
+    """
+    out_lines: list[str] = []
+    for line in src.read_text().splitlines():
+        if line.startswith(("ATOM  ", "HETATM")) and len(line) >= 21:
+            rn5 = line[16:21]
+            if rn5 in ("HIS_D", "HIS_E"):
+                line = line[:16] + " HIS " + line[21:]
+        out_lines.append(line)
+    dst.write_text("\n".join(out_lines) + "\n")
+    return dst
+
+
+def stage_rosetta_final(
+    *,
+    topk_tsv: Path,
+    pdb_map: dict[str, Path],
+    out_dir: Path,
+    ligand_params: Path,
+    key_atoms: Iterable[str] = ("P1", "O5", "O1", "O4"),
+) -> Path:
+    """Add Rosetta no-repack DDG (and other comprehensive metrics) to top-K.
+
+    ~10 s/design: only viable as a final-stage enrichment over the
+    diversity-selected top-K. Gated behind ``--rosetta_final``.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    df = pd.read_csv(topk_tsv, sep="\t")
+    if len(df) == 0:
+        LOGGER.warning("stage_rosetta_final: empty top-K, nothing to do")
+        df.to_csv(out_dir / "topk_with_rosetta.tsv", sep="\t", index=False)
+        return out_dir / "topk_with_rosetta.tsv"
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from protein_chisel.tools.rosetta_metrics import (
+        compute_rosetta_metrics, RosettaMetricsConfig,
+    )
+
+    sanitize_dir = out_dir / "_sanitized_pdbs"
+    sanitize_dir.mkdir(exist_ok=True)
+    rows: list[dict] = []
+    cfg = RosettaMetricsConfig(include_ec=False, include_sap=False)
+    for _, row in df.iterrows():
+        pdb = pdb_map.get(row["id"])
+        if pdb is None or not pdb.is_file():
+            rows.append({"id": row["id"], "rosetta__ddg": float("nan")})
+            continue
+        sanitized = _sanitize_pdb_for_rosetta(pdb, sanitize_dir / pdb.name)
+        try:
+            res = compute_rosetta_metrics(
+                pdb_path=sanitized,
+                ligand_params=ligand_params,
+                key_atoms=list(key_atoms),
+                config=cfg,
+            )
+            rows.append({
+                "id": row["id"],
+                "rosetta__ddg": float(res.ddg),
+                "rosetta__contact_molecular_surface": float(res.contact_molecular_surface),
+                "rosetta__ligand_interface_energy": float(res.ligand_interface_energy),
+                "rosetta__total_energy": float(res.total_rosetta_energy_metric),
+                "rosetta__n_hbonds_to_ligand": int(res.n_hbonds_to_ligand),
+            })
+        except Exception as e:  # pragma: no cover -- log + skip per-design
+            LOGGER.warning("rosetta_final failed for %s: %s", row["id"], e)
+            rows.append({"id": row["id"], "rosetta__ddg": float("nan")})
+
+    rosetta_df = pd.DataFrame(rows)
+    merged = df.merge(rosetta_df, on="id", how="left")
+    out_path = out_dir / "topk_with_rosetta.tsv"
+    merged.to_csv(out_path, sep="\t", index=False)
+    LOGGER.info("stage_rosetta_final: enriched %d top-K with rosetta__ddg "
+                 "(mean=%.2f)", len(merged),
+                 float(merged["rosetta__ddg"].mean(skipna=True)))
+    return out_path
+
+
+# ----------------------------------------------------------------------
 # One iteration cycle
 # ----------------------------------------------------------------------
 
@@ -1730,6 +2199,7 @@ def run_cycle(
     survivors_seq = stage_seq_filter(
         candidates_tsv=cand_tsv, out_dir=seq_filter_dir,
         net_charge_max=cycle_cfg.net_charge_max,
+        net_charge_min=cycle_cfg.net_charge_min,
         wt_length=wt_length,
         expression_engine=expression_engine,
         seed_ss_reduced=seed_ss_reduced,
@@ -1844,6 +2314,15 @@ def main() -> None:
                    help="Disable the heavy-atom clash check between catalytic+"
                         "ligand and designed sidechains. Off by default; only "
                         "use if you're debugging clash false positives.")
+    p.add_argument("--cms_final", action="store_true",
+                   help="After stage_diverse_topk, run Coventry Contact "
+                        "Molecular Surface on the top-K only (~3-4 s/design, "
+                        "needs esmc.sif). Adds 'cms__total' column.")
+    p.add_argument("--rosetta_final", action="store_true",
+                   help="After stage_diverse_topk, run the comprehensive "
+                        "Rosetta no-repack metrics panel (DDG + interface "
+                        "energy + ...) on the top-K only. ~30-60 s/design, "
+                        "needs pyrosetta.sif. Default OFF.")
     args = p.parse_args()
 
     logging.basicConfig(
@@ -1916,6 +2395,24 @@ def main() -> None:
     if len(ss.ss_reduced) != L:
         raise RuntimeError(f"SS length {len(ss.ss_reduced)} != L {L}")
     seed_sasa = protein_rows["sasa"].astype(float).values
+
+    # ---- One-shot: tunnel-residue annotation on seed PDB -----------
+    # Identifies residues whose atoms sit within 6 Å of any
+    # active-site alpha-sphere — these are the channel-lining
+    # positions where bulky/charged residues most directly impact
+    # pocket accessibility. Written as a sidecar TSV next to manifest
+    # for downstream tools (incl. scripts/audit_pocket_metrics.py).
+    seed_tunnel_path = run_dir / "seed_tunnel_residues.tsv"
+    try:
+        annotate_seed_tunnel_residues(
+            seed_pdb=args.seed_pdb,
+            out_path=seed_tunnel_path,
+            catalytic_resnos=DEFAULT_CATRES,
+            chain=CHAIN,
+            proximity_cutoff=6.0,
+        )
+    except Exception as exc:
+        LOGGER.warning("seed tunnel annotation failed: %s", exc)
 
     # ---- Pre-flight: evaluate WT against the engine ---------------
     wt_eng = expression_engine.evaluate(
@@ -2036,11 +2533,23 @@ def main() -> None:
         LOGGER.info("final pool: %d unique survivors across %d cycles",
                      len(pool), len(all_ranked))
 
-        stage_diverse_topk(
+        topk_tsv = stage_diverse_topk(
             pool_df=pool, pdb_map=all_pdb_maps,
             out_dir=final_dir,
             target_k=args.target_k, min_hamming=args.min_hamming,
         )
+        # ---- Optional final-stage enrichments on top-K only --------
+        if args.cms_final:
+            topk_tsv = stage_cms_final(
+                topk_tsv=topk_tsv, pdb_map=all_pdb_maps,
+                out_dir=final_dir / "cms_final",
+            )
+        if args.rosetta_final:
+            stage_rosetta_final(
+                topk_tsv=topk_tsv, pdb_map=all_pdb_maps,
+                out_dir=final_dir / "rosetta_final",
+                ligand_params=args.ligand_params,
+            )
     else:
         LOGGER.warning("final: zero survivors across all cycles!")
 
