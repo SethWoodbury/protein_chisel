@@ -3,8 +3,16 @@
 #SBATCH --partition=gpu-bf
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=16G
-#SBATCH --time=08:00:00
+#SBATCH --mem=10G
+#SBATCH --time=01:00:00
+# Resource notes (validated 2026-05-04 sweep E):
+#   - cpus=2 mem=8G: ~7.5 min wall, 3.5 GB peak (44% of 8G)
+#   - cpus=4 mem=10G: better with fpocket parallelization (Pool(4) cuts
+#     fpocket time ~4x; was ~41% of total wall before)
+#   - cpus=8 mem=12G: optimal if you want max parallelization, more
+#     priority cost. Most users want cpus=4.
+# Original was cpus=4 mem=16G --time=08:00:00 — overprovisioned 2x on
+# memory and 8x on time. Production runs land in 7-10 min.
 #SBATCH --output=/net/scratch/woodbuse/slurm-iter-v2-%j.out
 #SBATCH --error=/net/scratch/woodbuse/slurm-iter-v2-%j.err
 

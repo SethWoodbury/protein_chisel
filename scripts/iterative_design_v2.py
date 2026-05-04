@@ -1259,9 +1259,10 @@ def stage_struct_filter(
     fixed_resnos: Iterable[int] = (),
     clash_filter: bool = True,
     clash_severe_distance: float = 1.5,
-    # For DFI per-class summary
-    position_classes_for_dfi: Optional[list[str]] = None,
-    position_resnos_for_dfi: Optional[list[int]] = None,
+    # For DFI per-class summary — pre-computed once on the seed
+    # and broadcast to all designs (DFI is design-invariant for
+    # fixed-backbone runs).
+    seed_dfi_metrics: Optional[dict] = None,
 ) -> Path:
     """Apply h-bond + SAP-proxy structural filter."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1338,25 +1339,15 @@ def stage_struct_filter(
                 "preorg__n_first_shell": 0,
                 "preorg__n_second_shell": 0,
             }
-        # DFI (GNM-based dynamic flexibility index). Diagnostic only,
-        # ~50-80 ms/design. Per-class summary picks up the active-site
-        # vs framework signal we want for enzyme design QC.
-        from protein_chisel.scoring.dfi import compute_dfi
-        try:
-            dfi_classes = position_classes_for_dfi
-            dfi_resnos = position_resnos_for_dfi
-            dfi_res = compute_dfi(
-                pdb, chain=CHAIN,
-                classes=dfi_classes, classes_resnos=dfi_resnos,
-            )
-            dfi_metrics = dfi_res.to_dict()
-        except Exception as e:                # pragma: no cover
-            LOGGER.warning("DFI failed for %s: %s", cid, e)
-            dfi_metrics = {
-                "dfi__mean": float("nan"), "dfi__std": float("nan"),
-                "dfi__min": float("nan"), "dfi__max": float("nan"),
-                "dfi__elapsed_ms": float("nan"),
-            }
+        # DFI is design-invariant for fixed-backbone designs (CA-only
+        # GNM gives same answer for every design). Computed ONCE on the
+        # seed at startup and broadcast here — saves ~80 ms/design ×
+        # ~200 designs = ~16 s/cycle.
+        dfi_metrics = seed_dfi_metrics or {
+            "dfi__mean": float("nan"), "dfi__std": float("nan"),
+            "dfi__min": float("nan"), "dfi__max": float("nan"),
+            "dfi__elapsed_ms": float("nan"),
+        }
         reasons: list[str] = []
         if len(hbonds) < 1:
             reasons.append("no h-bonds to catalytic HIS")
@@ -1837,6 +1828,24 @@ def annotate_seed_tunnel_residues(
     return out_path
 
 
+def _fpocket_worker(args: tuple) -> tuple:
+    """Module-level fpocket worker — must be picklable for Pool().
+
+    Args tuple: (cid, pdb_path, out_dir, catalytic_resnos_list, chain).
+    Returns (cid, info_dict_or_None).
+    """
+    cid_, pdb_, out_, cat_, chain_ = args
+    if pdb_ is None:
+        return cid_, None
+    try:
+        return cid_, _run_fpocket(
+            pdb_, out_, catalytic_resnos=cat_, chain=chain_,
+        )
+    except Exception as e:    # pragma: no cover -- fpocket can flake
+        LOGGER.warning("fpocket failed for %s: %s", cid_, e)
+        return cid_, None
+
+
 def stage_fpocket_rank(
     *,
     scored_tsv: Path,
@@ -1856,19 +1865,46 @@ def stage_fpocket_rank(
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     df = pd.read_csv(scored_tsv, sep="\t")
-    LOGGER.info("stage_fpocket_rank: input n=%d (active-site constraint=%s)",
-                 len(df), "yes" if catalytic_resnos else "no")
     fpocket_dir = out_dir / "per_design_fpocket"
     fpocket_dir.mkdir(exist_ok=True)
+
+    # Parallelize fpocket invocations across CPUs. Each call is a
+    # standalone fpocket subprocess writing to its own temp dir.
+    # Speedup: ~N× where N = min(cpus, n_designs). Saves the bulk of
+    # cycle time (fpocket was ~41% of total wall before).
+    import os as _os
+    cpus_available = (
+        len(_os.sched_getaffinity(0))
+        if hasattr(_os, "sched_getaffinity") else (_os.cpu_count() or 1)
+    )
+    n_workers = max(1, min(cpus_available, len(df), 8))   # cap at 8
+    LOGGER.info(
+        "stage_fpocket_rank: input n=%d (active-site constraint=%s, "
+        "n_workers=%d/%d cpus)",
+        len(df), "yes" if catalytic_resnos else "no",
+        n_workers, cpus_available,
+    )
+
+    # Build worker arg tuples (only picklable types)
+    cat_list = list(catalytic_resnos) if catalytic_resnos else []
+    work_args: list[tuple] = []
+    for _, row in df.iterrows():
+        cid = row["id"]
+        pdb = pdb_map.get(cid)
+        work_args.append((cid, pdb, fpocket_dir / cid, cat_list, chain))
+
+    if n_workers == 1 or len(work_args) <= 2:
+        # Small pool / serial path — avoids Pool startup overhead.
+        infos = dict(_fpocket_worker(a) for a in work_args)
+    else:
+        from multiprocessing import Pool
+        with Pool(n_workers) as pool:
+            infos = dict(pool.map(_fpocket_worker, work_args, chunksize=1))
 
     rows = []
     for _, row in df.iterrows():
         cid = row["id"]
-        pdb = pdb_map.get(cid)
-        info = _run_fpocket(
-            pdb, fpocket_dir / cid,
-            catalytic_resnos=catalytic_resnos, chain=chain,
-        ) if pdb else None
+        info = infos.get(cid)
         # Helper to read keys safely with NaN fallback
         def _g(key, default=float("nan")):
             return info.get(key, default) if info else default
@@ -2282,6 +2318,7 @@ def run_cycle(
     seed_sasa: Optional[np.ndarray] = None,
     seed_position_class: Optional[list[str]] = None,
     seed_protein_resnos: Optional[list[int]] = None,
+    seed_dfi_metrics: Optional[dict] = None,
     position_table_df=None,           # for first-shell diversity injection
     omit_AA_per_residue: Optional[dict[str, str]] = None,
     catalytic_his_resnos: Iterable[int] = CATALYTIC_HIS_RESNOS,
@@ -2498,8 +2535,7 @@ def run_cycle(
         fixed_resnos=fixed_resnos,
         clash_filter=cycle_cfg.clash_filter,
         clash_severe_distance=cycle_cfg.clash_severe_distance,
-        position_classes_for_dfi=seed_position_class,
-        position_resnos_for_dfi=seed_protein_resnos,
+        seed_dfi_metrics=seed_dfi_metrics,
     )
 
     n_struct = len(pd.read_csv(survivors_struct, sep="\t"))
@@ -2601,7 +2637,7 @@ def main() -> None:
                         "Rosetta no-repack metrics panel (DDG + interface "
                         "energy + ...) on the top-K only. ~30-60 s/design, "
                         "needs pyrosetta.sif. Default OFF.")
-    p.add_argument("--consensus_threshold", type=float, default=0.85,
+    p.add_argument("--consensus_threshold", type=float, default=0.90,
                    help="Cycle k+1 consensus reinforcement: AA frequency "
                         "across cycle-k survivors required to 'agree' "
                         "before that AA's bias is reinforced. Default 0.85. "
@@ -2609,16 +2645,16 @@ def main() -> None:
                         "preserve diversity. Round-6/7 with 0.85 lost ~50%% "
                         "of pairwise hamming vs rounds 1-5 (when consensus "
                         "was silently dead due to a class-name bug).")
-    p.add_argument("--consensus_strength", type=float, default=2.0,
+    p.add_argument("--consensus_strength", type=float, default=1.0,
                    help="Bias magnitude (nats) added at consensus-agreed "
                         "(position, AA) pairs. Default 2.0; lower (e.g. "
                         "1.0) reduces over-collapse to consensus.")
-    p.add_argument("--consensus_max_fraction", type=float, default=0.30,
+    p.add_argument("--consensus_max_fraction", type=float, default=0.15,
                    help="Max fraction of eligible positions that consensus "
                         "can augment per cycle. Default 0.30; lower (e.g. "
                         "0.15) preserves more positional diversity by "
                         "reinforcing only the strongest-agreement positions.")
-    p.add_argument("--strategy", type=str, default="constant",
+    p.add_argument("--strategy", type=str, default="annealing",
                    choices=["constant", "annealing"],
                    help="Cycle schedule: 'constant' = same filter "
                         "thresholds + TOPSIS weights every cycle (legacy "
@@ -2970,6 +3006,26 @@ def main() -> None:
         cycles = cycles[: max(1, args.cycles)]
     LOGGER.info("cycle schedule: %d cycles, omit_AA=%r", len(cycles), args.omit_AA)
 
+    # ---- Pre-compute seed DFI once (design-invariant for fixed-backbone) --
+    # DFI was previously computed per-design (~80 ms × 200 designs/cycle =
+    # ~16 s/cycle wasted). Now computed once on the seed and broadcast.
+    seed_dfi_metrics: Optional[dict] = None
+    try:
+        from protein_chisel.scoring.dfi import compute_dfi
+        seed_dfi = compute_dfi(
+            args.seed_pdb, chain=CHAIN,
+            classes=position_classes, classes_resnos=protein_resnos,
+        )
+        seed_dfi_metrics = seed_dfi.to_dict()
+        LOGGER.info(
+            "seed DFI (computed once): mean=%.3f, primary=%.3f, distal_buried=%.3f",
+            seed_dfi_metrics.get("dfi__mean", float("nan")),
+            seed_dfi_metrics.get("dfi__mean__primary_sphere", float("nan")),
+            seed_dfi_metrics.get("dfi__mean__distal_buried", float("nan")),
+        )
+    except Exception as exc:
+        LOGGER.warning("seed DFI compute failed (%s); designs get NaN", exc)
+
     # ---- Loop cycles ------------------------------------------------
     all_ranked: list[pd.DataFrame] = []
     all_pdb_maps: dict[str, Path] = {}
@@ -2997,6 +3053,7 @@ def main() -> None:
             seed_sasa=seed_sasa,
             seed_position_class=position_classes,
             seed_protein_resnos=protein_resnos,
+            seed_dfi_metrics=seed_dfi_metrics,
             position_table_df=pt.df,
             omit_AA_per_residue=omit_AA_per_residue,
             balance_z_threshold=args.balance_z_threshold,
