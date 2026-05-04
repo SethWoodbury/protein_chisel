@@ -133,28 +133,37 @@ def test_cosine_orthogonal_distributions_low():
 # ---- fuse_plm_logits ------------------------------------------------------
 
 
-def test_fuse_zero_weights_at_active_site():
+def test_fuse_active_site_can_be_zeroed_via_config():
+    """Active-site weight is configurable. With class_weights['active_site']=0,
+    the bias at that position is exactly zero (preserves the legacy
+    'fixed-residues get no PLM' behavior when explicitly requested)."""
     L = 4
     lp_esmc = _peak_log_probs(L, aa_index=0)
     lp_saprot = _peak_log_probs(L, aa_index=0)
     pos_classes = ["active_site", "first_shell", "buried", "surface"]
-    res = fuse_plm_logits(lp_esmc, lp_saprot, pos_classes)
-    # Active site bias is exactly zero
+    cfg = FusionConfig(class_weights={
+        "active_site": 0.0, "first_shell": 0.05, "pocket": 0.10,
+        "buried": 0.30, "surface": 0.50, "ligand": 0.0,
+    })
+    res = fuse_plm_logits(lp_esmc, lp_saprot, pos_classes, config=cfg)
     assert np.allclose(res.bias[0], 0.0)
-    # Surface bias is non-zero (highest weight class)
     assert np.any(res.bias[3] != 0)
 
 
 def test_fuse_class_weight_ordering():
-    """Higher class_weights → larger absolute bias magnitude."""
+    """Higher class_weights → larger absolute bias magnitude.
+
+    Default weights (post 2026-05-04 bump): active_site < first_shell <
+    pocket < buried < surface, so the bias magnitude is monotone non-
+    decreasing across this class sequence.
+    """
     L = 4
-    # Put both models in agreement on a single AA so log-odds are large
     lp = _peak_log_probs(L, aa_index=0)
     res = fuse_plm_logits(lp, lp.copy(), ["active_site", "first_shell", "buried", "surface"])
     abs_mags = np.abs(res.bias).max(axis=-1)
-    # active_site=0 < first_shell < buried < surface
-    assert abs_mags[0] == 0.0
-    assert abs_mags[0] <= abs_mags[1] <= abs_mags[2] <= abs_mags[3]
+    # active_site < first_shell <= buried <= surface (all non-zero now)
+    assert abs_mags[0] > 0.0   # active_site is now bumped to 0.05
+    assert abs_mags[0] < abs_mags[1] < abs_mags[2] < abs_mags[3]
 
 
 def test_fuse_shrinkage_for_disagreement():
@@ -172,10 +181,56 @@ def test_fuse_no_shrinkage_for_agreement():
     L = 4
     lp = _peak_log_probs(L, aa_index=5)
     classes = ["surface"] * L
-    res = fuse_plm_logits(lp, lp.copy(), classes, config=FusionConfig(shrink_disagreement=True))
-    # Surface class weight is 0.5; agreement → no shrinkage → still 0.5
-    assert np.allclose(res.weights_per_position[:, 0], 0.5)
-    assert np.allclose(res.weights_per_position[:, 1], 0.5)
+    cfg = FusionConfig(shrink_disagreement=True)
+    res = fuse_plm_logits(lp, lp.copy(), classes, config=cfg)
+    # Agreement → no shrinkage → weights equal the configured surface
+    # class weight (default 0.55 post-2026-05-04 bump).
+    expected = cfg.class_weights["surface"]
+    assert np.allclose(res.weights_per_position[:, 0], expected)
+    assert np.allclose(res.weights_per_position[:, 1], expected)
+
+
+def test_fuse_global_strength_scales_weights():
+    """global_strength scales class_weights uniformly."""
+    L = 3
+    lp = _peak_log_probs(L, aa_index=0)
+    classes = ["surface"] * L
+    cfg_default = FusionConfig(global_strength=1.0)
+    cfg_bumped = FusionConfig(global_strength=1.5)
+    r1 = fuse_plm_logits(lp, lp.copy(), classes, config=cfg_default)
+    r2 = fuse_plm_logits(lp, lp.copy(), classes, config=cfg_bumped)
+    # Bumped should scale weights by exactly 1.5×
+    assert np.allclose(
+        r2.weights_per_position, r1.weights_per_position * 1.5
+    )
+    # And bias should also scale by 1.5×
+    assert np.allclose(r2.bias, r1.bias * 1.5)
+
+
+def test_fuse_zero_strength_disables_plm():
+    """global_strength=0.0 zeroes the bias entirely (PLM disabled)."""
+    L = 3
+    lp = _peak_log_probs(L, aa_index=0)
+    classes = ["surface", "buried", "first_shell"]
+    cfg = FusionConfig(global_strength=0.0)
+    res = fuse_plm_logits(lp, lp.copy(), classes, config=cfg)
+    assert np.allclose(res.bias, 0.0)
+    assert np.allclose(res.weights_per_position, 0.0)
+
+
+def test_fuse_strength_and_shrinkage_commute():
+    """strength * shrink should equal shrink * strength (linearity check)."""
+    L = 3
+    lp_a = _peak_log_probs(L, aa_index=0)
+    lp_b = _peak_log_probs(L, aa_index=2)   # disagreement → shrinkage active
+    classes = ["surface"] * L
+    cfg_1 = FusionConfig(global_strength=1.0, shrink_disagreement=True)
+    cfg_2 = FusionConfig(global_strength=2.0, shrink_disagreement=True)
+    r1 = fuse_plm_logits(lp_a, lp_b, classes, config=cfg_1)
+    r2 = fuse_plm_logits(lp_a, lp_b, classes, config=cfg_2)
+    # Strength multiplies the post-shrink weights; r2 = 2 * r1.
+    assert np.allclose(r2.weights_per_position, 2 * r1.weights_per_position)
+    assert np.allclose(r2.bias, 2 * r1.bias)
 
 
 def test_fuse_shape_mismatch_raises():

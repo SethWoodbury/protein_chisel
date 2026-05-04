@@ -2378,7 +2378,26 @@ def main() -> None:
                         "Rosetta no-repack metrics panel (DDG + interface "
                         "energy + ...) on the top-K only. ~30-60 s/design, "
                         "needs pyrosetta.sif. Default OFF.")
+    p.add_argument("--plm_strength", type=float, default=1.0,
+                   help="Global multiplier on PLM fusion class weights "
+                        "(applied uniformly to ESM-C and SaProt at every "
+                        "position). 1.0 = use FusionConfig defaults "
+                        "(active=0.05, first_shell=0.15, pocket=0.20, "
+                        "buried=0.35, surface=0.55). Pass e.g. 1.3 to "
+                        "amplify PLM influence (more active-site "
+                        "diversification, higher fitness ceiling, lower "
+                        "MPNN structural fidelity); 0.7 to soften. "
+                        "Must be non-negative; 0.0 disables PLM bias.")
     args = p.parse_args()
+    if args.plm_strength < 0:
+        p.error("--plm_strength must be >= 0 "
+                "(negative would invert the PLM signal)")
+    if args.plm_strength > 5.0:
+        LOGGER.warning(
+            "--plm_strength=%.2f is very large; PLM bias may dominate "
+            "MPNN's structure-conditioned logits (collapse to PLM "
+            "consensus). Typical range 0.5-2.0.", args.plm_strength,
+        )
 
     logging.basicConfig(
         level=logging.INFO,
@@ -2394,15 +2413,15 @@ def main() -> None:
     art = args.plm_artifacts_dir
     log_probs_esmc = np.load(art / "esmc_log_probs.npy")
     log_probs_saprot = np.load(art / "saprot_log_probs.npy")
-    base_bias = np.load(art / "fusion_bias.npy")
-    weights_per_position = np.load(art / "fusion_weights.npy")
-    LOGGER.info("loaded PLM artifacts: L=%d, mean_abs_bias=%.4f",
-                 base_bias.shape[0], float(np.abs(base_bias).mean()))
+    cached_base_bias = np.load(art / "fusion_bias.npy")
+    cached_weights = np.load(art / "fusion_weights.npy")
+    LOGGER.info("loaded raw PLM log-probs: L=%d", log_probs_esmc.shape[0])
 
     # ---- Load PositionTable -----------------------------------------
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
     from protein_chisel.io.schemas import PositionTable
     from protein_chisel.io.pdb import extract_sequence
+    from protein_chisel.sampling.plm_fusion import FusionConfig, fuse_plm_logits
 
     pt = PositionTable.from_parquet(args.position_table)
     protein_rows = pt.df[pt.df["is_protein"]].sort_values("resno").reset_index(drop=True)
@@ -2411,6 +2430,62 @@ def main() -> None:
     L = len(protein_resnos)
     LOGGER.info("position table: L=%d, class counts=%s",
                  L, protein_rows["class"].value_counts().to_dict())
+
+    # ---- Recompute PLM fusion at runtime ----------------------------
+    # The cached fusion_bias.npy was built with whatever class_weights
+    # the precompute step used. We re-fuse here so the *current*
+    # FusionConfig.class_weights take effect (e.g. after bumping
+    # active_site / first_shell / pocket weights). Cheap: a few
+    # numpy ops on (L, 20) matrices. We then snapshot the runtime
+    # result to the run dir so offline analysis/replays use the
+    # *actual* bias the cycles saw, not the stale cached one.
+    fusion_cfg = FusionConfig(global_strength=args.plm_strength)
+    fusion_res = fuse_plm_logits(
+        log_probs_esmc=log_probs_esmc,
+        log_probs_saprot=log_probs_saprot,
+        position_classes=position_classes,
+        config=fusion_cfg,
+    )
+    base_bias = fusion_res.bias
+    weights_per_position = fusion_res.weights_per_position
+    fusion_dir = run_dir / "fusion_runtime"
+    fusion_dir.mkdir(parents=True, exist_ok=True)
+    np.save(fusion_dir / "base_bias.npy", base_bias)
+    np.save(fusion_dir / "weights_per_position.npy", weights_per_position)
+    np.save(fusion_dir / "log_odds_esmc.npy", fusion_res.log_odds_esmc)
+    np.save(fusion_dir / "log_odds_saprot.npy", fusion_res.log_odds_saprot)
+    with open(fusion_dir / "fusion_config.json", "w") as fh:
+        json.dump({
+            "class_weights": fusion_cfg.class_weights,
+            "global_strength": fusion_cfg.global_strength,
+            "entropy_match": fusion_cfg.entropy_match,
+            "shrink_disagreement": fusion_cfg.shrink_disagreement,
+            "shrink_threshold": fusion_cfg.shrink_threshold,
+            "cached_artifact_dir": str(art),
+            "cached_mean_abs_bias": float(np.abs(cached_base_bias).mean()),
+            "runtime_mean_abs_bias": float(np.abs(base_bias).mean()),
+        }, fh, indent=2)
+    LOGGER.info(
+        "PLM fusion (runtime): mean_abs_bias=%.4f (cached was %.4f); "
+        "global_strength=%.2f, class_weights=%s",
+        float(np.abs(base_bias).mean()),
+        float(np.abs(cached_base_bias).mean()),
+        args.plm_strength, fusion_cfg.class_weights,
+    )
+    # Diagnostic: per-class total bias mass with the new weights.
+    import collections as _coll
+    cls_mass: dict[str, float] = _coll.defaultdict(float)
+    cls_count: dict[str, int] = _coll.defaultdict(int)
+    abs_bias_per_pos = np.abs(base_bias).sum(axis=-1)
+    for cls, m in zip(position_classes, abs_bias_per_pos):
+        cls_mass[cls] += float(m)
+        cls_count[cls] += 1
+    for cls in sorted(cls_mass):
+        LOGGER.info(
+            "  class %s: n=%d, total_|bias|=%.2f, mean_|bias|/pos=%.3f nats",
+            cls, cls_count[cls], cls_mass[cls],
+            cls_mass[cls] / max(1, cls_count[cls]),
+        )
 
     wt_seq = extract_sequence(args.seed_pdb, chain=CHAIN)
     if len(wt_seq) != L:

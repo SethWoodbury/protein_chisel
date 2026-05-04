@@ -46,17 +46,32 @@ LOG_AA_BG = np.log(AA_BG_VEC)
 class FusionConfig:
     aa_background: np.ndarray = field(default_factory=lambda: AA_BG_VEC.copy())
     entropy_match: bool = True
-    # Per-position-class weights. Keys correspond to the `class` column in
-    # PositionTable. Default values bias surface, soft-bias pocket/buried,
-    # and zero-bias active site / first shell.
+    # Per-position-class weights (β = γ = base_weights[class]). Keys map to
+    # the `class` column from classify_positions.
+    #
+    # Bumped 2026-05-04 (was: active=0.0, first=0.05, pocket=0.10,
+    # buried=0.30, surface=0.50). The previous values gave LigandMPNN
+    # essentially no PLM signal in the active site and first shell, where
+    # MPNN's structure-conditioned distribution collapses heavily toward a
+    # few WT-like rotamers. Adding a small but non-zero PLM nudge there
+    # lets the language models diversify catalytic-vicinity sampling
+    # without overwhelming MPNN's geometric reasoning. active_site is
+    # also non-zero now for documentation; in the PTE_i1 driver those
+    # positions are fixed_residues so the bias is moot in practice, but
+    # any non-fixed active_site residue (e.g. if the user expands the
+    # designable set) will get the bump.
     class_weights: dict[str, float] = field(default_factory=lambda: {
-        "active_site": 0.0,
-        "first_shell": 0.05,
-        "pocket": 0.10,
-        "buried": 0.30,
-        "surface": 0.50,
+        "active_site": 0.05,
+        "first_shell": 0.15,
+        "pocket": 0.20,
+        "buried": 0.35,
+        "surface": 0.55,
         "ligand": 0.0,
     })
+    # Global multiplier on top of class_weights. Lets the driver expose
+    # a single --plm_strength knob (default 1.0). Set < 1.0 to soften
+    # PLM influence everywhere, > 1.0 to emphasize.
+    global_strength: float = 1.0
     shrink_disagreement: bool = True
     # Cosine similarity threshold below which to shrink. 1.0 = perfect
     # agreement; 0 = orthogonal. Below `shrink_threshold`, weight is
@@ -186,7 +201,7 @@ def fuse_plm_logits(
     # 3. Per-position class weights
     base_weights = np.array([
         cfg.class_weights.get(cls, 0.0) for cls in position_classes
-    ], dtype=np.float64)  # (L,)
+    ], dtype=np.float64) * float(cfg.global_strength)  # (L,)
     # Same weight for both models initially; can be specialized later.
     beta = base_weights.copy()
     gamma = base_weights.copy()
