@@ -138,6 +138,35 @@ due to fpocket parallelization).
 For "thousands of jobs" workflow: CPU is fully viable. Trade ~6× wall
 time for unlimited concurrent slurm slots.
 
+## Update 2:25 PM — final empirical lesson: trust measurements > predictions
+
+After full CPU validation completed (job 14122546):
+  CPU before OMP env: 21m54s (round-1)
+  CPU with OMP=8 env: **26m14s** (round-2) → 4 minutes SLOWER
+
+Codex prediction said OMP_NUM_THREADS=cpus would save 150-300s on CPU.
+Actual measurement: it HURT by 260s. Why? PyTorch/MPNN's default
+threading detects physical cores, not slurm allocation. On a hyper-
+threading node, OMP=8 (logical) was worse than the default (physical).
+
+**Decision (commit `085eb40`)**: dropped the OMP env-var change
+entirely. Empirical lesson > theoretical correctness.
+
+**Net round-2 wins (kept)**:
+- `fitness__delta_vs_wt` metric per design (no perf cost)
+- `utils/resources.py` auto-detect (diagnostic logging only)
+- `stage_struct_filter` Pool (small win on large pools)
+- `_struct_filter_worker` empty_row schema fix (consistency)
+- thread pinning: CPU-only when n_gpus==0
+
+**Net round-2 reverts (codex prediction wrong)**:
+- always-set torch threads in parent (oversubscription via Pool fork)
+- OMP_NUM_THREADS env in fused_mpnn subprocess (slowed both pipelines)
+
+**Final pipeline timings**:
+- GPU: ~4-5 min wall (sampling variance dominates over optimization)
+- CPU: ~22 min wall (back to round-1 baseline)
+
 ## Update 2:10 PM — round 2 efficiency wins + empirical lesson on threading
 
 **The empirical lesson** (codex r2 was theoretically right but empirically wrong on GPU):
