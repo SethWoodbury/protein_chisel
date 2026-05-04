@@ -152,6 +152,20 @@ class CycleConfig:
     # AAs at those positions. So sc=0 is now safe.
     use_side_chain_context: int = 0
     enhance: Optional[str] = None
+    # Per-cycle light-filter thresholds (annealing strategy). Default
+    # values match the global defaults so "constant" strategy is a no-op.
+    instability_max: float = 60.0
+    gravy_min: float = -0.8
+    gravy_max: float = 0.3
+    aliphatic_min: float = 40.0
+    boman_max: float = 4.5
+    # Per-cycle TOPSIS weight overrides (annealing strategy). Maps
+    # metric label -> weight; merged with the global default specs at
+    # ranking time. Empty dict = use global defaults.
+    topsis_weight_overrides: dict[str, float] = field(default_factory=dict)
+    # If True, this cycle's survivors_prev for the next cycle is chosen
+    # by TOPSIS (full multi-objective). If False (legacy), by fitness alone.
+    use_topsis_for_survivors: bool = False
 
 
 @dataclass
@@ -171,21 +185,24 @@ def default_cycles(
     pi_max: float = 7.5,
     fpocket_druggability_min: float = 0.30,
     clash_filter: bool = True,
+    strategy: str = "constant",
 ) -> list[CycleConfig]:
     """Three-cycle exploration → exploitation schedule.
 
-    ``omit_AA`` is the AAs MPNN may never sample.
-    ``use_side_chain_context``: 0 (default) for diverse first-shell
-    sampling (per ablation); pass 1 to give MPNN the catalytic
-    sidechain rotamers (more WT-conservative).
-    ``enhance``: optional fused_mpnn enhancer checkpoint name e.g.
-    ``"plddt_residpo_alpha_20250116-aec4d0c4"``. Boosts mean fitness
-    by ~0.02 nats/residue at a diversity cost.
+    ``strategy``:
+      - ``"constant"`` (default, legacy): all cycles share the same
+        filter thresholds and TOPSIS weights. Survivors fed forward
+        by fitness alone.
+      - ``"annealing"``: cycle 0 has gentle-loose light filters AND
+        fitness-heavy TOPSIS weights (explore); cycle 1 is balanced;
+        cycle 2 uses the strict default filters AND default TOPSIS
+        weights with TOPSIS-based survivor selection (exploit). Hard
+        filters (charge band, pi band) stay constant throughout per
+        the user's preference; only the LIGHT filters (instability,
+        GRAVY, aliphatic, boman) and TOPSIS weights anneal.
     """
-    # Per-monomer charge target: -18 < charge < -4. Covers the
-    # supercharged-PTE paper's -7/monomer (Sukhwal 2024, dimer = -14)
-    # plus a wider acceptable window. Same band on every cycle -- we
-    # do NOT tighten across cycles because that just over-constrains.
+    if strategy not in ("constant", "annealing"):
+        raise ValueError(f"strategy must be 'constant' or 'annealing', got {strategy!r}")
     common = dict(
         omit_AA=omit_AA,
         use_side_chain_context=use_side_chain_context,
@@ -194,24 +211,70 @@ def default_cycles(
         fpocket_druggability_min=fpocket_druggability_min,
         clash_filter=clash_filter,
     )
-    # All cycles share the same charge window (-18 < x < -4) and SAP
-    # threshold; we only tighten temperature across cycles for refined
-    # exploitation late.
+    # Charge band and pi band stay constant (user pref: "the current
+    # range should be the final one"). Annealing only relaxes the
+    # *light* filters (instability/GRAVY/aliphatic/boman) early and
+    # uses TOPSIS for survivor selection late.
+    if strategy == "constant":
+        return [
+            CycleConfig(
+                cycle_idx=0, n_samples=500, sampling_temperature=0.20,
+                net_charge_max=-4.0, net_charge_min=-18.0,
+                sap_max_threshold=100.0, **common,
+            ),
+            CycleConfig(
+                cycle_idx=1, n_samples=400, sampling_temperature=0.18,
+                net_charge_max=-4.0, net_charge_min=-18.0,
+                sap_max_threshold=100.0, **common,
+            ),
+            CycleConfig(
+                cycle_idx=2, n_samples=300, sampling_temperature=0.15,
+                net_charge_max=-4.0, net_charge_min=-18.0,
+                sap_max_threshold=100.0, **common,
+            ),
+        ]
+    # Annealing — gentle relaxation, never tighten beyond defaults.
+    # Cycle 0 (explore): light filters loose; TOPSIS heavy on fitness;
+    #                    survivors picked by fitness (legacy).
+    # Cycle 1 (transition): light filters slightly loose; balanced
+    #                    TOPSIS weights (defaults).
+    # Cycle 2 (exploit): light filters at default; default TOPSIS
+    #                    weights; survivors picked by TOPSIS so the
+    #                    final pool reinforces multi-objective good.
     return [
         CycleConfig(
             cycle_idx=0, n_samples=500, sampling_temperature=0.20,
             net_charge_max=-4.0, net_charge_min=-18.0,
-            sap_max_threshold=100.0, **common,
+            sap_max_threshold=100.0,
+            instability_max=80.0, gravy_min=-1.0, gravy_max=0.4,
+            aliphatic_min=30.0, boman_max=5.5,
+            topsis_weight_overrides={
+                "fitness": 3.0,            # explore aggressively on fitness
+                "instability": 0.1, "gravy": 0.1, "aliphatic": 0.1,
+                "boman": 0.1, "pocket_hydrophobicity": 0.1,
+            },
+            use_topsis_for_survivors=False,
+            **common,
         ),
         CycleConfig(
             cycle_idx=1, n_samples=400, sampling_temperature=0.18,
             net_charge_max=-4.0, net_charge_min=-18.0,
-            sap_max_threshold=100.0, **common,
+            sap_max_threshold=100.0,
+            instability_max=70.0, gravy_min=-0.9, gravy_max=0.35,
+            aliphatic_min=35.0, boman_max=5.0,
+            topsis_weight_overrides={},        # balanced (defaults)
+            use_topsis_for_survivors=True,
+            **common,
         ),
         CycleConfig(
             cycle_idx=2, n_samples=300, sampling_temperature=0.15,
             net_charge_max=-4.0, net_charge_min=-18.0,
-            sap_max_threshold=100.0, **common,
+            sap_max_threshold=100.0,
+            instability_max=60.0, gravy_min=-0.8, gravy_max=0.3,
+            aliphatic_min=40.0, boman_max=4.5,
+            topsis_weight_overrides={},        # balanced (defaults)
+            use_topsis_for_survivors=True,
+            **common,
         ),
     ]
 
@@ -2489,6 +2552,19 @@ def main() -> None:
                         "Rosetta no-repack metrics panel (DDG + interface "
                         "energy + ...) on the top-K only. ~30-60 s/design, "
                         "needs pyrosetta.sif. Default OFF.")
+    p.add_argument("--strategy", type=str, default="constant",
+                   choices=["constant", "annealing"],
+                   help="Cycle schedule: 'constant' = same filter "
+                        "thresholds + TOPSIS weights every cycle (legacy "
+                        "default); 'annealing' = light filters loose in "
+                        "cycle 0, tightening to defaults by cycle 2; "
+                        "TOPSIS weights fitness-heavy cycle 0, balanced "
+                        "cycle 1+; cycles 1+ pick survivors by TOPSIS "
+                        "(multi-objective) instead of by fitness alone. "
+                        "Hard filters (charge band, pi band, severe "
+                        "clash) stay constant across cycles in BOTH "
+                        "strategies — only the light/soft components "
+                        "anneal.")
     p.add_argument("--rank_weights", type=str, default="",
                    help="Multi-objective weight overrides as 'k=v,k=v'. "
                         "Keys can be metric labels: fitness, druggability, "
@@ -2783,7 +2859,20 @@ def main() -> None:
         pi_min=args.pi_min, pi_max=args.pi_max,
         fpocket_druggability_min=args.fpocket_druggability_min,
         clash_filter=not args.no_clash_filter,
+        strategy=args.strategy,
     )
+    LOGGER.info("strategy: %s", args.strategy)
+    if args.strategy == "annealing":
+        for c in cycles:
+            LOGGER.info(
+                "  cycle %d: instability_max=%.0f, gravy=[%.2f, %.2f], "
+                "aliphatic_min=%.0f, boman_max=%.1f, "
+                "topsis_overrides=%s, use_topsis=%s",
+                c.cycle_idx, c.instability_max, c.gravy_min, c.gravy_max,
+                c.aliphatic_min, c.boman_max,
+                c.topsis_weight_overrides or "(defaults)",
+                c.use_topsis_for_survivors,
+            )
     if args.cycles == 1:
         cycles = cycles[:1]   # short-test mode
     elif args.cycles != 3:
@@ -2822,17 +2911,56 @@ def main() -> None:
             omit_AA_per_residue=omit_AA_per_residue,
             balance_z_threshold=args.balance_z_threshold,
             design_ph=args.design_ph,
-            instability_max=args.instability_max,
-            gravy_min=args.gravy_min,
-            gravy_max=args.gravy_max,
-            aliphatic_min=args.aliphatic_min,
-            boman_max=args.boman_max,
+            # Per-cycle filter thresholds: in 'annealing' strategy these
+            # come from CycleConfig (which override global defaults);
+            # in 'constant' strategy CycleConfig fields == global defaults
+            # so this is a no-op.
+            instability_max=cyc.instability_max if args.strategy == "annealing"
+                            else args.instability_max,
+            gravy_min=cyc.gravy_min if args.strategy == "annealing"
+                      else args.gravy_min,
+            gravy_max=cyc.gravy_max if args.strategy == "annealing"
+                      else args.gravy_max,
+            aliphatic_min=cyc.aliphatic_min if args.strategy == "annealing"
+                          else args.aliphatic_min,
+            boman_max=cyc.boman_max if args.strategy == "annealing"
+                      else args.boman_max,
         )
         if ranked_df is not None and len(ranked_df) > 0:
             ranked_df = ranked_df.copy()
             ranked_df["cycle"] = cyc.cycle_idx
             all_ranked.append(ranked_df)
-            survivors_prev = ranked_df
+            # Per-cycle survivor selection: by fitness (legacy) OR by
+            # TOPSIS (annealing). When use_topsis_for_survivors is True,
+            # we compute the multi-objective score over the cycle's
+            # ranked_df and feed the top survivors (sorted by mo_topsis)
+            # into next cycle's consensus reinforcement, so the
+            # iteration improves on ALL objectives, not just fitness.
+            if cyc.use_topsis_for_survivors:
+                from protein_chisel.scoring.multi_objective import (
+                    DEFAULT_METRIC_SPECS, apply_cli_overrides,
+                    compute_topsis_scores_v2, parse_kv_string,
+                )
+                cycle_specs = apply_cli_overrides(
+                    DEFAULT_METRIC_SPECS,
+                    {**parse_kv_string(args.rank_weights),
+                     **cyc.topsis_weight_overrides},
+                    parse_kv_string(args.rank_targets),
+                )
+                cyc_scores, _used, _dbg = compute_topsis_scores_v2(
+                    ranked_df, cycle_specs,
+                )
+                ranked_df["mo_topsis_cycle"] = cyc_scores
+                survivors_prev = ranked_df.sort_values(
+                    "mo_topsis_cycle", ascending=False,
+                ).reset_index(drop=True)
+                LOGGER.info(
+                    "cycle %d survivors fed forward by TOPSIS: top score=%.3f",
+                    cyc.cycle_idx, float(cyc_scores.max()) if len(cyc_scores) else 0.0,
+                )
+            else:
+                # Legacy: by fitness alone.
+                survivors_prev = ranked_df
         all_pdb_maps.update(pdb_map)
 
     # ---- Final pool: concat + dedup --------------------------------
