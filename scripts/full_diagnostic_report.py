@@ -27,13 +27,23 @@ import numpy as np
 import pandas as pd
 
 
-WT_SEQ = (
-    # PTE_i1 wild-type sequence (length 202). Source: extracted from the
-    # seed PDB chain A.
-    "MIYRSGSAFGEAFREAAVRRLLEYREEYNVPLDIPLEHALAAGHVDIIDLGSEHTLPNDIIIRELLDPHF"
-    "ARNFPVGTKEFLDRYAAEDIDPSPYIRYRLAFEERHLKDPLAGFEEILEHIDKHKWAYNAYTHLDPIVYA"
-    "ANPHIQQRTGRIRMTDQNLPIPVAEAFAKLDSAEPVTEYIDFRGGLPATLSTGV"
-)
+def _extract_wt_from_seed(seed_pdb: Path | str = None, chain: str = "A") -> str:
+    """Extract the WT sequence from the seed PDB chain A. Falls back to
+    None if PDB extraction fails — caller can use a hardcoded value
+    or skip WT comparison.
+    """
+    try:
+        sys_path = Path(__file__).resolve().parents[1] / "src"
+        if str(sys_path) not in sys.path:
+            sys.path.insert(0, str(sys_path))
+        from protein_chisel.io.pdb import extract_sequence
+        return extract_sequence(seed_pdb, chain=chain) if seed_pdb else None
+    except Exception:
+        return None
+
+
+# Lazy-load: WT_SEQ is set when main() reads from --seed_pdb.
+WT_SEQ = ""
 
 
 def _baseline() -> dict[str, tuple[float, str]]:
@@ -150,6 +160,18 @@ def main() -> None:
     )
     args = p.parse_args()
     run_dir = args.run_dir
+
+    # Pull WT directly from seed PDB rather than hardcoding (was buggy).
+    global WT_SEQ
+    extracted = _extract_wt_from_seed(args.seed_pdb)
+    if extracted:
+        WT_SEQ = extracted
+        print(f"WT seq extracted from {args.seed_pdb.name}: L={len(WT_SEQ)}, "
+              f"first 30: {WT_SEQ[:30]}")
+    else:
+        print(f"WARN: could not extract WT sequence from {args.seed_pdb}; "
+              "WT comparison will use empty string.")
+        WT_SEQ = ""
 
     df_all = pd.read_csv(run_dir / "final_topk" / "all_survivors.tsv", sep="\t")
     df = df_all.sort_values("fitness__logp_fused_mean", ascending=False).head(args.top_k)

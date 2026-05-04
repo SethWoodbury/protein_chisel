@@ -119,6 +119,7 @@ class CycleConfig:
     sap_max_threshold: float = 100.0
     consensus_threshold: float = 0.85
     consensus_strength: float = 2.0
+    consensus_max_fraction: float = 0.30
     # pI window. With net_charge_no_HIS < -10 the cycle-0 design pI
     # distribution is 4.55-5.35 (WT is 4.58). pi_min=5.0 selects the
     # least-acidic tail (~1% pass cycle 0). Low pass rate is FINE in
@@ -186,6 +187,9 @@ def default_cycles(
     fpocket_druggability_min: float = 0.30,
     clash_filter: bool = True,
     strategy: str = "constant",
+    consensus_threshold: float = 0.85,
+    consensus_strength: float = 2.0,
+    consensus_max_fraction: float = 0.30,
 ) -> list[CycleConfig]:
     """Three-cycle exploration → exploitation schedule.
 
@@ -210,6 +214,9 @@ def default_cycles(
         pi_min=pi_min, pi_max=pi_max,
         fpocket_druggability_min=fpocket_druggability_min,
         clash_filter=clash_filter,
+        consensus_threshold=consensus_threshold,
+        consensus_strength=consensus_strength,
+        consensus_max_fraction=consensus_max_fraction,
     )
     # Charge band and pi band stay constant (user pref: "the current
     # range should be the final one"). Annealing only relaxes the
@@ -790,6 +797,13 @@ def stage_seq_filter(
     catalytic_resnos: Iterable[int] = (),
     design_ph: float = 7.5,
     fixed_resnos: Iterable[int] = (),
+    # N/C-term sequence pads added to the design body BEFORE computing
+    # sequence-only metrics. Default empty so legacy behavior is
+    # preserved; pass e.g. n_term_pad="MSG" / c_term_pad="GSA" so
+    # protparam reflects the full expressed protein after vector
+    # tags. Affects charge, pI, GRAVY, instability, aliphatic, boman.
+    n_term_pad: str = "",
+    c_term_pad: str = "",
     # Light de-novo filters on cheap sequence-only metrics. Generous
     # thresholds — only catch truly broken designs, not most of the pool.
     instability_max: float = 60.0,        # Guruprasad 1990; lit 40 is for natives
@@ -825,7 +839,10 @@ def stage_seq_filter(
         reasons: list[str] = []
         if len(seq) != wt_length:
             reasons.append(f"length {len(seq)} != WT {wt_length}")
-        pp = protparam_metrics(seq, ph=design_ph)
+        pp = protparam_metrics(
+            seq, ph=design_ph,
+            n_term_pad=n_term_pad, c_term_pad=c_term_pad,
+        )
         # Filter on the ROBUST full-HH charge (all 7 ionizables + termini).
         # The minimalist 'no_HIS' (still computed below as a diagnostic
         # column) is too lenient because it misses Cys/Tyr at high pH.
@@ -2265,6 +2282,9 @@ def run_cycle(
     gravy_max: float = 0.3,
     aliphatic_min: float = 40.0,
     boman_max: float = 4.5,
+    n_term_pad: str = "",
+    c_term_pad: str = "",
+    omit_M_at_pos1: bool = True,
 ) -> tuple[Optional[pd.DataFrame], dict[str, Path]]:
     """Run ONE iteration cycle. Returns (ranked DataFrame, pdb_map)."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -2287,6 +2307,7 @@ def run_cycle(
         cfg = IterationBiasConfig(
             consensus_threshold=cycle_cfg.consensus_threshold,
             consensus_strength=cycle_cfg.consensus_strength,
+            max_augmented_fraction=cycle_cfg.consensus_max_fraction,
         )
         bias_k, t = build_iteration_bias(
             base_bias=base_bias,
@@ -2397,6 +2418,22 @@ def run_cycle(
         cycle_cfg.cycle_idx, diversity_omit,
     )
     merged_omit = merge_omit_dicts(omit_AA_per_residue or {}, diversity_omit)
+    # Position-1 M omit: 100% of designs across rounds 1–7 had M at
+    # position 1 (the start codon Met from the seed PDB), giving zero
+    # diversity at that position. With an MSG vector tag (--n_term_pad
+    # MSG), the Met that the ribosome inserts is at position 1 of the
+    # tag, not position 1 of the design body — so the design body's
+    # position 1 is just an internal residue. Hard-omit M there to
+    # break the artifact.
+    if omit_M_at_pos1:
+        # MPNN expects per-residue label '<chain><resno>' with PDB resno;
+        # protein_resnos[0] is the first protein residue's pose-resno
+        # (1-indexed). Use that.
+        first_resno = sorted(protein_resnos)[0]
+        m_omit = {f"{CHAIN}{first_resno}": "M"}
+        merged_omit = merge_omit_dicts(merged_omit, m_omit)
+        LOGGER.info("cycle %d: pos-1 M omit added (%s)",
+                     cycle_cfg.cycle_idx, m_omit)
     cand_tsv = stage_sample(
         cycle_cfg=cycle_cfg, seed_pdb=seed_pdb, bias=bias_k,
         protein_resnos=protein_resnos, fixed_resnos=fixed_resnos,
@@ -2437,6 +2474,8 @@ def run_cycle(
         gravy_max=gravy_max,
         aliphatic_min=aliphatic_min,
         boman_max=boman_max,
+        n_term_pad=n_term_pad,
+        c_term_pad=c_term_pad,
     )
 
     # ---- 4. Struct filter -------------------------------------------
@@ -2552,6 +2591,23 @@ def main() -> None:
                         "Rosetta no-repack metrics panel (DDG + interface "
                         "energy + ...) on the top-K only. ~30-60 s/design, "
                         "needs pyrosetta.sif. Default OFF.")
+    p.add_argument("--consensus_threshold", type=float, default=0.85,
+                   help="Cycle k+1 consensus reinforcement: AA frequency "
+                        "across cycle-k survivors required to 'agree' "
+                        "before that AA's bias is reinforced. Default 0.85. "
+                        "Raise to 0.90+ to require stronger agreement and "
+                        "preserve diversity. Round-6/7 with 0.85 lost ~50% "
+                        "of pairwise hamming vs rounds 1-5 (when consensus "
+                        "was silently dead due to a class-name bug).")
+    p.add_argument("--consensus_strength", type=float, default=2.0,
+                   help="Bias magnitude (nats) added at consensus-agreed "
+                        "(position, AA) pairs. Default 2.0; lower (e.g. "
+                        "1.0) reduces over-collapse to consensus.")
+    p.add_argument("--consensus_max_fraction", type=float, default=0.30,
+                   help="Max fraction of eligible positions that consensus "
+                        "can augment per cycle. Default 0.30; lower (e.g. "
+                        "0.15) preserves more positional diversity by "
+                        "reinforcing only the strongest-agreement positions.")
     p.add_argument("--strategy", type=str, default="constant",
                    choices=["constant", "annealing"],
                    help="Cycle schedule: 'constant' = same filter "
@@ -2606,6 +2662,21 @@ def main() -> None:
                    help="Light filter on Boman index (PPI/sticky propensity). "
                         "Boman 2003 threshold ~2.5; default 4.5 catches only "
                         "extreme cases.")
+    p.add_argument("--n_term_pad", type=str, default="MSG",
+                   help="N-terminal sequence pad added to the design body "
+                        "BEFORE computing sequence-only metrics (charge, "
+                        "pI, GRAVY, instability, aliphatic, boman). "
+                        "Default 'MSG' matches a typical E. coli vector "
+                        "tag — the actual expressed protein is "
+                        "M-S-G-[design]-G-S-A. Pass '' to disable.")
+    p.add_argument("--c_term_pad", type=str, default="GSA",
+                   help="C-terminal sequence pad — see --n_term_pad. "
+                        "Default 'GSA'. Pass '' to disable.")
+    p.add_argument("--no_omit_M_at_pos1", action="store_true",
+                   help="By default, position 1 of the design body is "
+                        "hard-omitted from M (start codon Met is in the "
+                        "vector tag, not the design). Pass this flag to "
+                        "disable the omit and let MPNN sample M there.")
     p.add_argument("--design_ph", type=float, default=7.8,
                    help="pH at which net charge / pI / etc. are computed. "
                         "Default 7.8 (close to PTE assay buffer pH 8.0, "
@@ -2860,6 +2931,9 @@ def main() -> None:
         fpocket_druggability_min=args.fpocket_druggability_min,
         clash_filter=not args.no_clash_filter,
         strategy=args.strategy,
+        consensus_threshold=args.consensus_threshold,
+        consensus_strength=args.consensus_strength,
+        consensus_max_fraction=args.consensus_max_fraction,
     )
     LOGGER.info("strategy: %s", args.strategy)
     if args.strategy == "annealing":
@@ -2925,6 +2999,9 @@ def main() -> None:
                           else args.aliphatic_min,
             boman_max=cyc.boman_max if args.strategy == "annealing"
                       else args.boman_max,
+            n_term_pad=args.n_term_pad,
+            c_term_pad=args.c_term_pad,
+            omit_M_at_pos1=not args.no_omit_M_at_pos1,
         )
         if ranked_df is not None and len(ranked_df) > 0:
             ranked_df = ranked_df.copy()

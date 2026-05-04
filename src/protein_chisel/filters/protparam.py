@@ -106,11 +106,24 @@ class ProtParamResult:
         }
 
 
-def protparam_metrics(sequence: str, ph: float = 7.8) -> ProtParamResult:
+def protparam_metrics(
+    sequence: str,
+    ph: float = 7.8,
+    n_term_pad: str = "",
+    c_term_pad: str = "",
+) -> ProtParamResult:
     """Compute Biopython ProtParam metrics + multiple charge variants.
 
     Default pH 7.8 (close to the user's typical PTE assay buffer at
     pH 8.0, slightly under for safety margin).
+
+    ``n_term_pad`` / ``c_term_pad``: sequence flanks added to the design
+    body BEFORE computing sequence-only metrics. Useful when the
+    design will be expressed with a vector-added N/C terminus (e.g.
+    MSG + design + GSA) — padding lets charge, pI, instability,
+    GRAVY, aliphatic, boman, etc. reflect the actual expressed
+    protein. Length and AA composition are reported for the FULL
+    padded sequence; the caller can subtract pad lengths if needed.
 
     Returns five charge variants — pick whichever fits your context:
       - ``charge_at_pH_full_HH``   ROBUST default: HH on K/R/H/D/E/C/Y + termini
@@ -122,7 +135,11 @@ def protparam_metrics(sequence: str, ph: float = 7.8) -> ProtParamResult:
     The "pH7" suffix on three fields is historical (predates this rewrite);
     the actual pH used in all five is whatever ``ph`` is passed.
     """
-    seq = sequence.replace("*", "").upper()
+    # Pad the design body with N/C-term flanks BEFORE computing metrics
+    # so charge, pI, instability, GRAVY, aliphatic, boman all reflect
+    # the actual expressed protein (e.g. MSG-design-GSA after vector tags).
+    raw = (n_term_pad or "").upper() + sequence + (c_term_pad or "").upper()
+    seq = raw.replace("*", "").upper()
     # ProtParam fails on non-canonical AAs. Strip them; warn implicitly via
     # length difference if the caller cares.
     canonical = "".join(c for c in seq if c in "ACDEFGHIKLMNPQRSTVWY")
