@@ -316,7 +316,7 @@ def compute_graded_clash_bias(
     chain: str = CHAIN,
     cb_clearance_threshold: float = 5.0,
     eligible_classes: tuple[str, ...] = ("first_shell", "buried"),
-    bulky_aas: str = "YFWHMR",
+    bulky_aas: str = "YFWHMRK",   # K is as long as R (Cb->NZ ~6 A)
     # Per-AA bias = -bias_strength_per_pct_clash * clash_pct.
     # Crude 9-stub rotamer grid produces small clash percentages
     # (typically 0.1-0.3), so we need a high strength to give a
@@ -422,9 +422,16 @@ def compute_graded_clash_bias(
             continue
         cb = cb_by_resno[resno]
         ca = ca_by_resno[resno]
-        # Quick reject: if Cb is too far from ANY fixed sidechain, skip
+        # AA-aware quick reject. The shortest reach in bulky_aas
+        # determines the gating distance: if Cb is more than
+        # (longest_reach + cb_clearance_threshold) from ANY fixed
+        # sidechain, NO bulky AA can clash even with a fully extended
+        # rotamer; skip entirely. (Was a flat 5.0 A cutoff regardless
+        # of which AA we cared about, which over-flagged short-reach
+        # AAs like H at long-reach gating distances.)
+        max_reach = max(SIDECHAIN_REACH.get(aa, 0.0) for aa in bulky_aas)
         cb_min = float(np.linalg.norm(fixed_arr - cb, axis=1).min())
-        if cb_min >= cb_clearance_threshold:
+        if cb_min >= max_reach + 1.5:    # +1.5 A vdW slop
             continue
         # Build a coordinate frame at Cb
         cb_axis = (cb - ca) / max(np.linalg.norm(cb - ca), 1e-9)
@@ -436,17 +443,31 @@ def compute_graded_clash_bias(
         perp2 = np.cross(cb_axis, perp)
         perp2 /= max(np.linalg.norm(perp2), 1e-9)
 
+        # Cb->nearest-fixed-atom direction. If Cb-Cα-fixed_atom angle
+        # exceeds 110 deg the sidechain points AWAY from the fixed atom;
+        # short-reach AAs (H, M) cannot reach over the backbone to
+        # clash. We softer-bias those.
+        nearest_fixed_idx = int(np.argmin(np.linalg.norm(fixed_arr - cb, axis=1)))
+        nearest_fixed = fixed_arr[nearest_fixed_idx]
+        cb_to_fixed = nearest_fixed - cb
+        cb_to_fixed_norm = cb_to_fixed / max(np.linalg.norm(cb_to_fixed), 1e-9)
+        cos_axis_to_fixed = float(np.dot(cb_axis, cb_to_fixed_norm))
+        # cos_axis_to_fixed > 0  -> Cb points toward fixed atom (high-clash risk)
+        # cos_axis_to_fixed < 0  -> Cb points away (low risk for short reach)
         per_aa_clash_pct = {}
         for aa in bulky_aas:
             reach = SIDECHAIN_REACH.get(aa, 4.5)
+            # If Cb points away from fixed and AA reach is short,
+            # impossible to reach -> skip entirely.
+            if cos_axis_to_fixed < -0.3 and reach < 4.5:
+                per_aa_clash_pct[aa] = 0.0
+                continue
             n_clash = 0
             n_total = 0
             for d in rot_directions:
-                # Build tip = cb + reach * (rotated direction in CB frame)
                 tip = cb + reach * (
                     d[0] * cb_axis + d[1] * perp + d[2] * perp2
                 )
-                # Min distance from this tip to any fixed sidechain atom
                 d_min = float(np.linalg.norm(fixed_arr - tip, axis=1).min())
                 n_total += 1
                 if d_min < clash_atom_distance:
@@ -769,7 +790,7 @@ def stage_seq_filter(
 
 
 def _read_atoms(pdb_path: Path) -> list[dict]:
-    """Minimal stdlib PDB ATOM parser."""
+    """Minimal stdlib PDB ATOM/HETATM parser."""
     atoms = []
     with open(pdb_path) as fh:
         for line in fh:
@@ -777,6 +798,7 @@ def _read_atoms(pdb_path: Path) -> list[dict]:
                 continue
             try:
                 atoms.append({
+                    "record": line[:6].strip(),
                     "atom_name": line[12:16].strip(),
                     "res_name": line[17:20].strip(),
                     "chain_id": line[21].strip(),
@@ -789,6 +811,129 @@ def _read_atoms(pdb_path: Path) -> list[dict]:
             except (ValueError, IndexError):
                 continue
     return atoms
+
+
+def _detect_hbond_to_ligand(
+    pdb_path: Path,
+    chain: str = CHAIN,
+    distance_cutoff: float = 3.5,
+) -> list[dict]:
+    """Heavy-atom geometric H-bond detection: any HETATM atom (N/O/S)
+    within ``distance_cutoff`` of any protein donor/acceptor heavy atom.
+
+    Returned hits exclude trivial covalent contacts (within same residue).
+    """
+    atoms = _read_atoms(pdb_path)
+    DA_NAMES = {
+        "N", "O", "OD1", "OD2", "OE1", "OE2", "OG", "OG1", "OH",
+        "ND2", "NE", "NE1", "NE2", "NH1", "NH2", "NZ", "ND1", "SG",
+    }
+    protein = [
+        a for a in atoms
+        if (a["chain_id"] == chain and a["atom_name"] in DA_NAMES
+            and a["element"] in ("N", "O", "S"))
+    ]
+    ligand = [
+        a for a in atoms
+        if (a["record"] == "HETATM" and a["element"] in ("N", "O", "S"))
+    ]
+    hits = []
+    for L in ligand:
+        for p in protein:
+            d = ((L["x"]-p["x"])**2 + (L["y"]-p["y"])**2 + (L["z"]-p["z"])**2)**0.5
+            if d <= distance_cutoff:
+                hits.append({
+                    "ligand_resname": L["res_name"], "ligand_atom": L["atom_name"],
+                    "protein_resno": p["res_seq"], "protein_atom": p["atom_name"],
+                    "protein_resname": p["res_name"], "distance": round(d, 3),
+                })
+    return hits
+
+
+def _detect_ligand_contacts(
+    pdb_path: Path,
+    chain: str = CHAIN,
+    hbond_cutoff: float = 3.5,
+    salt_bridge_cutoff: float = 4.5,
+    aromatic_cutoff: float = 5.5,
+    hydrophobic_cutoff: float = 5.0,
+) -> dict:
+    """Cheap geometric detection of common protein↔ligand interactions.
+
+    All checks are heavy-atom distance only (no hydrogens, no angle
+    geometry). Sub-millisecond per design. Categories:
+
+      n_hbonds:        protein N/O/S ↔ ligand N/O/S (<= hbond_cutoff)
+      n_salt_bridges:  protein K/R sidechain N ↔ ligand O (<= salt_bridge_cutoff)
+                    + protein D/E sidechain O ↔ ligand N (<= salt_bridge_cutoff)
+      n_aromatic:      protein F/W/Y/H aromatic atom ↔ ligand C-aromatic
+                    (<= aromatic_cutoff, no plane-angle check)
+      n_hydrophobic:   protein A/V/L/I/M/F/W/Y/C ↔ ligand C
+                    (<= hydrophobic_cutoff)
+      n_total:         sum
+
+    Reported as metrics; not used as filters by default.
+    """
+    atoms = _read_atoms(pdb_path)
+    DA_NAMES = {"N","O","OD1","OD2","OE1","OE2","OG","OG1","OH",
+                "ND2","NE","NE1","NE2","NH1","NH2","NZ","ND1","SG"}
+    AROMATIC_NAMES_BY_RES = {
+        "PHE": {"CG","CD1","CD2","CE1","CE2","CZ"},
+        "TYR": {"CG","CD1","CD2","CE1","CE2","CZ"},
+        "TRP": {"CG","CD1","CD2","CE2","CE3","NE1","CZ2","CZ3","CH2"},
+        "HIS": {"CG","ND1","CE1","NE2","CD2"},
+        "HID": {"CG","ND1","CE1","NE2","CD2"},
+        "HIE": {"CG","ND1","CE1","NE2","CD2"},
+        "HIP": {"CG","ND1","CE1","NE2","CD2"},
+        "HIS_D": {"CG","ND1","CE1","NE2","CD2"},
+    }
+    HYDROPHOBIC_RESIDUES = {"ALA","VAL","LEU","ILE","MET","PHE","TRP","TYR","CYS"}
+    BASIC_NS = {"NZ", "NH1", "NH2"}        # K NZ; R NH1/NH2
+    ACIDIC_OS = {"OD1", "OD2", "OE1", "OE2"}
+
+    protein = [a for a in atoms if (a["chain_id"] == chain and a["record"] == "ATOM")]
+    ligand = [a for a in atoms if a["record"] == "HETATM"]
+    if not ligand or not protein:
+        return {"n_hbonds": 0, "n_salt_bridges": 0, "n_aromatic": 0,
+                "n_hydrophobic": 0, "n_total": 0}
+
+    n_hb = n_sb = n_aro = n_hyd = 0
+    hb2 = hbond_cutoff ** 2
+    sb2 = salt_bridge_cutoff ** 2
+    ar2 = aromatic_cutoff ** 2
+    hy2 = hydrophobic_cutoff ** 2
+    for L in ligand:
+        Lx, Ly, Lz = L["x"], L["y"], L["z"]
+        Lel = L["element"]
+        for p in protein:
+            dx = p["x"] - Lx; dy = p["y"] - Ly; dz = p["z"] - Lz
+            r2 = dx*dx + dy*dy + dz*dz
+            if r2 > ar2 and r2 > hy2:
+                continue
+            # H-bond
+            if (p["atom_name"] in DA_NAMES and p["element"] in ("N","O","S")
+                    and Lel in ("N","O","S") and r2 <= hb2):
+                n_hb += 1
+            # Salt bridge K/R-N ↔ ligand O   OR   D/E-O ↔ ligand N
+            if r2 <= sb2:
+                if p["atom_name"] in BASIC_NS and Lel == "O":
+                    n_sb += 1
+                elif p["atom_name"] in ACIDIC_OS and Lel == "N":
+                    n_sb += 1
+            # Aromatic
+            if (p["res_name"] in AROMATIC_NAMES_BY_RES
+                    and p["atom_name"] in AROMATIC_NAMES_BY_RES[p["res_name"]]
+                    and Lel == "C" and r2 <= ar2):
+                n_aro += 1
+            # Hydrophobic C-C
+            if (p["res_name"] in HYDROPHOBIC_RESIDUES
+                    and p["element"] == "C" and Lel == "C" and r2 <= hy2):
+                n_hyd += 1
+    return {
+        "n_hbonds": n_hb, "n_salt_bridges": n_sb,
+        "n_aromatic": n_aro, "n_hydrophobic": n_hyd,
+        "n_total": n_hb + n_sb + n_aro + n_hyd,
+    }
 
 
 def _detect_hbond_to_his_sidechain(
@@ -967,6 +1112,10 @@ def stage_struct_filter(
         hbonds = _detect_hbond_to_his_sidechain(pdb, catalytic_his_resnos)
         for h in hbonds:
             hbond_rows.append({"id": cid, **h})
+        # Cheap geometric ligand-contact panel: hbond, salt-bridge,
+        # aromatic, hydrophobic. Heavy-atom distance only, no hydrogens
+        # or angle geometry. Reported as metrics, not filters by default.
+        lc = _detect_ligand_contacts(pdb, chain=CHAIN)
         sap = _compute_sap_proxy(pdb) or {}
         sap_max = sap.get("sap_max", float("nan"))
         # Clash detection (catalytic + ligand vs designed sidechains)
@@ -988,6 +1137,11 @@ def stage_struct_filter(
             )
         rows.append({**row.to_dict(),
                      "n_hbonds_to_cat_his": len(hbonds),
+                     "ligand_contacts__n_hbonds": lc["n_hbonds"],
+                     "ligand_contacts__n_salt_bridges": lc["n_salt_bridges"],
+                     "ligand_contacts__n_aromatic": lc["n_aromatic"],
+                     "ligand_contacts__n_hydrophobic": lc["n_hydrophobic"],
+                     "ligand_contacts__n_total": lc["n_total"],
                      "sap_max": sap_max,
                      "sap_mean": sap.get("sap_mean", float("nan")),
                      "sap_p95": sap.get("sap_p95", float("nan")),
@@ -1295,6 +1449,116 @@ def stage_fpocket_rank(
                  float(ranked["fitness__logp_fused_mean"].iloc[0]) if len(ranked) else float('nan'),
                  float(ranked["fpocket__mean_alpha_sphere_radius"].iloc[0]) if len(ranked) else float('nan'))
     return out_path
+
+
+def stage_arpeggio_final(
+    *,
+    topk_pdb_dir: Path,
+    topk_tsv: Path,
+    out_dir: Path,
+) -> None:
+    """Run pdbe-arpeggio on the final top-K PDBs and merge per-design
+    contact counts into topk.tsv.
+
+    Arpeggio gives the proper physics panel: hbond / weak_hbond /
+    halogen / ionic / metal_complex / aromatic / hydrophobic /
+    carbonyl / polar / weak_polar / vdw / vdw_clash. Slow per-design
+    (~5-15 s for a small enzyme + ligand), so reserved for the final
+    characterization, not the inner sample/filter loop.
+
+    Spawns a separate apptainer call into esmc.sif (where pdbe-arpeggio
+    is installed via pip). If arpeggio fails or isn't available,
+    silently degrades -- topk.tsv just won't gain the arpeggio
+    columns. The simpler in-loop H-bond detection is independent.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    df = pd.read_csv(topk_tsv, sep="\t")
+    if "id" not in df.columns:
+        LOGGER.warning("stage_arpeggio_final: topk.tsv has no 'id' column; skipping")
+        return
+
+    # Build a one-shot script the inner apptainer call will run.
+    inner_script = out_dir / "_run_arpeggio_inner.py"
+    inner_script.write_text(
+        '"""Inner script: convert PDBs to mmCIF, run pdbe-arpeggio, dump per-id JSON."""\n'
+        'import sys, json\n'
+        'from pathlib import Path\n'
+        'sys.path.insert(0, "/code/src")\n'
+        'from protein_chisel.tools.arpeggio_interactions import arpeggio_interactions\n'
+        '\n'
+        'pdb_dir = Path(sys.argv[1])\n'
+        'out_path = Path(sys.argv[2])\n'
+        '\n'
+        'try:\n'
+        '    import biotite.structure.io.pdb as bpdb\n'
+        '    import biotite.structure.io.pdbx as pdbx_io\n'
+        '    have_biotite = True\n'
+        'except ImportError:\n'
+        '    have_biotite = False\n'
+        '\n'
+        'results = {}\n'
+        'errors = []\n'
+        'for pdb in sorted(pdb_dir.glob("*.pdb")):\n'
+        '    try:\n'
+        '        if have_biotite:\n'
+        '            cif = pdb.with_suffix(".cif")\n'
+        '            struct = bpdb.PDBFile.read(str(pdb)).get_structure(model=1)\n'
+        '            f = pdbx_io.CIFFile(); pdbx_io.set_structure(f, struct)\n'
+        '            f.write(str(cif))\n'
+        '            res = arpeggio_interactions(cif_path=cif, timeout=180)\n'
+        '            cif.unlink(missing_ok=True)\n'
+        '        else:\n'
+        '            res = arpeggio_interactions(cif_path=pdb, timeout=180)\n'
+        '        results[pdb.stem] = res.to_dict("arpeggio__")\n'
+        '    except Exception as e:\n'
+        '        errors.append((pdb.stem, str(e)[:200]))\n'
+        '        results[pdb.stem] = {}\n'
+        '\n'
+        'out_path.write_text(json.dumps({"results": results, "errors": errors}, indent=2))\n'
+    )
+
+    json_out = out_dir / "arpeggio_per_design.json"
+    cmd = [
+        "apptainer", "exec",
+        "--bind", "/home/woodbuse/codebase_projects/protein_chisel:/code",
+        "--bind", "/net/scratch",
+        "--env", "PYTHONPATH=/code/src",
+        "/net/software/containers/users/woodbuse/esmc.sif",
+        "python", str(inner_script),
+        str(topk_pdb_dir),
+        str(json_out),
+    ]
+    LOGGER.info("stage_arpeggio_final: running on %d top-K PDBs (this is slow, ~10s/PDB)",
+                 len(df))
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=3600, check=False,
+        )
+        if proc.returncode != 0:
+            LOGGER.warning("stage_arpeggio_final: arpeggio inner call rc=%d; "
+                            "stderr tail: %s", proc.returncode, proc.stderr[-500:])
+            return
+    except Exception as e:
+        LOGGER.warning("stage_arpeggio_final: exception spawning arpeggio: %s", e)
+        return
+
+    if not json_out.is_file():
+        LOGGER.warning("stage_arpeggio_final: arpeggio JSON not produced at %s", json_out)
+        return
+    data = json.loads(json_out.read_text())
+    LOGGER.info("stage_arpeggio_final: %d designs scored, %d errors",
+                 len(data["results"]), len(data["errors"]))
+
+    # Merge per-id columns into topk.tsv
+    rows: list[dict] = []
+    for _, row in df.iterrows():
+        cid = row["id"]
+        ad = data["results"].get(cid, {})
+        rows.append({**row.to_dict(), **ad})
+    enriched = pd.DataFrame(rows)
+    enriched_path = out_dir / "topk_with_arpeggio.tsv"
+    enriched.to_csv(enriched_path, sep="\t", index=False)
+    LOGGER.info("stage_arpeggio_final: wrote %s", enriched_path)
 
 
 def _hamming(a: str, b: str) -> int:
