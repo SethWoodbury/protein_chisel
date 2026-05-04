@@ -1270,106 +1270,55 @@ def stage_struct_filter(
     LOGGER.info("stage_struct_filter: input n=%d", len(df))
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-    from protein_chisel.structure import detect_clashes
+
+    # Build worker arg tuples. Per-design work (sap + clash + preorg +
+    # ligand_int + h-bond detection) is independent → Pool-able.
+    cat_his_list = list(catalytic_his_resnos)
+    fixed_list = list(fixed_resnos)
+    work_args: list[tuple] = []
+    for _, row in df.iterrows():
+        cid = row["id"]
+        pdb = pdb_map.get(cid)
+        work_args.append((
+            cid, pdb, cat_his_list, fixed_list,
+            clash_severe_distance, sap_max_threshold,
+            seed_dfi_metrics,
+        ))
+
+    from protein_chisel.utils.resources import pool_workers
+    n_workers = pool_workers(len(work_args), cap=8)
+    LOGGER.info(
+        "stage_struct_filter: input n=%d, n_workers=%d (parallel SAP+clash+"
+        "preorg+ligand_int)", len(df), n_workers,
+    )
+
+    if n_workers == 1:
+        results = [_struct_filter_worker(a) for a in work_args]
+    else:
+        from multiprocessing import Pool
+        with Pool(n_workers) as pool:
+            results = pool.map(_struct_filter_worker, work_args, chunksize=1)
+    by_cid = {cid: (row, hbonds, reasons) for cid, row, hbonds, reasons in results}
 
     rows: list[dict] = []
     hbond_rows: list[dict] = []
     for _, row in df.iterrows():
         cid = row["id"]
-        pdb = pdb_map.get(cid)
-        if pdb is None or not pdb.is_file():
-            rows.append({**row.to_dict(),
-                         "n_hbonds_to_cat_his": 0,
-                         "sap_max": float("nan"),
-                         "sap_mean": float("nan"),
-                         "sap_p95": float("nan"),
-                         "clash__n_total": 0,
-                         "clash__n_to_catalytic": 0,
-                         "clash__n_to_ligand": 0,
-                         "clash__has_severe": 0,
-                         "preorg__n_hbonds_to_cat": 0,
-                         "preorg__n_salt_bridges_to_cat": 0,
-                         "preorg__n_pi_to_cat": 0,
-                         "preorg__n_hbonds_within_shells": 0,
-                         "preorg__strength_total": 0.0,
-                         "preorg__interactome_density": 0.0,
-                         "preorg__n_first_shell": 0,
-                         "preorg__n_second_shell": 0,
-                         "passed_struct_filter": False,
-                         "struct_fail": f"pdb_missing: {pdb}"})
-            continue
-        hbonds = _detect_hbond_to_his_sidechain(pdb, catalytic_his_resnos)
-        for h in hbonds:
-            hbond_rows.append({"id": cid, **h})
-        # Cheap geometric protein<->ligand interaction panel via the
-        # generalizable tools.geometric_interactions module: H-bonds
-        # with antecedent-angle check, donor/acceptor type-aware salt
-        # bridges, π-π with plane angle, π-cation, hydrophobic, and
-        # vdW-clash detection -- each with a Gaussian strength score.
-        # ~50 ms/design. Replaces the previous embedded helper.
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-        from protein_chisel.tools.geometric_interactions import detect_interactions
-        panel = detect_interactions(pdb, chain=CHAIN, selection="protein_vs_ligand")
-        gi_metrics = panel.to_dict("ligand_int__")
-        sap = _compute_sap_proxy(pdb) or {}
-        sap_max = sap.get("sap_max", float("nan"))
-        # Clash detection (catalytic + ligand vs designed sidechains)
-        clash = detect_clashes(
-            pdb, catalytic_resnos=fixed_resnos, chain=CHAIN,
-            severe_distance=clash_severe_distance,
-        )
-        clash_dict = clash.to_dict()
-        # Preorganization metrics (informational, not a filter): geometric
-        # interactome around catalytic + first/second-shell residues.
-        # ~10-20 ms/design.
-        from protein_chisel.scoring.preorganization import preorganization_score
-        try:
-            preorg_metrics = preorganization_score(
-                pdb, catalytic_resnos=list(fixed_resnos), chain=CHAIN,
-            )
-        except Exception as e:  # pragma: no cover -- never block the pipeline
-            LOGGER.warning("preorganization failed for %s: %s", cid, e)
-            preorg_metrics = {
-                "preorg__n_hbonds_to_cat": 0,
-                "preorg__n_salt_bridges_to_cat": 0,
-                "preorg__n_pi_to_cat": 0,
-                "preorg__n_hbonds_within_shells": 0,
-                "preorg__strength_total": 0.0,
-                "preorg__interactome_density": 0.0,
-                "preorg__n_first_shell": 0,
-                "preorg__n_second_shell": 0,
-            }
-        # DFI is design-invariant for fixed-backbone designs (CA-only
-        # GNM gives same answer for every design). Computed ONCE on the
-        # seed at startup and broadcast here — saves ~80 ms/design ×
-        # ~200 designs = ~16 s/cycle.
-        dfi_metrics = seed_dfi_metrics or {
-            "dfi__mean": float("nan"), "dfi__std": float("nan"),
-            "dfi__min": float("nan"), "dfi__max": float("nan"),
-            "dfi__elapsed_ms": float("nan"),
-        }
-        reasons: list[str] = []
-        if len(hbonds) < 1:
-            reasons.append("no h-bonds to catalytic HIS")
-        if sap_max == sap_max and sap_max > sap_max_threshold:
-            reasons.append(f"sap_max={sap_max:.2f} > {sap_max_threshold}")
-        if clash_filter and clash.has_severe_clash:
-            reasons.append(
-                f"severe clash (n_cat={clash.clashes_to_catalytic}, "
-                f"n_lig={clash.clashes_to_ligand}, "
-                f"detail={clash_dict['clash__detail']})"
-            )
-        rows.append({**row.to_dict(),
-                     "n_hbonds_to_cat_his": len(hbonds),
-                     **gi_metrics,
-                     "sap_max": sap_max,
-                     "sap_mean": sap.get("sap_mean", float("nan")),
-                     "sap_p95": sap.get("sap_p95", float("nan")),
-                     **clash_dict,
-                     **preorg_metrics,
-                     **dfi_metrics,
-                     "passed_struct_filter": not reasons,
-                     "struct_fail": "; ".join(reasons)})
+        wrow, hbonds_, reasons = by_cid.get(cid, ({}, [], ["worker_missing"]))
+        hbond_rows.extend(hbonds_)
+        # Apply severe-clash filter (worker doesn't have clash_filter flag)
+        if clash_filter and wrow.get("clash__has_severe"):
+            reasons = list(reasons) + [
+                f"severe clash (n_cat={wrow.get('clash__n_to_catalytic',0)}, "
+                f"n_lig={wrow.get('clash__n_to_ligand',0)}, "
+                f"detail={wrow.get('clash__detail','')})"
+            ]
+        rows.append({
+            **row.to_dict(),
+            **wrow,
+            "passed_struct_filter": not reasons,
+            "struct_fail": "; ".join(reasons),
+        })
 
     out_df = pd.DataFrame(rows)
     if len(out_df) > 0 and "passed_struct_filter" in out_df.columns:
@@ -1402,8 +1351,15 @@ def stage_fitness_score(
     log_probs_saprot: np.ndarray,
     weights_per_position: np.ndarray,
     fitness_cache: dict,
+    wt_fitness: Optional[float] = None,
 ) -> Path:
-    """Score each survivor's fitness from cached PLM marginals."""
+    """Score each survivor's fitness from cached PLM marginals.
+
+    If ``wt_fitness`` is provided, also computes
+    ``fitness__delta_vs_wt = design - wt_fitness`` per row.
+    Positive = design is more PLM-natural per residue than WT;
+    negative = design is less natural than WT.
+    """
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
     from protein_chisel.sampling.fitness_score import score_dataframe_fitness
 
@@ -1415,12 +1371,23 @@ def stage_fitness_score(
         df, log_probs_esmc, log_probs_saprot, weights_per_position,
         fitness_cache=fitness_cache,
     )
+    if wt_fitness is not None and "fitness__logp_fused_mean" in scored.columns:
+        scored["fitness__delta_vs_wt"] = (
+            scored["fitness__logp_fused_mean"] - wt_fitness
+        )
+        scored["fitness__wt_logp_fused"] = float(wt_fitness)
     out_path = out_dir / "scored.tsv"
     scored.to_csv(out_path, sep="\t", index=False)
-    LOGGER.info(
-        "stage_fitness_score: cache size now %d; logp_fused mean=%.3f",
-        len(fitness_cache), float(scored["fitness__logp_fused_mean"].mean()),
+    log_msg = (
+        f"stage_fitness_score: cache size now {len(fitness_cache)}; "
+        f"logp_fused mean={float(scored['fitness__logp_fused_mean'].mean()):.3f}"
     )
+    if wt_fitness is not None:
+        log_msg += (
+            f", wt={wt_fitness:.3f}, "
+            f"delta_vs_wt mean={float(scored['fitness__delta_vs_wt'].mean()):+.3f}"
+        )
+    LOGGER.info(log_msg)
     return out_path
 
 
@@ -1828,6 +1795,97 @@ def annotate_seed_tunnel_residues(
     return out_path
 
 
+def _struct_filter_worker(args: tuple) -> tuple:
+    """Module-level per-design struct-filter worker (Pool-friendly).
+
+    Args tuple:
+        (cid, pdb_path, catalytic_his_resnos, fixed_resnos,
+         clash_severe_distance, sap_max_threshold)
+    Returns: (cid, row_dict, hbond_list, struct_fail_reasons)
+    """
+    (cid, pdb, cat_his, fixed_, sev_dist, sap_max_thr,
+     seed_dfi_metrics_) = args
+    if pdb is None or not Path(pdb).is_file():
+        empty_row = {
+            "n_hbonds_to_cat_his": 0,
+            "sap_max": float("nan"), "sap_mean": float("nan"),
+            "sap_p95": float("nan"),
+            "clash__n_total": 0, "clash__n_to_catalytic": 0,
+            "clash__n_to_ligand": 0, "clash__has_severe": 0,
+            "preorg__n_hbonds_to_cat": 0,
+            "preorg__n_salt_bridges_to_cat": 0,
+            "preorg__n_pi_to_cat": 0,
+            "preorg__n_hbonds_within_shells": 0,
+            "preorg__strength_total": 0.0,
+            "preorg__interactome_density": 0.0,
+            "preorg__n_first_shell": 0, "preorg__n_second_shell": 0,
+            "struct_fail_reason": f"pdb_missing: {pdb}",
+            "_passed": False,
+        }
+        return cid, empty_row, [], [f"pdb_missing: {pdb}"]
+    # Lazy imports inside worker so each Pool process re-imports cleanly.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from protein_chisel.tools.geometric_interactions import detect_interactions
+    from protein_chisel.scoring.preorganization import preorganization_score
+    from protein_chisel.structure import detect_clashes
+
+    # H-bond to catalytic HIS
+    hbonds = _detect_hbond_to_his_sidechain(pdb, cat_his)
+    hbond_dicts = [{"id": cid, **h} for h in hbonds]
+
+    # Geometric interaction panel (~50 ms)
+    panel = detect_interactions(pdb, chain=CHAIN, selection="protein_vs_ligand")
+    gi_metrics = panel.to_dict("ligand_int__")
+
+    # SAP proxy via freesasa
+    sap = _compute_sap_proxy(pdb) or {}
+    sap_max = sap.get("sap_max", float("nan"))
+
+    # Clash detection (catalytic + ligand vs designed sidechains)
+    clash = detect_clashes(
+        pdb, catalytic_resnos=fixed_, chain=CHAIN,
+        severe_distance=sev_dist,
+    )
+    clash_dict = clash.to_dict()
+
+    # Preorganization (~10-20 ms)
+    try:
+        preorg_metrics = preorganization_score(
+            pdb, catalytic_resnos=list(fixed_), chain=CHAIN,
+        )
+    except Exception as e:    # pragma: no cover
+        LOGGER.warning("preorganization failed for %s: %s", cid, e)
+        preorg_metrics = {
+            "preorg__n_hbonds_to_cat": 0,
+            "preorg__n_salt_bridges_to_cat": 0,
+            "preorg__n_pi_to_cat": 0,
+            "preorg__n_hbonds_within_shells": 0,
+            "preorg__strength_total": 0.0,
+            "preorg__interactome_density": 0.0,
+            "preorg__n_first_shell": 0, "preorg__n_second_shell": 0,
+        }
+
+    # Filter reasons
+    reasons: list[str] = []
+    if len(hbonds) < 1:
+        reasons.append("no h-bonds to catalytic HIS")
+    if sap_max == sap_max and sap_max > sap_max_thr:
+        reasons.append(f"sap_max={sap_max:.2f} > {sap_max_thr}")
+    # Severe-clash filter applied by caller (it has the boolean flag).
+
+    row = {
+        "n_hbonds_to_cat_his": len(hbonds),
+        **gi_metrics,
+        "sap_max": sap_max,
+        "sap_mean": sap.get("sap_mean", float("nan")),
+        "sap_p95": sap.get("sap_p95", float("nan")),
+        **clash_dict,
+        **preorg_metrics,
+        **(seed_dfi_metrics_ or {}),
+    }
+    return cid, row, hbond_dicts, reasons
+
+
 def _fpocket_worker(args: tuple) -> tuple:
     """Module-level fpocket worker — must be picklable for Pool().
 
@@ -1868,16 +1926,12 @@ def stage_fpocket_rank(
     fpocket_dir = out_dir / "per_design_fpocket"
     fpocket_dir.mkdir(exist_ok=True)
 
-    # Parallelize fpocket invocations across CPUs. Each call is a
-    # standalone fpocket subprocess writing to its own temp dir.
-    # Speedup: ~N× where N = min(cpus, n_designs). Saves the bulk of
-    # cycle time (fpocket was ~41% of total wall before).
-    import os as _os
-    cpus_available = (
-        len(_os.sched_getaffinity(0))
-        if hasattr(_os, "sched_getaffinity") else (_os.cpu_count() or 1)
-    )
-    n_workers = max(1, min(cpus_available, len(df), 8))   # cap at 8
+    # Parallelize fpocket invocations across CPUs (uses centralized
+    # resource detection). Each call is a standalone fpocket subprocess
+    # writing to its own temp dir.
+    from protein_chisel.utils.resources import pool_workers, detect_n_cpus
+    cpus_available, _src = detect_n_cpus()
+    n_workers = pool_workers(len(df), cpu_budget=cpus_available, cap=8)
     LOGGER.info(
         "stage_fpocket_rank: input n=%d (active-site constraint=%s, "
         "n_workers=%d/%d cpus)",
@@ -2319,6 +2373,7 @@ def run_cycle(
     seed_position_class: Optional[list[str]] = None,
     seed_protein_resnos: Optional[list[int]] = None,
     seed_dfi_metrics: Optional[dict] = None,
+    wt_fitness: Optional[float] = None,
     position_table_df=None,           # for first-shell diversity injection
     omit_AA_per_residue: Optional[dict[str, str]] = None,
     catalytic_his_resnos: Iterable[int] = CATALYTIC_HIS_RESNOS,
@@ -2552,6 +2607,7 @@ def run_cycle(
         log_probs_saprot=log_probs_saprot,
         weights_per_position=weights_per_position,
         fitness_cache=fitness_cache,
+        wt_fitness=wt_fitness,
     )
 
     # ---- 6. Fpocket rank (constrained to active-site pocket) -------
@@ -2775,6 +2831,18 @@ def main() -> None:
     run_dir = args.out_root / f"iterative_design_v2_PTE_i1_{timestamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
     LOGGER.info("=== run dir: %s ===", run_dir)
+
+    # ---- Detect available compute resources -----------------------------
+    # Single source of truth for CPU/GPU counts; consumed by all parallel
+    # stages (fpocket, struct_filter, restore_sample_dir). Also configures
+    # PyTorch thread count to match the slurm allocation (avoids
+    # oversubscription when running on a CPU node with cpus_per_task < total cores).
+    from protein_chisel.utils.resources import (
+        detect_resources, configure_torch_threads,
+    )
+    resources = detect_resources()
+    if resources.n_gpus == 0:
+        configure_torch_threads(resources.n_cpus)
 
     # ---- Load PLM artifacts -----------------------------------------
     art = args.plm_artifacts_dir
@@ -3026,6 +3094,28 @@ def main() -> None:
     except Exception as exc:
         LOGGER.warning("seed DFI compute failed (%s); designs get NaN", exc)
 
+    # ---- Pre-compute WT fitness once (PLM gather on the seed sequence) ---
+    # Used to populate `fitness__delta_vs_wt` per design row. Positive
+    # delta = more PLM-natural per residue than WT.
+    wt_fitness: Optional[float] = None
+    try:
+        from protein_chisel.sampling.fitness_score import (
+            fitness_from_seed_marginals,
+        )
+        wt_res = fitness_from_seed_marginals(
+            wt_seq, log_probs_esmc, log_probs_saprot, weights_per_position,
+        )
+        wt_fitness = float(wt_res.logp_fused_mean)
+        LOGGER.info(
+            "WT fitness (gather on seed sequence): logp_fused=%.4f "
+            "(esmc=%.4f, saprot=%.4f). delta_vs_wt > 0 means design is "
+            "more PLM-natural per residue than WT.",
+            wt_res.logp_fused_mean, wt_res.logp_esmc_mean,
+            wt_res.logp_saprot_mean,
+        )
+    except Exception as exc:
+        LOGGER.warning("WT fitness compute failed (%s); delta_vs_wt = NaN", exc)
+
     # ---- Loop cycles ------------------------------------------------
     all_ranked: list[pd.DataFrame] = []
     all_pdb_maps: dict[str, Path] = {}
@@ -3054,6 +3144,7 @@ def main() -> None:
             seed_position_class=position_classes,
             seed_protein_resnos=protein_resnos,
             seed_dfi_metrics=seed_dfi_metrics,
+            wt_fitness=wt_fitness,
             position_table_df=pt.df,
             omit_AA_per_residue=omit_AA_per_residue,
             balance_z_threshold=args.balance_z_threshold,
