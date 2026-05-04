@@ -138,6 +138,35 @@ due to fpocket parallelization).
 For "thousands of jobs" workflow: CPU is fully viable. Trade ~6× wall
 time for unlimited concurrent slurm slots.
 
+## Update 1:25 PM — round 2 efficiency landed
+
+User asked for delta_fitness_vs_wt + further parallelization + auto-detect.
+
+Done (commit `8db934c`):
+1. **`fitness__delta_vs_wt` per design**: WT fitness computed once at
+   startup via `fitness_from_seed_marginals(wt_seq, ...)`. Each design
+   row gets `fitness__delta_vs_wt = design - wt_fitness` and
+   `fitness__wt_logp_fused = wt`. Positive = design more PLM-natural
+   per residue than WT.
+
+2. **`utils/resources.py`**: centralized resource detection.
+   - `detect_n_cpus()`: slurm-aware (SLURM_CPUS_PER_TASK > affinity > cpu_count)
+   - `detect_n_gpus()`: torch.cuda.device_count() > nvidia-smi -L > 0
+   - `pool_workers(n_jobs, cap=8, min_for_pool=3)`: single decision
+     point for Pool sizing, used by all parallel stages
+   - `configure_torch_threads()`: pins torch threads to slurm allocation
+     when running on CPU (avoids oversubscription)
+   - Logs `ResourceInfo(...)` line at startup so the user sees the
+     resource budget the script is using.
+
+3. **`stage_struct_filter` parallelization**: was sequential ~13s/cycle
+   (SAP + clash + preorg + ligand_int + h-bond per design). Now Pool
+   uses `_struct_filter_worker` at module scope. Same correctness (
+   severe-clash filter applied caller-side after worker returns).
+
+Round-2 GPU validation submitted (job 14122473) — running.
+Codex round-2 review submitted in parallel — running.
+
 ## Compute WT fitness for comparison
 
 Computed direct from seed PDB + cached PLM artifacts:
