@@ -802,6 +802,16 @@ def stage_seq_filter(
     # preserved; pass e.g. n_term_pad="MSG" / c_term_pad="GSA" so
     # protparam reflects the full expressed protein after vector
     # tags. Affects charge, pI, GRAVY, instability, aliphatic, boman.
+    # N/C-term sequence pads added to the design body BEFORE computing
+    # ProtParam metrics (charge, pI, GRAVY, instability, aliphatic,
+    # boman). The expression rule engine deliberately sees the UNPADDED
+    # design body so its structure-aware rules (kr_neighbor_dibasic
+    # etc.) align with the seed PDB's per-residue SS / SASA / class.
+    # Per the user's spec: "use these N- and C-term adds for sequence-
+    # specific, structure-agnostic calculations." Junction-induced
+    # liabilities (e.g. dibasic spanning the tag/design boundary) are
+    # NOT caught here — would require a separate expression-engine
+    # invocation on the padded sequence with no structure context.
     n_term_pad: str = "",
     c_term_pad: str = "",
     # Light de-novo filters on cheap sequence-only metrics. Generous

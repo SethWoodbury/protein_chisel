@@ -173,7 +173,15 @@ DEFAULT_METRIC_SPECS: list[MetricSpec] = [
 
 
 def _normalize_axis(values: np.ndarray, spec: MetricSpec) -> np.ndarray:
-    """Normalize values to [0, 1] where 1 = ideal. Handles NaN as 0.5."""
+    """Normalize values to [0, 1] where 1 = ideal.
+
+    NaN handling: replaced with the column's mean (so NaN rows score
+    near-neutral after min-max normalization for direction == 'max'
+    or 'min'). For direction == 'target', a NaN takes the mean's
+    distance-to-target as its surrogate score — this is non-neutral
+    but acceptable in practice (NaN should be rare; if it isn't, the
+    spec's column shouldn't be in the ranking basket).
+    """
     v = np.where(np.isnan(values), np.nanmean(values) if not np.isnan(values).all() else 0.5, values)
     if spec.direction == "max":
         lo, hi = float(v.min()), float(v.max())
