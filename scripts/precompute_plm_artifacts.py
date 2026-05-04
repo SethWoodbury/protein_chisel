@@ -54,18 +54,20 @@ def main() -> None:
     )
     p.add_argument(
         "--saprot_model", default="saprot_35m",
-        choices=["saprot_35m", "saprot_650m", "saprot_1.3b"],
-        help="SaProt model variant. From westlake-repl on HF: "
+        choices=["saprot_35m", "saprot_650m", "saprot_650m_af2", "saprot_1.3b"],
+        help="SaProt model variant. From westlake-repl on HF, all four "
+             "now cached at /net/databases/huggingface/saprot/hub: "
              "saprot_35m = SaProt_35M_AF2 (35M params, 40M AF2 structures; "
              "default, ~10s on H100). "
-             "saprot_650m = SaProt_650M_PDB (650M params, 40M AF2 phase1 + "
-             "60K PDB phase2; ~3× slower). "
-             "saprot_1.3b = SaProt_1.3B_AFDB_OMG_NCBI (1.3B params, "
-             "40M AF2 + 200M OMG_prot50 + 150M NCBI 70%% identity-filtered; "
-             "~10× slower, ~6 GB VRAM, broadest pretraining). All three "
-             "are cached at /net/databases/huggingface/saprot/hub. "
-             "(SaProt_650M_AF2 also exists upstream but is NOT cached "
-             "locally.)",
+             "saprot_650m = SaProt_650M_PDB (650M, 40M AF2 phase1 + 60K "
+             "PDB phase2; ~3× slower). "
+             "saprot_650m_af2 = SaProt_650M_AF2 (650M, AF2-only pretrain; "
+             "added 2026-05-04 because the upstream README documents "
+             "experimental benchmarking against this checkpoint; not yet "
+             "validated in our pipeline). "
+             "saprot_1.3b = SaProt_1.3B_AFDB_OMG_NCBI (1.3B, 40M AF2 + "
+             "200M OMG_prot50 + 150M NCBI 70%% identity-filtered; ~10× "
+             "slower, ~6 GB VRAM, broadest pretraining).",
     )
     p.add_argument("--device", default="auto",
                    help="'auto' picks cuda if available else cpu. Pass "

@@ -873,19 +873,41 @@ def classify_positions(
         df[df["is_protein"]]["class"].value_counts().to_dict(),
     )
 
-    # Persist schema version + config + SASA source as actual columns
-    # so they survive parquet round-trips (codex flagged df.attrs is not
-    # round-trip-safe via pyarrow). Also lets users compare designs in
-    # the same parquet that may have different SASA backends.
+    # Persist schema version, preset, and SASA source as actual columns.
+    # Short ASCII strings; safe in TSV/parquet round-trip.
     df["schema_version"] = POSITION_TABLE_SCHEMA_VERSION
     df["classify_preset"] = cfg.preset_name
-    df["classify_config_json"] = json.dumps(asdict(cfg))
     df["sasa_source"] = sasa_source
-    # Also stash on attrs for in-memory access (best-effort).
-    df.attrs["classify_config"] = df["classify_config_json"].iloc[0]
+    # Stash config JSON on df.attrs (in-memory access). For durable
+    # storage, callers should write `classify_config_sidecar(df, path)`
+    # which produces a side-car JSON next to the table. Embedding the
+    # JSON as a per-row column produced TSV escaping bugs (the embedded
+    # `"`-chars broke pandas to_csv writers in some versions, leaving
+    # trailing junk lines that downstream readers parsed as NaN rows).
+    df.attrs["classify_config"] = json.dumps(asdict(cfg))
     df.attrs["schema_version"] = POSITION_TABLE_SCHEMA_VERSION
 
     return PositionTable(df=df)
+
+
+def classify_config_sidecar(pt: PositionTable, table_path: Path) -> Path:
+    """Write the ClassifyConfig JSON next to the PositionTable file.
+
+    Produces ``<table_path>.classify_config.json`` with the config dict
+    and schema version. Caller passes the table path (after writing it).
+    Returns the side-car path.
+    """
+    side = Path(table_path).with_suffix(
+        Path(table_path).suffix + ".classify_config.json",
+    )
+    payload = {
+        "schema_version": pt.df.attrs.get(
+            "schema_version", POSITION_TABLE_SCHEMA_VERSION,
+        ),
+        "config": pt.df.attrs.get("classify_config", "{}"),
+    }
+    side.write_text(json.dumps(payload, indent=2))
+    return side
 
 
 __all__ = [
@@ -894,5 +916,6 @@ __all__ = [
     "LEGACY_CLASS_REMAP",
     "ClassifyConfig",
     "classify_positions",
+    "classify_config_sidecar",
     "remap_legacy_class",
 ]

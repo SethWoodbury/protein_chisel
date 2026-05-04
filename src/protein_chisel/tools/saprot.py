@@ -97,9 +97,10 @@ def sa_tokens_from_pdb(pdb_path: str | Path, chain: Optional[str] = None) -> str
 
 
 SAPROT_MODELS = {
-    "saprot_35m": "westlake-repl/SaProt_35M_AF2",
-    "saprot_650m": "westlake-repl/SaProt_650M_PDB",
-    "saprot_1.3b": "westlake-repl/SaProt_1.3B_AFDB_OMG_NCBI",
+    "saprot_35m":      "westlake-repl/SaProt_35M_AF2",
+    "saprot_650m":     "westlake-repl/SaProt_650M_PDB",     # PDB phase-2 fine-tune
+    "saprot_650m_af2": "westlake-repl/SaProt_650M_AF2",     # AF2-only training
+    "saprot_1.3b":     "westlake-repl/SaProt_1.3B_AFDB_OMG_NCBI",
 }
 
 
