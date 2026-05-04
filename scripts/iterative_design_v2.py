@@ -2489,6 +2489,29 @@ def main() -> None:
                         "Rosetta no-repack metrics panel (DDG + interface "
                         "energy + ...) on the top-K only. ~30-60 s/design, "
                         "needs pyrosetta.sif. Default OFF.")
+    p.add_argument("--rank_weights", type=str, default="",
+                   help="Multi-objective weight overrides as 'k=v,k=v'. "
+                        "Keys can be metric labels: fitness, druggability, "
+                        "lig_int_strength, preorg_strength, hbonds_to_cat, "
+                        "instability, sap_max, boman, aliphatic, gravy, "
+                        "charge, pi, bottleneck, pocket_hydrophobicity. "
+                        "Default weights — fitness=2.0, druggability=1.0, "
+                        "lig_int_strength=1.0, preorg_strength=0.7, "
+                        "hbonds_to_cat=0.5, instability=0.5, sap_max=0.5, "
+                        "all target metrics 0.3 (boman, aliphatic, gravy, "
+                        "charge, pi, bottleneck) + 0.2 (pocket_hydrophobicity). "
+                        "Set weight=0 to drop a metric from ranking.")
+    p.add_argument("--rank_targets", type=str, default="",
+                   help="Multi-objective target value overrides. Same key "
+                        "names as --rank_weights. Example: "
+                        "'aliphatic=100,boman=2.0,charge=-12'. Only "
+                        "applies to target-direction metrics.")
+    p.add_argument("--min_hamming_active", type=int, default=0,
+                   help="Minimum active-site (primary_sphere) Hamming "
+                        "between top-K designs, alongside the full-"
+                        "sequence Hamming. Default 0 (disabled). Set "
+                        "≥ 2 to enforce active-site diversity even "
+                        "between designs that differ globally.")
     p.add_argument("--instability_max", type=float, default=60.0,
                    help="Light filter on Guruprasad 1990 instability index. "
                         "Lit threshold for native E. coli expression is 40, "
@@ -2831,18 +2854,86 @@ def main() -> None:
                 "fpocket-druggability filter: %d -> %d (cutoff=%.2f)",
                 n_before, len(pool), druggability_min,
             )
+        # ---- Multi-objective ranking over the full pool ---------------
+        # TOPSIS over a configurable basket of metrics with CLI-tunable
+        # weights / targets. Replaces the legacy 2-key (fitness,
+        # alpha_radius) sort. The legacy sort is still computed and
+        # written as `legacy_rank_score` for back-compat / debugging.
+        from protein_chisel.scoring.multi_objective import (
+            DEFAULT_METRIC_SPECS, apply_cli_overrides, compute_topsis_scores_v2,
+            parse_kv_string, select_diverse_topk_two_axis,
+        )
+        rank_weights = parse_kv_string(args.rank_weights)
+        rank_targets = parse_kv_string(args.rank_targets)
+        active_specs = apply_cli_overrides(
+            DEFAULT_METRIC_SPECS, rank_weights, rank_targets,
+        )
+        scores, used_specs, _debug = compute_topsis_scores_v2(pool, active_specs)
+        pool["mo_topsis"] = scores
+        # Legacy diagnostic — keep next to mo_topsis so we can compare.
+        pool["legacy_rank_score"] = (
+            pool["fitness__logp_fused_mean"].rank(ascending=False)
+            + pool["fpocket__mean_alpha_sphere_radius"].rank(ascending=True)
+        )
         pool = pool.sort_values(
-            ["fitness__logp_fused_mean", "fpocket__mean_alpha_sphere_radius"],
-            ascending=[False, True], na_position="last",
+            ["mo_topsis", "fitness__logp_fused_mean"],
+            ascending=[False, False], na_position="last",
         ).reset_index(drop=True)
         pool.to_csv(final_dir / "all_survivors.tsv", sep="\t", index=False)
         LOGGER.info("final pool: %d unique survivors across %d cycles",
                      len(pool), len(all_ranked))
+        LOGGER.info("multi-objective ranking applied with %d active specs:",
+                     len(used_specs))
+        for s in used_specs:
+            LOGGER.info("  %-25s direction=%-7s weight=%.2f target=%s",
+                         s.label, s.direction, s.weight, s.target)
+        LOGGER.info("top-5 mo_topsis scores: %s",
+                     pool["mo_topsis"].head(5).round(3).tolist())
 
-        topk_tsv = stage_diverse_topk(
-            pool_df=pool, pdb_map=all_pdb_maps,
-            out_dir=final_dir,
-            target_k=args.target_k, min_hamming=args.min_hamming,
+        # ---- Diverse top-K (full + active-site Hamming) ---------------
+        # Build position-index list for primary_sphere from the
+        # re-classified PositionTable so the active-site Hamming gate
+        # has the right indices.
+        primary_positions: Optional[list[int]] = None
+        if args.min_hamming_active > 0:
+            try:
+                pt_protein = pt.df[pt.df["is_protein"]].sort_values("resno").reset_index(drop=True)
+                primary_positions = [
+                    i for i, cls in enumerate(pt_protein["class"].astype(str).tolist())
+                    if cls == "primary_sphere"
+                ]
+                LOGGER.info(
+                    "active-site Hamming gate: %d primary_sphere positions, "
+                    "min_hamming_active=%d",
+                    len(primary_positions), args.min_hamming_active,
+                )
+            except Exception as exc:
+                LOGGER.warning("could not extract primary positions: %s", exc)
+
+        top = select_diverse_topk_two_axis(
+            pool, target_k=args.target_k,
+            min_hamming_full=args.min_hamming,
+            primary_sphere_positions=primary_positions,
+            min_hamming_active=args.min_hamming_active,
+            score_col="mo_topsis",
+        )
+        # Write the top-K artifact files (PDB copy, FASTA, TSV).
+        top.to_csv(final_dir / "topk.tsv", sep="\t", index=False)
+        with open(final_dir / "topk.fasta", "w") as fh:
+            for _, row in top.iterrows():
+                fh.write(f">{row['id']}\n{row['sequence']}\n")
+        pdb_out = final_dir / "topk_pdbs"
+        pdb_out.mkdir(exist_ok=True)
+        for _, row in top.iterrows():
+            src = all_pdb_maps.get(row["id"])
+            if src and src.is_file():
+                shutil.copy2(src, pdb_out / src.name)
+        topk_tsv = final_dir / "topk.tsv"
+        LOGGER.info(
+            "stage_diverse_topk: selected %d / %d "
+            "(target=%d, min_hamming=%d, min_hamming_active=%d)",
+            len(top), len(pool), args.target_k,
+            args.min_hamming, args.min_hamming_active,
         )
         # ---- Optional final-stage enrichments on top-K only --------
         if args.cms_final:
