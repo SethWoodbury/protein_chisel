@@ -266,24 +266,16 @@ def sample_with_ligand_mpnn(
 
     LOGGER.info("running fused_mpnn: %s", " ".join(cmd))
 
-    # Subprocess threading env. On CPU-only runs, pin OMP/MKL threads
-    # to cpus_per_task so fused_mpnn matches the slurm allocation.
-    # On GPU runs, DO NOT constrain — GPU sample needs CPU helpers
-    # (data loading, param copy) and limiting them empirically slowed
-    # GPU sample by ~30s/cycle (round-2 test 14122473 vs round-1 14118716).
-    # Inherits from os.environ so caller can override.
+    # Subprocess threading env: empirical testing (round-2 14122473
+    # GPU + 14122546 CPU) showed that setting OMP_NUM_THREADS in the
+    # fused_mpnn subprocess SLOWED both pipelines. GPU went 3:49→5:41,
+    # CPU went 21:54→26:14. PyTorch/MPNN's default threading
+    # heuristics (physical core count, not slurm allocation) work
+    # better in practice. We leave the env unmodified (inherits parent's
+    # os.environ; if user wants to constrain, they can set OMP via
+    # sbatch directives or shell exports).
     import os as _os
     sub_env = dict(_os.environ)
-    try:
-        from protein_chisel.utils.resources import detect_n_gpus, detect_n_cpus
-        n_gpus, _, _ = detect_n_gpus()
-        if n_gpus == 0:
-            cpus, _ = detect_n_cpus()
-            sub_env.setdefault("OMP_NUM_THREADS", str(cpus))
-            sub_env.setdefault("MKL_NUM_THREADS", str(cpus))
-            sub_env.setdefault("OPENBLAS_NUM_THREADS", str(cpus))
-    except Exception:
-        pass
 
     if via_apptainer:
         from protein_chisel.utils.apptainer import universal_call
