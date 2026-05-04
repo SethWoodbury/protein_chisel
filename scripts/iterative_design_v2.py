@@ -576,6 +576,7 @@ def stage_sample(
     out_dir: Path,
     chain: str = CHAIN,
     omit_AA_per_residue: Optional[dict[str, str]] = None,
+    bias_AA: str = "",
 ) -> Path:
     """Sample N candidates via LigandMPNN with the given (L,20) bias.
 
@@ -613,15 +614,22 @@ def stage_sample(
         ligand_mpnn_use_side_chain_context=cycle_cfg.use_side_chain_context,
         enhance=cycle_cfg.enhance,
         omit_AA=cycle_cfg.omit_AA,
-        # No global bias_AA -- per-residue bias is the whole point.
+        # Global bias_AA: class-balanced compensatory bias built from
+        # the previous cycle's survivor pool composition (see
+        # protein_chisel.expression.aa_class_balance). Cycle 0 leaves this
+        # empty; cycles 1+ get e.g. "E:-1.40,D:1.45,..." to swap within
+        # an over/under-rep class. Applies uniformly to every position
+        # on top of the per-residue PLM-fusion bias.
+        bias_AA=bias_AA,
         extra_flags=tuple(extra_flags),
     )
 
     LOGGER.info(
-        "stage_sample[cycle=%d]: n=%d, T=%.3f, fixed=%s, mean_abs_bias=%.4f",
+        "stage_sample[cycle=%d]: n=%d, T=%.3f, fixed=%s, "
+        "mean_abs_bias=%.4f, bias_AA=%r",
         cycle_cfg.cycle_idx, cycle_cfg.n_samples,
         cycle_cfg.sampling_temperature, sorted(set(fixed_resnos)),
-        float(np.abs(bias).mean()),
+        float(np.abs(bias).mean()), bias_AA or "(none)",
     )
 
     res = sample_with_ligand_mpnn(
@@ -2148,6 +2156,52 @@ def run_cycle(
     with open(bias_dir / "telemetry.json", "w") as fh:
         json.dump(telem, fh, indent=2)
 
+    # ---- 0b. Class-balanced compensatory bias_AA -------------------
+    # Built from the previous cycle's survivor pool. For each AA class
+    # (negatively_charged, hydrophobic_aliphatic, ...), if one member is
+    # over-rep (z > 2) and another is under-rep (z < -2), swap: down-
+    # weight the over-rep AA AND up-weight the under-rep AA. Address
+    # cases like "E z=+5, D z=-2": instead of just suppressing E (which
+    # only reduces total negative charge), encourage D to take its place.
+    bias_AA_str = ""
+    if survivors_prev is not None and len(survivors_prev) > 0:
+        from protein_chisel.expression.aa_class_balance import (
+            compute_class_balanced_bias_AA,
+        )
+        # Pool survivors into one mega-sequence: this gives a count-
+        # weighted average composition (each survivor contributes equally
+        # since they're the same length L).
+        pool_seq = "".join(survivors_prev["sequence"].astype(str).tolist())
+        # exclude_aas matches cycle_cfg.omit_AA (default "X" or "CX") so
+        # we don't try to up-weight an AA the sampler can't pick anyway.
+        excl = "".join(c for c in cycle_cfg.omit_AA.upper() if c != "X")
+        balance_telem = compute_class_balanced_bias_AA(
+            pool_seq,
+            reference="swissprot_ec3_hydrolases_2026_01",
+            exclude_aas=excl,
+            balance_z_threshold=2.0,
+            over_z_threshold=3.0,
+            max_bias_nats=2.5,
+            bias_per_z=0.4,
+        )
+        bias_AA_str = balance_telem.bias_AA_string
+        with open(bias_dir / "class_balance_telemetry.json", "w") as fh:
+            json.dump(balance_telem.to_dict(), fh, indent=2)
+        if bias_AA_str:
+            LOGGER.info(
+                "cycle %d class-balanced bias_AA: %s (swaps=%d)",
+                cycle_cfg.cycle_idx, bias_AA_str, len(balance_telem.swaps),
+            )
+            for sw in balance_telem.swaps:
+                LOGGER.info(
+                    "  swap[%s]: %s(z=%+.2f)->%+.2f  %s(z=%+.2f)->%+.2f",
+                    sw["class"], sw["down_aa"], sw["down_z"], sw["down_bias"],
+                    sw["up_aa"], sw["up_z"], sw["up_bias"],
+                )
+        else:
+            LOGGER.info("cycle %d class-balanced bias_AA: (no swaps triggered)",
+                         cycle_cfg.cycle_idx)
+
     # ---- 1. Sample --------------------------------------------------
     sample_dir = cycle_dir / "01_sample"
     # Diversity injection: per-cycle, randomly forbid the WT identity at
@@ -2182,6 +2236,7 @@ def run_cycle(
         protein_resnos=protein_resnos, fixed_resnos=fixed_resnos,
         out_dir=sample_dir,
         omit_AA_per_residue=merged_omit,
+        bias_AA=bias_AA_str,
     )
 
     # ---- 2. Restore PDBs --------------------------------------------
