@@ -80,7 +80,7 @@ def compute_class_balanced_bias_AA(
     *,
     reference: str = "swissprot_ec3_hydrolases_2026_01",
     exclude_aas: str = "C",
-    balance_z_threshold: float = 1.5,
+    balance_z_threshold: float = 2.0,
     over_z_threshold: float = 3.0,
     max_bias_nats: float = 2.5,
     bias_per_z: float = 0.4,

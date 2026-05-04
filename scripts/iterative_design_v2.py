@@ -2122,6 +2122,7 @@ def run_cycle(
     position_table_df=None,           # for first-shell diversity injection
     omit_AA_per_residue: Optional[dict[str, str]] = None,
     catalytic_his_resnos: Iterable[int] = CATALYTIC_HIS_RESNOS,
+    balance_z_threshold: float = 2.0,
 ) -> tuple[Optional[pd.DataFrame], dict[str, Path]]:
     """Run ONE iteration cycle. Returns (ranked DataFrame, pdb_map)."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -2188,13 +2189,14 @@ def run_cycle(
             pool_seq,
             reference="swissprot_ec3_hydrolases_2026_01",
             exclude_aas=excl,
-            # Lowered from 2.0 to 1.5 (2026-05-04): cycle-1 telemetry
-            # consistently showed E z=+5.4 paired with D z=-1.98 — D
-            # JUST missed the 2.0 cutoff so the literature-suggested
-            # E/D swap never fired. 1.5 catches the case where one
-            # class member is moderately under-rep AND the other is
-            # extremely over-rep.
-            balance_z_threshold=1.5,
+            # Threshold 2.0: only fire swaps when BOTH ends of the
+            # class imbalance are clearly extreme (over-rep > +2σ AND
+            # under-rep < −2σ). Keeps the bias_AA quiet under moderate
+            # imbalance so PLM + structure can drive composition; only
+            # corrects truly pathological pools. (User preference;
+            # earlier 1.5 was too aggressive for moderate cases like
+            # E z=+5 paired with D z=−1.7.)
+            balance_z_threshold=balance_z_threshold,
             over_z_threshold=3.0,
             max_bias_nats=2.5,
             bias_per_z=0.4,
@@ -2393,6 +2395,11 @@ def main() -> None:
                         "Rosetta no-repack metrics panel (DDG + interface "
                         "energy + ...) on the top-K only. ~30-60 s/design, "
                         "needs pyrosetta.sif. Default OFF.")
+    p.add_argument("--balance_z_threshold", type=float, default=2.0,
+                   help="Class-balanced bias_AA z-cutoff. A swap fires "
+                        "only when one class member is over-rep > +z AND "
+                        "another is under-rep < -z (default 2.0; the user "
+                        "noted 2-3 is reasonable, ≤1.5 is too aggressive).")
     p.add_argument("--plm_strength", type=float, default=1.0,
                    help="Global multiplier on PLM fusion class weights "
                         "(applied uniformly to ESM-C and SaProt at every "
@@ -2667,6 +2674,7 @@ def main() -> None:
             seed_protein_resnos=protein_resnos,
             position_table_df=pt.df,
             omit_AA_per_residue=omit_AA_per_residue,
+            balance_z_threshold=args.balance_z_threshold,
         )
         if ranked_df is not None and len(ranked_df) > 0:
             ranked_df = ranked_df.copy()
