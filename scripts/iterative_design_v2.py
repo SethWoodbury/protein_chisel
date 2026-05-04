@@ -109,13 +109,15 @@ class CycleConfig:
     sap_max_threshold: float = 15.0
     consensus_threshold: float = 0.85
     consensus_strength: float = 2.0
-    # pI window. Physically constrained by net_charge_no_HIS < -10:
-    # a protein with -10 charge at pH 7 has pI ~5.0 (deprotonating
-    # ~10 acidic residues = ~2 pH unit shift). pi_min=5.0 catches
-    # designs that drift WT-like-too-acidic (charge ~-25, pI ~4.6)
-    # while leaving room for less-acidic charge=-10 designs (pI ~5.0)
-    # up to the aspirational target ~7.2.
-    pi_min: float = 5.0
+    # pI window. Empirically: with net_charge_no_HIS < -10 the
+    # observed design pI distribution on PTE_i1 is 4.55-5.35. WT itself
+    # is pI 4.58. pi_min=4.7 excludes WT-like-extreme-acidic (lets ~89%
+    # through the gate) while still pushing away from the very-acidic
+    # tail. The aspirational target 6.5-7.2 from the user's notes is
+    # not achievable simultaneously with --net_charge_max<-10; tighten
+    # pi_min to 4.8 or 4.9 if you want stronger selection toward less-
+    # acidic, but expect higher rejection rate.
+    pi_min: float = 4.7
     pi_max: float = 7.5
     # fpocket-druggability filter on the active-site pocket. Designs
     # with druggability < this are dropped (no detectable active-site
@@ -155,7 +157,7 @@ def default_cycles(
     omit_AA: str = "X",
     use_side_chain_context: int = 0,
     enhance: Optional[str] = None,
-    pi_min: float = 5.0,
+    pi_min: float = 4.7,
     pi_max: float = 7.5,
     fpocket_druggability_min: float = 0.30,
     clash_filter: bool = True,
@@ -1394,14 +1396,14 @@ def main() -> None:
                         "Default None (use base ligand_mpnn). Available choices "
                         f"({len(AVAILABLE_ENHANCE_CHECKPOINTS)}): "
                         + ", ".join(AVAILABLE_ENHANCE_CHECKPOINTS))
-    p.add_argument("--pi_min", type=float, default=5.0,
-                   help="Minimum theoretical pI. Default 5.0 -- "
-                        "physically the floor consistent with "
-                        "--net_charge_max<-10 (a -10 charge at pH 7 has "
-                        "pI ~5.0; -25 like WT has pI ~4.6 and is too "
-                        "acidic). Aspirational target is 6.5-7.2 for "
-                        "soluble PTE-like cores assayed at pH 7.5-8.5 -- "
-                        "tighten by also relaxing --net_charge_max.")
+    p.add_argument("--pi_min", type=float, default=4.7,
+                   help="Minimum theoretical pI. Default 4.7 -- excludes "
+                        "WT-like extreme-acidic (pI 4.58) while letting "
+                        "the bulk of charge<-10 designs (typical pI "
+                        "4.7-5.3) through. Aspirational target 6.5-7.2 "
+                        "is not achievable simultaneously with "
+                        "--net_charge_max<-10. Tighten to 4.8/4.9 for "
+                        "stronger less-acidic selection.")
     p.add_argument("--pi_max", type=float, default=7.5)
     p.add_argument("--fpocket_druggability_min", type=float, default=0.30,
                    help="Drop designs with fpocket-druggability below this "
