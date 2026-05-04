@@ -1,309 +1,254 @@
 # Architecture
 
-## Three layers
+`protein_chisel`'s production pipeline is `scripts/iterative_design_v2.py` (the "v2 driver"), wrapped by `scripts/run_iterative_design_v2.sbatch`. It runs in three stages across three apptainer images, with file-based handoffs so each stage is independently restartable.
 
+## Pipeline
+
+```mermaid
+flowchart TD
+    seed[(seed PDB<br/>+ REMARK 666 catalytic motif<br/>+ ligand .params)]
+
+    subgraph Stage1["Stage 1: classify_positions  (pyrosetta.sif, CPU)"]
+        S1A[parse REMARK 666 → catalytic resnos]
+        S1B[two-pass directional classifier:<br/>primary / secondary / nearby_surface /<br/>distal_buried / distal_surface / ligand]
+        S1A --> S1B
+    end
+
+    subgraph Stage2["Stage 2: precompute_plm_artifacts  (esmc.sif, GPU)"]
+        S2A[ESM-C masked-LM marginals  (L,20)]
+        S2B[SaProt masked-LM marginals  (L,20)]
+        S2C[calibrate → log-odds<br/>entropy-match across models<br/>cosine-disagreement shrinkage<br/>per-class β/γ weights]
+        S2A --> S2C
+        S2B --> S2C
+    end
+
+    subgraph Stage3["Stage 3: iterative_design_v2  (universal.sif, GPU or CPU)"]
+        direction TB
+        S3init[runtime PLM re-fusion +<br/>graded-clash bias +<br/>expression-rule omit_AA]
+        S3init --> C0
+        C0[cycle 0: bias = base PLM-fusion]
+        C0 --> C1[cycle 1: bias = base + consensus_k0<br/>+ class-balanced bias_AA from k0 survivors]
+        C1 --> C2[cycle 2: bias = base + consensus_k1<br/>+ class-balanced bias_AA from k1 survivors]
+        C2 --> FINAL[final pool = ∪ cycle survivors,<br/>dedup, fpocket-druggability gate,<br/>multi-objective TOPSIS, diverse top-K]
+    end
+
+    seed --> Stage1
+    seed --> Stage2
+    Stage1 -- positions.tsv / parquet --> Stage3
+    Stage2 -- esmc + saprot logits<br/>+ fusion artifacts --> Stage3
+    Stage3 --> out[(final_topk/<br/>topk.fasta + topk_pdbs/<br/>all_survivors.tsv<br/>manifest.json)]
 ```
-pipelines/   ← orchestrators: chain tools with file-based handoffs.
-   │
-   ▼
-tools/       ← single-purpose primitives, runnable on their own.
-   │  uses
-   ▼
-filters/, scoring/, sampling/, io/, utils/  ← shared helpers (pure, importable).
+
+### Per-cycle sub-stages
+
+```mermaid
+flowchart LR
+    A[00_bias:<br/>base + consensus<br/>+ graded clash bias] --> B[01_sample:<br/>LigandMPNN<br/>--bias_AA_per_residue<br/>+ --bias_AA<br/>+ --omit_AA_per_residue]
+    B --> C[02_restore:<br/>REMARK 666 / HETNAM /<br/>LINK / HIS-tautomer /<br/>KCX caps / cat-Hs]
+    C --> D[02_seq_filter:<br/>charge / pI / instability /<br/>GRAVY / aliphatic / boman /<br/>expression-rule HARD_FILTERs]
+    D --> E[03_struct_filter:<br/>cat-HIS hbonds + SAP-proxy +<br/>severe-clash gate +<br/>geometric_interactions panel +<br/>preorganization + DFI]
+    E --> F[04_fitness:<br/>per-survivor PLM logp<br/>cached marginals]
+    F --> G[05_fpocket:<br/>active-site pocket pick +<br/>druggability + bottleneck]
+    G --> H[(ranked_df<br/>cycle survivors)]
 ```
 
-**Tools** never call other tools (don't reach across the layer). Anything two tools want to share lives one level down — `filters/`, `sampling/`, etc. **Pipelines** call tools.
+### Container split
 
-## Why file-based handoffs in pipelines
+| SIF | Purpose | Stage | Hardware |
+|---|---|---|---|
+| `pyrosetta.sif` | PyRosetta (DSSP, SASA, classifier), parse REMARK 666 / cstfile, write canonical PositionTable | Stage 1; optional `--rosetta_final` enrichment | CPU |
+| `esmc.sif` | ESM-C 600M + SaProt 650M masked-LM marginals, py_contact_ms (CMS), PROPKA | Stage 2; optional `--cms_final` enrichment | GPU (16 GB VRAM, fp32) |
+| `universal.sif` | LigandMPNN (`/net/software/lab/fused_mpnn/seth_temp/`), fpocket binary, freesasa, biopython, pandas, the protein_chisel package | Stage 3 (the iterative driver) | GPU preferred; CPU validated |
 
-Each pipeline stage reads inputs from disk and writes outputs to disk. This means:
-- **Restartable**: rerunning skips stages whose outputs already exist.
-- **Inspectable**: at any point you can stop, look at the intermediate files, and reason about what happened.
-- **Parallelizable**: independent stages can run on separate slurm jobs.
-- **Crash-tolerant**: if stage 4 of 6 dies, you don't redo 1–3.
+Bind-mount pattern: `--bind /home/woodbuse/codebase_projects/protein_chisel:/code --env PYTHONPATH=/code/src` lets every container import the package without a host-side `pip install`. See `scripts/run_iterative_design_v2.sbatch` for the canonical bind set.
 
-Cost: a little I/O overhead. Worth it for any pipeline >2 stages.
+## Per-cycle data flow
 
-### Artifact contracts and provenance (avoid stale-TSV glue)
+A single cycle takes the previous cycle's `survivors_prev` DataFrame (columns from the same per-cycle rank step) and feeds it into two independent priors that compose with the PLM bias:
 
-File handoffs are only safe if the receiving stage can verify what it's reading. `io/schemas.py` defines typed objects for the canonical artifacts:
+```mermaid
+flowchart TD
+    SP[survivors_prev<br/>cycle k DataFrame]
+    SP --> CB[class-balanced bias_AA<br/>aa_class_balance.compute_class_balanced_bias_AA]
+    SP --> CR[consensus reinforcement<br/>iterative_fusion.build_iteration_bias]
+    CB --> BAA[bias_AA string<br/>e.g. 'E:-1.40,D:1.45']
+    CR --> BIAS[bias_k+1 = base_bias<br/>+ consensus_delta]
+    BIAS --> SAMP
+    BAA --> SAMP[stage_sample at cycle k+1]
+```
 
-| Artifact | Carried by | Contents |
-|---|---|---|
-| `PoseSet` | one or more pickled poses + sidecar `.json` | list of `Pose + metadata(sequence_id, fold_source, conformer_index, parent_design_id, is_apo)` |
-| `PositionTable` | `position_table.parquet` | per-residue: class, sasa, dist_ligand, dist_catalytic, ss, ss_reduced, phi, psi, in_pocket, original_aa, chain |
-| `CandidateSet` | `candidates.fasta` + sidecar `.parquet` | per-sequence: id, sequence, parent_design_id, sampler (mpnn|esmif|iterative), sampler_params_hash |
-| `MetricTable` | `metrics.parquet` | one row per (sequence, conformer); columns prefixed by source (`rosetta__`, `fpocket__`, `esmc__`, ...). Pareto / ranking operates on this. |
+**`survivors_prev` source choice (annealing only):** by default `survivors_prev` is the cycle's full ranked DataFrame (sorted by fitness). With `--strategy annealing`, cycles where `cyc.use_topsis_for_survivors=True` (cycles 1 and 2) instead score the cycle ranked frame with a per-cycle TOPSIS spec and feed the TOPSIS-sorted survivors forward — so each successive cycle's prior is shaped by full multi-objective performance, not just fitness alone.
 
-**Provenance hashing**: every stage writes a `_manifest.json` next to its output containing:
-- input file SHA-256s
-- tool / model checkpoint version (e.g. esm 3.2.3, LigandMPNN commit, sif file mtime+inode)
-- hashed CLI args / config
-- python package versions
+### What `survivors_prev` carries
 
-Restart logic checks the manifest hash, not just file existence. Mismatched manifest → re-run. This prevents the silent-reuse bug where a stage's output was written under different parameters than the current run.
+`survivors_prev` is the cycle's `ranked_df` from `stage_fpocket_rank` — i.e. a pandas DataFrame with one row per surviving design that passed the seq + struct filters, with columns:
 
-## Inner-loop philosophy
+- **identity / sequence**: `id`, `sequence`, `parent_design_id`
+- **filter outcomes**: `passed_seq_filter`, `passed_struct_filter`, `fail_reasons`, `struct_fail`
+- **sequence metrics**: `length`, `net_charge_full_HH`, `net_charge_no_HIS`, `net_charge_HIS_half`, `pi`, `instability_index`, `gravy`, `aliphatic_index`, `boman_index`, `aromaticity`, `flexibility_mean_seq`, `helix_frac_seq`, `sheet_frac_seq`, `turn_frac_seq`, `molecular_weight`, `extinction_280nm_*`
+- **struct metrics**: `n_hbonds_to_cat_his`, `sap_max/sap_mean/sap_p95`, `clash__*`, `ligand_int__*` (geometric_interactions panel: hbonds / salt bridges / π-π / π-cation / hydrophobic, each with Gaussian strength), `preorg__*` (interactome around catalytic + first/second-shell), `dfi__*` (GNM dynamic flexibility per-class)
+- **fitness**: `fitness__logp_fused_mean`, `fitness__logp_esmc`, `fitness__logp_saprot`
+- **pocket**: `fpocket__druggability`, `fpocket__bottleneck_radius`, `fpocket__hydrophobicity_score`, `fpocket__mean_alpha_sphere_radius`, `fpocket__n_alpha_spheres_near_catalytic`
+- **expression rules**: `n_expression_warnings`, `n_expression_soft_bias_hits`, `n_expression_hard_omit_hits`, `n_expression_hard_filter_hits`, `expression_rule_summary`
 
-This codebase is explicitly built to **avoid AF2/AF3/Boltz in the inner loop**. Use:
-- LigandMPNN sampling (structure+ligand-conditioned) as the primary sequence engine.
-- ESM-C and SaProt as bias / scoring (NOT primary samplers for de novo scaffolds — they pull toward natural priors that conflict with designed features).
-- Cheap structural mini-eval: PyRosetta sidechain repack + Rosetta ligand interface ddG + fpocket geometry, all on the **fixed designed backbone** (no folding).
-- AF3 only as the final filter on the top 50–100 candidates.
+### Consensus reinforcement (cross-cycle)
 
-## Logit fusion — and an important asymmetry between samplers
+`src/protein_chisel/sampling/iterative_fusion.py::build_iteration_bias` builds `bias_{k+1} = base_bias + consensus_delta` where:
 
-LigandMPNN's logits are **not** the same kind of distribution as ESM-C / SaProt logits, and naive product-of-experts fusion across all three is incorrect.
+- For each protein position whose class is in `{secondary_sphere, nearby_surface, distal_buried, distal_surface}` (legacy: `{first_shell, pocket, buried, surface}`) AND not in `fixed_resnos` (catalytic),
+- empirical per-position AA frequency over `survivor_sequences` — if the top AA's frequency `≥ consensus_threshold` (default 0.85), add `+consensus_strength` nats (default 2.0) to that AA's bias entry.
+- Cap: `max_augmented_fraction * L` positions augmented per cycle (default 0.30, ≈ 60 positions on PTE_i1 L=200). Top-agreement positions are kept when capped.
+- All three knobs are CLI-tunable (`--consensus_threshold/--consensus_strength/--consensus_max_fraction`); telemetry is written to `cycle_NN/00_bias/telemetry.json` (n_eligible, n_augmented, augmented_resnos_1idx, capped).
 
-| Model | What its per-position logits represent |
+This was silently broken before the 2026-05-04 rewrite (a class-name mismatch made `n_positions_eligible = 0`); restoring it cost ~50 % of pairwise Hamming diversity in a parameter sweep, motivating the diversity-tunable knobs.
+
+### Class-balanced `bias_AA`
+
+`src/protein_chisel/expression/aa_class_balance.py::compute_class_balanced_bias_AA` operates on the pooled `survivors_prev` sequences and emits a global `--bias_AA` string (`{aa: nats}` flat across all positions) added on top of the per-residue PLM bias.
+
+The 8 AA classes:
+
+| Class | Members |
 |---|---|
-| LigandMPNN | Autoregressive: `p(aa_i | structure, ligand, aa_{decoded so far})`. Conditioned on a partial sequence determined by MPNN's own decoding order. |
-| ESM-C | Masked-LM marginal: `p(aa_i | aa_rest)` with position `i` masked. |
-| SaProt | Masked-LM marginal conditioned on AA + 3Di tokens. |
+| `hydrophobic_aliphatic` | A V L I M C |
+| `aromatic` | F W Y H |
+| `negatively_charged` | D E |
+| `positively_charged` | K R H |
+| `polar_uncharged` | S T N Q Y C H |
+| `small` | A G S C T |
+| `proline_special` | P (singleton) |
+| `glycine_special` | G (singleton) |
 
-These distributions live in different conditional regimes. Don't average / multiply them as if they were peer distributions over the same conditioning set.
+Per multi-member class, find the highest-z and lowest-z members against `swissprot_ec3_hydrolases_2026_01`. If `z_high > balance_z_threshold` (default 2.0; CLI `--balance_z_threshold`) AND `z_low < −balance_z_threshold`, **swap**: down-weight `high_aa` by `min(max_bias_nats, bias_per_z·z_high)` and up-weight `low_aa` symmetrically.
 
-**The right pattern: PLM logits as a bias to MPNN's native sampler.**
+**Extreme-over fallback.** If `z_high > over_z_threshold` (default 3.0) but no swap partner is under, downweight anyway (no up-weight). Added 2026-05-04 — without it, an AA at `z = +5` paired with the closest class member at `z = −1.7` would never get suppressed because the threshold required both ends extreme. Now extreme over-rep alone fires a one-sided correction.
 
-```
-log p_sample(aa_i) = log p_LigandMPNN(aa_i | structure, ligand, ctx)
-                   + β · log p_ESM-C(aa_i | seq_minus_i)
-                   + γ · log p_SaProt(aa_i | seq_minus_i, 3Di)
-```
+Cycle 0 has no survivors → `bias_AA` is empty. Cycles 1+ get e.g. `"E:-1.40,D:+1.45,K:-0.80,R:+0.95"` flat across positions.
 
-LigandMPNN exposes `--bias_AA_per_residue` which is added to its own per-position logits at decode time. Pre-compute the PLM marginals on the *original designed sequence* once, fold them into a bias matrix, and let MPNN sample with that bias. MPNN remains the primary generative process; the PLMs nudge the distribution.
+## PLM fusion (Stage 2 + runtime re-fusion)
 
-Per position class:
-- **active site** → freeze identity entirely (β = γ = 0; MPNN identity-fix on this position).
-- **first shell** → small bias (β, γ small) so structure-aware MPNN dominates.
-- **surface** → larger bias allowed; downstream hard filters (charge, pI) handle design objectives.
-
-**Pure-PLM pseudo-logits as a fallback.** When LigandMPNN isn't an option (e.g. the iterative walk pipeline below, where you need a per-position conditional and MPNN's autoregressive ordering would have to be re-run for each position), use just `log p_ESM-C + log p_SaProt` — both are masked-LM marginals, so they fuse cleanly.
-
-### Calibration of fused logits
-
-Don't add raw log-probs naively. Apply, in order:
-
-1. **Subtract the AA background** to convert per-position log-probs to log-odds:
-   `log p(aa | ctx) − log p_background(aa)` where `p_background` is the marginal AA frequency in the training corpus (or UniRef, or a uniform 1/20 prior). This decouples "this AA is rare everywhere" from "this AA is wrong here."
-2. **Entropy-match models**: each model has a different per-position entropy distribution. Rescale each model's logits by `τ_model` such that the median per-position entropy matches across models. Otherwise the high-entropy model dominates after summation.
-3. **Position-class–dependent weights** (β, γ): low at first-shell / pocket-lining, higher at surface; zero at active-site (which is frozen anyway).
-4. **Shrinkage at disagreement**: where models disagree strongly (low cosine similarity of their per-position distributions), shrink both contributions toward zero — let MPNN dominate. The PLMs are signaling low confidence; don't bias on disputed positions.
-
-### Why a static PLM bias can drift, and three remedies
-
-Computing the PLM marginals once on the seed sequence and freezing them as MPNN samples is fast but gets stale: as MPNN drifts the sequence away from the seed, the bias matrix encodes a context the new sequence no longer has. Three options, in order of complexity:
-
-1. **Refresh on top samples** — sample N candidates, recompute PLM logits on the median-by-naturalness candidate, re-bias, re-sample. Two or three rounds typically suffice.
-2. **PLM as reranker, not bias** — let MPNN sample freely, then rerank candidates by ESM-C / SaProt scores. Cleanest when you don't trust the bias calibration.
-3. **PLM as allowed-set restrictor** — at each position, restrict MPNN's allowed AAs to the top-k under PLM marginals (e.g. k=5). Strong restriction; use only at non-active, non-pocket positions, and only when speed matters.
-
-**Overconfidence warning**: a static PLM bias actively pushes toward natural-protein priors. For *de novo* enzymes whose function depends on intentionally unusual residues at pocket-adjacent positions, this can erase the design. Use refresh, reranker, or position-class–zero PLM weight at the pocket.
-
-## Iterative walk pipeline — two flavors
-
-Two related but distinct algorithms, useful when you start from an already-good sequence and want to refine it residue by residue, with each step seeing all previous steps. Both run as `pipelines/iterative_optimize.py` with a `--mode {constrained_local_search, mh}` flag.
-
-### Mode 1: constrained local search (cheap; default)
-
-```
-s ← starting sequence
-for t in 1..T:
-    pick position i (uniform / round-robin / weighted by uncertainty)
-    skip if i ∈ frozen (active site / first-shell-locked)
-    p(aa | s_{-i}) ← fused PLM marginals (ESM-C + SaProt, calibrated)
-    aa* ~ p with temperature τ
-    s' ← s with i ← aa*
-    accept iff hard filters pass on s' (regex / ProtParam range / repack Δ < threshold)
-    update s ← s' on accept
+```mermaid
+flowchart LR
+    EC[ESM-C log_probs<br/>L × 20] --> CALI1[− log AA_bg<br/>= log-odds]
+    SP[SaProt log_probs<br/>L × 20] --> CALI2[− log AA_bg<br/>= log-odds]
+    CALI1 --> EM1[entropy-match τ<br/>median entropy across models]
+    CALI2 --> EM1
+    EM1 --> CW[per-position β,γ<br/>= class_weight × global_strength]
+    CW --> SH[shrink at disagreement:<br/>cosine sim < 0.7 → scale toward 0]
+    SH --> BIAS[fusion_bias  L × 20<br/>nats; added to MPNN logits]
 ```
 
-This is **constrained local search**, not Metropolis-Hastings. There is no proposal-correction term and no scalar target energy — accept depends only on whether filters pass. It works for polishing a small mutable set, but it's biased: any path through "bad single-mutant intermediate to good double-mutant" is forbidden, so you cannot find compensatory mutation pairs. It can also stall in dense regions where every neighbor fails.
+Defaults from `FusionConfig` in `src/protein_chisel/sampling/plm_fusion.py`:
 
-### Mode 2: Metropolis-Hastings (when compensatory moves matter)
-
-Define a scalar score `E(s) = − log P_combined(s)` from a small fixed set of objectives (e.g. 0.5·E_rosetta + 1.0·log_perplexity + 0.5·max(0, charge_target − charge(s))²). For mutation `s → s'` proposed under `q(s'|s)`:
-
-```
-α = min(1,  exp(−ΔE) · q(s|s') / q(s'|s))
-accept with probability α
-```
-
-Use a **temperature schedule** for simulated annealing (high τ early to traverse barriers, low τ late). Use **block moves** occasionally — propose two or more positions at once at known interaction networks (hbond partners, salt bridges, hydrophobic core clusters) — to allow coordinated changes. **Parallel tempering** runs N chains at different τ; periodically swap configurations between adjacent chains to escape local minima.
-
-### Convergence diagnostics (not "no accepts in N sweeps")
-
-That naive criterion catches stalled chains, not converged ones. Use:
-- **Multiple chains from different seeds**; check **R-hat** (Gelman-Rubin) on objectives or top-cluster compositions.
-- **Acceptance-rate trend**: collapsing to <5% near end suggests cooled enough; rising late means temperature too high.
-- **Objective autocorrelation**: integrated autocorrelation time τ_int; report effective sample size = T / τ_int per chain.
-- **Stability of top sequence clusters**: cluster sequences from late-iteration samples; pipeline considers "converged" when the top-cluster composition stops shifting between windowed slices.
-
-### When this pipeline pathologically fails
-
-- Compensatory multi-site moves (constrained-LS only): can't traverse a worse single-mutant intermediate.
-- Charge-pair swaps: ditto.
-- Backbone-coupled core mutations: PLMs see neither backbone nor your repacked sidechains.
-- Catalytic-water-mediated networks: not modeled at all.
-- Designs that need a residue PLMs heavily disfavor (the "intentionally weird" problem).
-
-### When to prefer this vs. batch MPNN
-
-- **Batch MPNN** (enzyme_optimize_v1): redesign large fraction of the protein at once.
-- **Constrained local search**: polish a small set of mutable positions toward charge / pI / SAP / ddG targets.
-- **MH with parallel tempering**: same use case but when compensatory moves are needed.
-
-## Position classification (extended)
-
-Done once per design. Per residue, record:
-
-| Feature | How |
+| Class | β = γ |
 |---|---|
-| `class` ∈ {active_site, first_shell, pocket, buried, surface} | distance to ligand/catalytic atoms + SASA + fpocket pocket map |
-| `sasa` Å² | PyRosetta `getSASA` (Coventry recipe) |
-| `dist_ligand` Å | min distance to any ligand heavy atom |
-| `dist_catalytic` Å | min distance to any theozyme catalytic atom |
-| `secondary_structure` ∈ {H, E, L, ...} | DSSP (PyRosetta `SecondaryStructureMetric`) — can be passed downstream as a per-position feature for sampling priors |
-| `secondary_structure_reduced` ∈ {H, E, L} | DSSP reduced alphabet |
-| `phi`, `psi` | backbone dihedrals |
-| `chain` | for multi-chain inputs |
-| `in_pocket` (bool) | fpocket membership |
-| `original_aa` | wild-type / designed-sequence AA at this position |
+| `primary_sphere` | 0.05 |
+| `secondary_sphere` | 0.20 |
+| `nearby_surface` | 0.30 |
+| `distal_buried` | 0.40 |
+| `distal_surface` | 0.55 |
+| `ligand` | 0.0 |
 
-Output is a single JSON consumed by every downstream tool. Secondary-structure labels can drive sampling priors directly (e.g., disallow proline in helix interiors except at known helix breaks).
+`global_strength = 1.0` (CLI `--plm_strength`, default 1.25 in the driver — empirical sweep on PTE_i1 found 1.2–1.3 the sweet spot for fitness recovery + druggability tightness + primary-shell diversity). The driver re-fuses at runtime so changes to `class_weights` take effect without re-running Stage 2; the runtime artifacts are snapshotted to `<run_dir>/fusion_runtime/{base_bias,weights_per_position,log_odds_*}.npy`.
 
-## Theozyme satisfaction & active-site quality (separate from naturalness)
+A small **graded clash bias** (`compute_graded_clash_bias`) is added to the fusion bias before cycle 0: for each `(clash-prone position, bulky AA ∈ {Y,F,W,H,M,R})` pair, sample a 9-rotamer χ1×χ2 stub grid, count what fraction lands within 2.0 Å of any fixed-residue sidechain heavy atom, and subtract `20 · clash_fraction` nats from the corresponding bias entry. Replaces a previous all-or-nothing hard-omit that over-suppressed positions where the bulky AA actually fit.
 
-When the input PDB carries REMARK 666 catalytic geometry, treat the catalytic motif as a **specific geometric target**, not just "frozen residues." Per design / per conformer, compute:
+## Multi-objective TOPSIS ranking
 
-- **Motif RMSD** vs. theozyme reference (catalytic residue heavy atoms only).
-- **Catalytic distances**: each REMARK 666 motif atom pair (e.g. His Nε — ligand attack atom). Compare to the constraint definition.
-- **Catalytic angles & dihedrals**: again from REMARK 666 / cstfile semantics.
-- **Attack geometry**: for the substrate's reactive atom, the angle of approach to the nucleophile / proton donor.
-- **Catalytic-residue rotamer strain**: cart_bonded + fa_dun on each motif residue.
+`src/protein_chisel/scoring/multi_objective.py` provides:
 
-These are sharper signals than total-pose Rosetta score for whether the active site is preserved.
+- `MetricSpec(column, direction ∈ {max, min, target}, weight, target=None, label)` — generalizes `Objective` by adding a `"target"` direction (deviation from a target value treated as a min-objective).
+- `DEFAULT_METRIC_SPECS`: 14-axis basket tuned for PTE / hydrolase de-novo design.
+- `compute_topsis_scores_v2(df, specs)` — TOPSIS over the spec basket: per-axis normalize to [0,1] (NaN → column mean), apply weights, compute distance to ideal vs. nadir, return `closeness = d_neg / (d_pos + d_neg)`.
+- `apply_cli_overrides(specs, weights, targets)` — merge `--rank_weights k=v,k=v` and `--rank_targets k=v,k=v` onto the defaults; weight 0 drops a metric.
+- `select_diverse_topk_two_axis(...)` — greedy top-K sorted by `mo_topsis` desc, gated by **both** full-sequence Hamming (`--min_hamming`, default 3) and primary-sphere Hamming (`--min_hamming_active`, default 0 = disabled).
 
-## Active-site preorganization & flexibility
+### Default 14-metric basket
 
-Static structures undersell active-site quality. A well-preorganized pocket has small geometric variance under perturbation. Use one of:
+| Label | Column | Direction | Weight | Target |
+|---|---|---|---|---|
+| fitness | `fitness__logp_fused_mean` | max | 2.0 | — |
+| druggability | `fpocket__druggability` | max | 1.0 | — |
+| lig_int_strength | `ligand_int__strength_total` | max | 1.0 | — |
+| preorg_strength | `preorg__strength_total` | max | 0.7 | — |
+| hbonds_to_cat | `n_hbonds_to_cat_his` | max | 0.5 | — |
+| instability | `instability_index` | min | 0.5 | — |
+| sap_max | `sap_max` | min | 0.5 | — |
+| boman | `boman_index` | target | 0.3 | 2.5 |
+| aliphatic | `aliphatic_index` | target | 0.3 | 95.0 |
+| gravy | `gravy` | target | 0.3 | −0.2 |
+| charge | `net_charge_full_HH` | target | 0.3 | −10.0 |
+| pi | `pi` | target | 0.3 | 5.5 |
+| bottleneck | `fpocket__bottleneck_radius` | target | 0.3 | 3.65 |
+| pocket_hydrophobicity | `fpocket__hydrophobicity_score` | target | 0.2 | 45.0 |
 
-- **Restrained repack ensembles**: with the REMARK 666 constraints active, run N short repack-and-min trajectories. Compute variance of catalytic distances/angles across the ensemble. Low variance = preorganized.
-- **Backrub ensembles**: PyRosetta `BackrubMover` for limited backbone perturbation; same variance metric.
-- **AF3 conformer agreement**: when you do reach the final AF3 step, the per-conformer agreement on catalytic geometry is a free preorganization signal.
+Final pool sort key: `(mo_topsis desc, fitness__logp_fused_mean desc)`. The legacy 2-key (fitness rank + alpha-radius rank) score is computed alongside as `legacy_rank_score` for back-compat / debugging.
 
-This is one of the few enzyme-quality metrics you can compute cheaply that captures something AF3 wouldn't catch in a single pass.
+## Strategies: constant vs. annealing
 
-## Multi-pose inputs (single PDB or many)
+`--strategy {constant, annealing}` (default `constant`).
 
-Tools and pipelines accept either a single PDB or a `pose_set` — a list of poses with metadata. Common scenarios:
+```mermaid
+flowchart TD
+    subgraph CONST[constant - legacy default]
+        CC0[cycle 0:<br/>defaults x3<br/>survivors fed by fitness]
+        CC1[cycle 1:<br/>defaults x3<br/>survivors fed by fitness]
+        CC2[cycle 2:<br/>defaults x3<br/>survivors fed by fitness]
+        CC0 --> CC1 --> CC2
+    end
 
-| Scenario | Composition | Aggregation strategy |
-|---|---|---|
-| Single design | one PDB | per-pose metrics, no aggregation |
-| Design + AF3 conformers | designed model + N AF3 predictions of the same sequence | per-conformer metrics + agreement metrics: mean ± std of Rosetta total, ligand ddG, pocket volume; **conformational consistency** = how stable the metric is across conformers (low std → robust). |
-| Family of designs | M sequences on the same backbone, each maybe with K conformers | nested aggregation: per-sequence (mean across its K conformers) → ranked across M; or "robust to conformer" = sequences whose worst conformer still passes filters. |
-| Apo + holo | ligand-bound and ligand-free poses of the same sequence | apo-vs-holo metrics: ligand binding ΔΔG (the user's target), pocket geometry change, induced fit. |
-
-`io/pose_set.py` carries metadata per pose: `sequence_id`, `fold_source` (designed | AF3_seedN | Boltz | RFdiffusion), `conformer_index`, `parent_design_id`, `is_apo`. **Internally, every tool operates on a `PoseSet`; a single PDB just becomes a `PoseSet` of size 1.** No separate codepath.
-
-### Aggregation must be metric-specific
-
-Don't just average everything. Different metrics need different aggregation strategies:
-
-| Metric type | Aggregation across a PoseSet |
-|---|---|
-| Failure / clash / unsatisfiable | **worst-case** (max / 95th percentile). One bad conformer = the design fails. |
-| Mean descriptive (Rg, SASA totals) | mean ± std. Std is itself informative — high std = conformationally unstable. |
-| Pocket geometry | mean ± std, with a "min volume / max bottleneck" gate. |
-| Catalytic geometry | mean ± std (preorganization signal). High std = brittle. |
-| Apo vs holo paired | explicit paired delta (e.g. `ddG = E_holo − E_apo − E_ligand_alone`). Don't average across the two. |
-| Fold-source agreement | compare *across sources* (designed-model vs. AF3 mean): low agreement → designed model probably overfit. |
-
-**Don't average designed-model and AF3-conformer scores as exchangeable samples** — they come from different generative processes and reflect different things. Keep `source_model` in the metadata and report agreement separately from per-conformer aggregates.
-
-This abstraction lets you pick **conformation-robust** designs in addition to **single-pose-good** ones — important because a design that scores well only on its idealized model but poorly on every AF3 conformer is probably a brittle design.
-
-## Catalytic residues from REMARK 666
-
-Theozyme matcher output writes lines like:
-
-```
-REMARK 666 MATCH TEMPLATE B YYE  209 MATCH MOTIF A HIS  188  1  1
+    subgraph ANN[annealing - explore→exploit]
+        AC0[cycle 0 explore:<br/>light filters loose<br/>instability_max=80<br/>gravy [-1.0, +0.4]<br/>aliphatic_min=30<br/>boman_max=5.5<br/>TOPSIS fitness x3.0,<br/>others x0.1<br/>survivors fed by fitness]
+        AC1[cycle 1 transition:<br/>light filters mid-loose<br/>instability_max=70<br/>gravy [-0.9, +0.35]<br/>aliphatic_min=35<br/>boman_max=5.0<br/>TOPSIS defaults<br/>survivors fed by TOPSIS]
+        AC2[cycle 2 exploit:<br/>light filters at default<br/>instability_max=60<br/>gravy [-0.8, +0.3]<br/>aliphatic_min=40<br/>boman_max=4.5<br/>TOPSIS defaults<br/>survivors fed by TOPSIS]
+        AC0 --> AC1 --> AC2
+    end
 ```
 
-Fields (left to right): ligand chain, ligand name3, ligand resno; catalytic chain, catalytic name3, catalytic resno; constraint number, constraint variant. `io/pdb.py` parses these into a `{resno: catres_info}` dict and the position classifier consumes it directly — every REMARK 666 residue is force-classed `active_site` with identity locked.
+**Hard filters never anneal.** Charge band (`[-18, -4]`), pI band (`[5.0, 7.5]`), severe-clash gate, fpocket-druggability gate, and the expression-rule `HARD_FILTER`s stay constant across all cycles in both strategies. Only the **light** filters (instability / GRAVY / aliphatic / boman) and **TOPSIS weights** anneal.
 
-If REMARK 666 isn't present, fall back to a user-supplied `--catres "A94-96 B101"` spec (legacy `parse_ref_catres` pattern). One of the two is required.
+In annealing, cycles 1+ feed `survivors_prev` chosen by **multi-objective TOPSIS** (the `mo_topsis_cycle` column on the cycle's ranked frame), so the consensus prior reflects multi-objective good designs, not just high-fitness ones. This biases each successive cycle toward the full Pareto-front shape rather than the fitness ridge.
 
-## Chemical interactions and biophysics
+## Run layout
 
-Beyond the basic Rosetta metrics (`fa_elec`, `hbond_sc`, `hbond_bb_*`), planned tools cover:
+```
+$WORK/iterative_design_v2_PTE_i1_<ts-pid>/
+├── classify/
+│   └── positions.tsv              # PositionTable from Stage 1
+├── plm_artifacts/                 # from Stage 2 (cached, reused across runs)
+│   ├── esmc_log_probs.npy         # (L, 20)
+│   ├── saprot_log_probs.npy       # (L, 20)
+│   ├── fusion_bias.npy            # (L, 20) — cached cycle-0 bias
+│   ├── fusion_log_odds_{esmc,saprot}.npy
+│   ├── fusion_weights.npy         # (L, 2)
+│   └── manifest.json
+├── fusion_runtime/                # runtime re-fusion snapshot (Stage 3)
+│   ├── base_bias.npy
+│   ├── weights_per_position.npy
+│   ├── log_odds_{esmc,saprot}.npy
+│   └── fusion_config.json
+├── seed_tunnel_residues.tsv       # one-shot fpocket on the seed (channel-lining annotation)
+├── cycle_00/
+│   ├── 00_bias/{bias.npy, telemetry.json, class_balance_telemetry.json}
+│   ├── 01_sample/{candidates.fasta, candidates.tsv, pdbs_restored/, omit_AA_per_residue.json}
+│   ├── 02_seq_filter/{survivors_seq.tsv, rejects_seq.tsv}
+│   ├── 03_struct_filter/{survivors_struct.tsv, rejects_struct.tsv, hbond_details.tsv}
+│   ├── 04_fitness/scored.tsv
+│   └── 05_fpocket/{ranked.tsv, per_design/}
+├── cycle_01/                      # same layout
+├── cycle_02/                      # same layout
+├── final_topk/
+│   ├── all_survivors.tsv          # full pool with mo_topsis + legacy_rank_score
+│   ├── topk.tsv                   # diverse top-K
+│   ├── topk.fasta
+│   ├── topk_pdbs/                 # restored PDBs (REMARK 666 + tautomers + KCX)
+│   ├── cms_final/topk_with_cms.tsv         # if --cms_final
+│   └── rosetta_final/topk_with_rosetta.tsv # if --rosetta_final
+└── manifest.json                  # full run config + output paths
+```
 
-- **Hydrogen bonds & networks** — PyRosetta `HBondSet`, classify donor/acceptor by residue+atom; track *which* protein positions hbond to ligand / catalytic residues, with energies. Modernize from `~/special_scripts/metrics_and_hbond_rosetta_seth_no_RELAX_V2.py` and `~/special_scripts/hbonding_network.py`.
-- **Salt bridges & cation-π** — RosettaScripts `arg_cation_pi` reweighting (already used in legacy script); explicit detection via geometry.
-- **Aromatic π-π stacking** — geometric: pairs of aromatic rings (FYW + ligand aromatics), centroid distance < 6 Å, plane angle 0° or 90° (parallel/T-shape). Custom helper.
-- **Electrostatic complementarity** — RosettaScripts `ElectrostaticComplementarityMetric` (in legacy script).
-- **Electric field at active site** — APBS-derived 3D potential, sampled at theozyme TS midpoint or specific atoms. Heavier; reserve for late-stage characterization, not inner loop.
-- **Metal-binding suitability** — Metal3D (`/net/software/containers/pipelines/metal3d.sif`) when ligand is a metal cofactor or design has metal-coordinating residues.
-- **Per-atom SASA on ligand** — Coventry SASA recipe, from legacy script.
-- **Pocket geometry** — fpocket post-repack: volume, bottleneck, hydrophobicity, charge, druggability score.
+## Provenance
 
-## Position classification
+`manifest.json` carries: `pipeline`, `seed_pdb`, `ligand_params`, `plm_artifacts_dir`, `position_table`, `fixed_resnos`, `catalytic_his_resnos`, `wt_length`, `target_k`, `diversity_min_hamming`, `n_cycles_run`, the full per-cycle `CycleConfig` dataclass dump, output paths, and `started_at = <ms-precision-ts>-pid<pid>`. The ms+PID timestamp prevents `run_dir` collisions across concurrent jobs (a real bug observed during a 4-job parallel sweep where second-precision timestamps overlapped).
 
-Done once per design, before any sampling. Categories:
-- `active_site` — within 4 Å of catalytic atoms (theozyme); identity frozen.
-- `first_shell` — within 5 Å of ligand; conservative substitutions only.
-- `pocket` — fpocket-defined pocket residues not covered above.
-- `buried` — SASA < 20 Å²; allow stability mutations.
-- `surface` — SASA ≥ 20 Å²; free, biased toward design objectives.
-
-Output is a single JSON consumed by every downstream tool.
-
-## Multi-objective ranking
-
-**Hard filters first, then Pareto on what survives.** No weighted-sum scoring across incommensurable metrics — that path leads to elaborate weight tuning that doesn't generalize.
-
-But Pareto has its own failure mode: with too many correlated objectives, almost everything is non-dominated and the front becomes the whole set. To prevent this:
-
-1. **Cap at 3-5 *real* objectives.** Pick the ones with weakly correlated signal. Good candidate set:
-   - Rosetta total-score Δ (or ligand interface ddG)
-   - PLM naturalness (single fused score, not ESM-C and SaProt separately)
-   - Pocket geometry preservation (single fpocket-derived score, not separate volume/bottleneck/hydrophobicity)
-   - Catalytic preorganization (variance under repack ensembles, see below)
-   - One design-objective metric (target charge match, target pI, target SAP)
-2. **Hard constraints first**: charge in range, no protease sites, repack Δ within tolerance, BUNS below threshold. These reduce the set; Pareto then ranks within the survivors.
-3. **ε-dominance** instead of strict dominance: bin objectives at meaningful resolution before comparing. Prevents trivial floating-point differences from creating spurious non-dominated points.
-4. **Diversity selection on mutable / pocket positions only.** Hamming distance over full-length sequence is dominated by surface variation that doesn't matter for function. Compute identity over the union of (mutable positions ∪ pocket positions) — this gives you genuinely distinct designs.
-5. **Calibration set required.** Without a benchmark of known-good and known-bad designs to set thresholds and weights, your filters are folklore. Maintain a small held-out set of past designs with known experimental outcomes; periodically check the filter stack reproduces expected pass/fail labels.
-
-## Cheap filters: veto vs. ranker
-
-Fixed-backbone PyRosetta repacking + ligand ddG + fpocket geometry + SAP / charge / protease filters are **a veto layer**, not a ranker. They reliably catch:
-- Steric clashes
-- Gross desolvation
-- Pocket destruction
-- Ligand-incompatible substitutions
-- Obviously bad chemistry (excess net charge, exposed hydrophobics, runs of cysteines)
-
-They are **not** reliably informative for:
-- Foldability — backbone is fixed; you're not seeing whether the new sequence still folds to that backbone.
-- Loop gating / conformational dynamics — you have one rotamer state per residue.
-- Water-mediated catalysis — explicit waters absent.
-- Protonation-sensitive networks — pKa estimation is a separate task.
-- Induced-fit pockets — backbone movement isn't allowed.
-- Multiple alternate ligand poses — only the docked pose is scored.
-
-So: use cheap filters to *kill* obviously bad sequences, but treat near-tied survivors as equivalent. AF3 (the final filter outside the inner loop) is what tells you which of the survivors actually *work*.
-
-## Synthetic-MSA caveats
-
-A pool of N=1000 sampled sequences is a useful object — it gives per-position frequency profiles, mutual information between positions, and converged-vs-uncertain residues. **Do not** treat it like a natural MSA: classical MSA-derived signals (DCA, conservation, EVcouplings) extract evolutionary covariation, but a synthetic pool encodes only sampler priors, not biology. See `scoring/synthetic_msa.py` (when implemented) for the ways we use the pool.
-
-## Where to add a new tool
-
-1. Add `src/protein_chisel/tools/<your_tool>.py` — exposes a `cli` (`click` command) and a Python-callable function.
-2. Register it in `protein_chisel/cli.py` so it appears under `chisel --help`.
-3. Add an entry in `docs/dependencies.md` with the cluster path of whatever it wraps.
-4. Add a test in `tests/test_<your_tool>.py` (smoke test is fine).
-5. If the tool needs new paths, add them to `paths.py`.
+Per-cycle telemetry JSONs (`telemetry.json`, `class_balance_telemetry.json`) record exactly which positions were augmented by consensus, which AA swaps fired in the class-balance step, and z-scores against the reference distribution — enough to replay any cycle's bias from disk.
