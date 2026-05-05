@@ -346,10 +346,33 @@ before parallelization). Going to 8 hits hyperthread oversubscription
 with our Pool fork model and slows down.
 
 For the bigger PLMs (esmc_600m + saprot_1.3b), end-to-end CPU wall
-times at cpus=4 = 50:32 (mostly stage-2 PLM compute on CPU). Stage 3
-scaling at lower cpu counts is being benchmarked separately; expect
-1.3b stage 3 to scale similarly to default since it's LigandMPNN-
-bound (PLM scoring is per-fitness-call only).
+times at cpus=4 = 50:32 (stage 2 = ~32 min for PLM compute on CPU,
+stage 3 = ~18 min driver).
+
+Stage-3-only scaling with 1.3b artifacts (post-DFI-refactor):
+
+| cpus | stage-3 wall | MaxRSS | speedup vs cpus=1 | per-core efficiency |
+|---|---|---|---|---|
+| 1 | 54:49 | 5.5 GB | 1.00× | 100% |
+| 2 | 46:45 | 5.5 GB | 1.17× | 59% |
+| **4** ★ | **18:01** | ~6 GB | 3.04× (super-linear) | 76% |
+
+Quality is consistent across cpu counts (fitness mean −1.78 to
+−1.81, sap_max 0.89–1.01, druggability 0.97–0.98 — all within noise).
+
+Note that cpus=2 gives only marginal speedup over cpus=1 because
+most of stage 3 outside of fpocket is serial Python — the big jump
+comes at cpus=4 when the fpocket Pool(4) parallelism kicks in.
+**Don't bother with cpus=2** unless cluster priority demands it; jump
+straight from 1 to 4.
+
+End-to-end CPU wall (full pipeline, stage 1+2+3, 600m+1.3b PLMs):
+
+| cpus | stage 2 (1.3b on CPU) | stage 3 | total estimate |
+|---|---|---|---|
+| 1 | ~80–90 min | 55 min | ~2.4 hrs |
+| 2 | ~50 min | 47 min | ~1.6 hrs |
+| 4 | 32 min | 18 min | 50 min (validated) |
 
 ## Memory: per-job vs per-cpu
 
