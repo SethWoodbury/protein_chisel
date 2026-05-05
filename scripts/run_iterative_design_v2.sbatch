@@ -177,8 +177,15 @@ if [[ -z "$RUN_DIR" || ! -d "$RUN_DIR/final_topk/topk_pdbs" ]]; then
     echo "         skipping stage 4 (protonate). Run protonate_final_topk.py"
     echo "         manually if needed."
 else
-    echo "=== STAGE 4: protonate final top-K (pyrosetta.sif) ==="
+    echo "=== STAGE 4: protonate final top-K + shipping layout (pyrosetta.sif) ==="
     echo "    run_dir = $RUN_DIR"
+    # SAVE_INTERMEDIATES=1 to keep cycle_NN/ subtrees for diagnostics.
+    # Default (unset): clean shipping layout — run_dir/designs/*.pdb +
+    # designs.tsv + designs.fasta + cycle_metrics.tsv + manifest.json.
+    SHIPPING_FLAGS="--shipping_layout"
+    if [[ "${SAVE_INTERMEDIATES:-}" == "1" ]]; then
+        SHIPPING_FLAGS="--shipping_layout --no_strip_intermediates"
+    fi
     apptainer exec \
         --bind "$REPO:/code" \
         --bind /net/software \
@@ -191,7 +198,8 @@ else
             --seed_pdb "$SEED_PDB" \
             --ligand_params "$LIG_PARAMS" \
             --out_dir "$RUN_DIR/final_topk/topk_pdbs_protonated" \
-            --summary_json "$RUN_DIR/final_topk/protonation_summary.json" \
+            --summary_json "$RUN_DIR/protonation_summary.json" \
+            $SHIPPING_FLAGS \
             ${PTM:+--ptm "$PTM"}
 fi
 

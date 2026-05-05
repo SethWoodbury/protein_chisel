@@ -41,6 +41,7 @@ import argparse
 import datetime as _dt
 import json
 import logging
+import random
 import re
 import shutil
 import subprocess
@@ -3468,9 +3469,10 @@ def main() -> None:
                 ("fitness__logp_fused_mean", "fitness"),
                 ("sap_max", "sap_max"),
                 ("fpocket__druggability", "druggability"),
+                ("fpocket__bottleneck_radius", "bottleneck"),
+                ("fpocket__volume", "volume"),
                 ("net_charge_no_HIS", "charge"),
                 ("pi", "pi"),
-                ("pairwise_hamming_full", "hamming"),
             ):
                 if col in ranked_df.columns:
                     vals = pd.to_numeric(ranked_df[col], errors="coerce").dropna()
@@ -3478,6 +3480,62 @@ def main() -> None:
                         cycle_row[f"{prefix}_mean"] = float(vals.mean())
                         cycle_row[f"{prefix}_min"] = float(vals.min())
                         cycle_row[f"{prefix}_max"] = float(vals.max())
+
+            # Sequence-space diversity + AA composition (cheap; useful for
+            # diagnosing whether bias / consensus reinforcement is collapsing
+            # or expanding the population)
+            if "sequence" in ranked_df.columns:
+                seqs = ranked_df["sequence"].dropna().astype(str).tolist()
+                if len(seqs) >= 2:
+                    cycle_row["n_unique_seqs"] = len(set(seqs))
+                    # full-sequence pairwise hamming (sample to bound cost)
+                    sample = seqs if len(seqs) <= 80 else random.sample(seqs, 80)
+                    arr = np.array([[ord(c) for c in s] for s in sample],
+                                    dtype=np.uint8)
+                    if arr.size > 0:
+                        n = arr.shape[0]
+                        # Vectorized pairwise hamming
+                        diff_counts = []
+                        for i in range(n):
+                            d = (arr[i+1:] != arr[i]).sum(axis=1)
+                            diff_counts.extend(d.tolist())
+                        if diff_counts:
+                            d_arr = np.array(diff_counts, dtype=float)
+                            cycle_row["pairwise_hamming_mean"] = float(d_arr.mean())
+                            cycle_row["pairwise_hamming_std"]  = float(d_arr.std(ddof=0))
+                    # AA composition (mean count + Shannon entropy)
+                    aa_counts: dict[str, list[int]] = {}
+                    for aa in "ACDEFGHIKLMNPQRSTVWY":
+                        aa_counts[aa] = [s.count(aa) for s in seqs]
+                    cycle_row["n_unique_aas_observed"] = sum(
+                        1 for aa, cs in aa_counts.items() if max(cs) > 0
+                    )
+                    # Shannon entropy of mean-AA-frequency distribution (bits)
+                    means = np.array([np.mean(cs) for cs in aa_counts.values()])
+                    if means.sum() > 0:
+                        p = means / means.sum()
+                        p = p[p > 0]
+                        cycle_row["aa_shannon_entropy_bits"] = float(
+                            -(p * np.log2(p)).sum()
+                        )
+                    # Active-site (first-shell) diversity using fixed_resnos.
+                    # Catalytic positions are FIXED so they shouldn't vary
+                    # across designs; we measure variation at all OTHER
+                    # designable positions for "effective design diversity".
+                    L_seq = len(sample[0]) if sample else 0
+                    fixed_idx = {r - 1 for r in fixed_resnos
+                                  if 1 <= r <= L_seq}
+                    designable_idx = [i for i in range(L_seq) if i not in fixed_idx]
+                    if designable_idx and arr.size > 0:
+                        # Mean number of unique AAs per designable position
+                        unique_per_pos = [
+                            len(set(arr[:, i].tolist())) for i in designable_idx
+                        ]
+                        cycle_row["unique_aas_per_pos_mean"] = float(np.mean(unique_per_pos))
+                        cycle_row["unique_aas_per_pos_max"]  = float(np.max(unique_per_pos))
+                        cycle_row["pct_pos_with_2plus_aas"]  = float(
+                            100.0 * sum(1 for u in unique_per_pos if u >= 2) / len(unique_per_pos)
+                        )
         cycle_metric_rows.append(cycle_row)
         if args.verbose:
             LOGGER.info("cycle %d metrics snapshot: %s",

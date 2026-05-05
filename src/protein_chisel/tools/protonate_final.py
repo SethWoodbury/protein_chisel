@@ -36,15 +36,26 @@ Why two modules:
     ``protonate_final.py`` runs ONCE at the end (only on top-K) and is
     PyRosetta-backed. It can afford the model load.
 
-REMARK 668 format (paired with REMARK 666):
+REMARK code split (so REMARK 666/668 are PURE DATA, grep-friendly):
 
-    REMARK 668 ---------------------------------------------------------------
-    REMARK 668 PROTONATION STATE + PTM OF CATALYTIC RESIDUES (PAIRED W/ R 666)
-    REMARK 668 ---------------------------------------------------------------
-    REMARK 668   <documentation block: STATE / PTM / ROSETTA_PATCH / H_ATOMS>
-    REMARK 668 IDX CHN RESN  RESI STATE PTM H_ATOMS                ROSETTA_PATCH
-    REMARK 668   1   A HIS    132   HID  -  HD1                    HIS_D
-    REMARK 668   3   A LYS    157   LYS KCX -                      LYS
+    REMARK 665   = column-key + format hint for REMARK 666 lines
+    REMARK 666   = data only (Rosetta enzyme-matcher anchor lines)
+    REMARK 667   = column-key + STATE/PTM legend for REMARK 668 lines
+    REMARK 668   = data only (one row per catalytic residue)
+
+Example output:
+
+    REMARK 665 REMARK 666 = Rosetta enzyme-matcher catalytic-motif anchors.
+    REMARK 665 fmt: REMARK 666 MATCH TEMPLATE <tCH tNAME tRESI> MATCH MOTIF <mCH mRESN mRESI IDX VAR>
+    REMARK 666 MATCH TEMPLATE B YYE  211 MATCH MOTIF A HIS   97  1  1
+    REMARK 666 MATCH TEMPLATE B YYE  211 MATCH MOTIF A LYS   19  3  1
+    ...
+    REMARK 667 REMARK 668 = catres protonation/PTM (paired by IDX with REMARK 666).
+    REMARK 667 STATE: HID/HIE/HIP (HIS); ASP/ASH; GLU/GLH; LYS/LYN/KCX; CYS/CYM/CYX; TYR/TYM.
+    REMARK 667 PTM = wwPDB CCD code (KCX,SEP,TPO,...) or '-' if none; ANNOTATION-ONLY.
+    REMARK 667 fmt: REMARK 668 <IDX CH RESN RESI STATE PTM H_ATOMS ROSETTA_PATCH>
+    REMARK 668   1   A HIS     97   HID -   HD1                     HIS
+    REMARK 668   3   A LYS     19   LYS KCX -                       LYS
     ...
 
 The ``IDX`` field is the integer that appears as the trailing motif-index
@@ -709,50 +720,26 @@ def detect_protonation_state(
 # ----------------------------------------------------------------------------
 
 
-_REMARK_668_HEADER: tuple[str, ...] = (
-    "REMARK 668 -----------------------------------------------------------------\n",
-    "REMARK 668 PROTONATION STATE + PTM OF CATALYTIC RESIDUES (PAIRED W/ R 666)\n",
-    "REMARK 668 -----------------------------------------------------------------\n",
-    "REMARK 668 Each entry below documents the protonation/tautomer state AND\n",
-    "REMARK 668 any post-translational modification of one catalytic residue\n",
-    "REMARK 668 listed in REMARK 666. The IDX field matches the trailing motif\n",
-    "REMARK 668 index of the corresponding REMARK 666 MATCH MOTIF line;\n",
-    "REMARK 668 CHN/RESN/RESI duplicate that line's chain, resname, resno for\n",
-    "REMARK 668 cross-check. STATE uses standard biochemistry conventions:\n",
-    "REMARK 668   HIS: HID (ND1-H, delta), HIE (NE2-H, epsilon), HIP (both)\n",
-    "REMARK 668   ASP: ASP (deprot), ASH (OD2-H)\n",
-    "REMARK 668   GLU: GLU (deprot), GLH (OE2-H)\n",
-    "REMARK 668   LYS: LYS (NH3+), LYN (NH2), KCX (carbamylated)\n",
-    "REMARK 668   CYS: CYS (thiol), CYM (thiolate), CYX (disulfide)\n",
-    "REMARK 668   TYR: TYR (phenol), TYM (phenolate)\n",
-    "REMARK 668 PTM is the wwPDB Chemical Component Dictionary 3-letter code\n",
-    "REMARK 668 for any post-translational modification known to be intended\n",
-    "REMARK 668 at this position (e.g. KCX, SEP, TPO, PTR, MLY, M3L, ALY, HYP).\n",
-    "REMARK 668 \"-\" means no PTM declared. PTM is set from explicit user/CLI\n",
-    "REMARK 668 declaration, the seed PDB resname, or auto-detect from the\n",
-    "REMARK 668 seed atom inventory (e.g. CX/OQ1/OQ2 -> KCX).\n",
-    "REMARK 668 PTM IS ANNOTATION-ONLY: the residue is kept as its unmodified\n",
-    "REMARK 668 form (RESN=LYS, not KCX) for Rosetta / sequence reading /\n",
-    "REMARK 668 protonation; the PTM column is metadata for downstream tools\n",
-    "REMARK 668 (docking, MD setup) that need to apply the modification.\n",
-    "REMARK 668 ROSETTA_PATCH is the Rosetta variant_type tag actually present\n",
-    "REMARK 668 in the dumped pose (HIS_D, KCX, etc.). H_ATOMS lists the side-\n",
-    "REMARK 668 chain protonating hydrogens present; \"-\" means none observed.\n",
-    "REMARK 668 -----------------------------------------------------------------\n",
-    # Header columns must align EXACTLY with the data-line format string in
-    # format_remark_668_line(). Data line layout (after "REMARK 668 " prefix):
-    #   col 12-14: IDX   (>3d), col 15: space
-    #   col 16-18: CHN   (>3s), col 19: space
-    #   col 20-23: RESN  (<4s), col 24: space
-    #   col 25-29: RESI  (>5d), col 30: space
-    #   col 31-35: STATE (>5s), col 36: space
-    #   col 37-39: PTM   (<3s), col 40: space
-    #   col 41-63: H_ATOMS (<23s), col 64: space
-    #   col 65-72: ROSETTA_PATCH (<8s)
-    "REMARK 668 IDX CHN RESN  RESI STATE PTM H_ATOMS                 ROSETTA_PATCH\n",
+# Aesthetic / column-header lines for REMARK 666 + REMARK 668 are emitted
+# under different REMARK codes (665 and 667 respectively) so that REMARK 666
+# and REMARK 668 lines are PURELY DATA and can be `grep`'d without false
+# hits on the documentation block.
+#
+# REMARK 665: column key for REMARK 666 (Rosetta enzyme-matcher motifs).
+# REMARK 667: column key + protonation-code legend for REMARK 668.
+#
+# Lines are kept short (<= 80 PDB columns) and dense.
+_REMARK_665_HEADER: tuple[str, ...] = (
+    "REMARK 665 REMARK 666 = Rosetta enzyme-matcher catalytic-motif anchors.\n",
+    "REMARK 665 fmt: REMARK 666 MATCH TEMPLATE <tCH tNAME tRESI> MATCH MOTIF <mCH mRESN mRESI IDX VAR>\n",
 )
-_REMARK_668_FOOTER: tuple[str, ...] = (
-    "REMARK 668 -----------------------------------------------------------------\n",
+
+_REMARK_667_HEADER: tuple[str, ...] = (
+    "REMARK 667 REMARK 668 = catres protonation/PTM (paired by IDX with REMARK 666).\n",
+    "REMARK 667 STATE: HID/HIE/HIP (HIS); ASP/ASH; GLU/GLH; LYS/LYN/KCX; CYS/CYM/CYX; TYR/TYM.\n",
+    "REMARK 667 PTM = wwPDB CCD code (KCX,SEP,TPO,PTR,MLY,M3L,ALY,HYP,...) or '-' if none;\n",
+    "REMARK 667 PTM is ANNOTATION-ONLY -- RESN keeps unmodified form; ROSETTA_PATCH = pose variant.\n",
+    "REMARK 667 fmt: REMARK 668 <IDX CH RESN RESI STATE PTM H_ATOMS ROSETTA_PATCH>\n",
 )
 
 
@@ -1082,7 +1069,9 @@ def build_remark_668_block(
     inventory = _collect_residue_atom_inventory(rosetta_pdb)
     resolved_ptm_map = resolve_ptm_map(seed_pdb, ptm_map)
 
-    lines: list[str] = list(_REMARK_668_HEADER)
+    # REMARK 667 is the documentation/column-header block for REMARK 668.
+    # REMARK 668 lines are PURE DATA (one per catalytic residue).
+    lines: list[str] = list(_REMARK_667_HEADER)
     for entry in motif_entries:
         key = (entry.motif_chain, entry.motif_resno)
         residue = inventory.get(key)
@@ -1117,7 +1106,6 @@ def build_remark_668_block(
                 ptm=ptm_code,
             )
         )
-    lines.extend(_REMARK_668_FOOTER)
     return lines
 
 
@@ -1127,17 +1115,30 @@ def build_remark_668_block(
 
 
 def _extract_seed_header_lines(seed_pdb: str | Path) -> list[str]:
-    """REMARK 666, HETNAM, LINK from the seed (these flow downstream)."""
+    """Header block to flow downstream: REMARK 665 (column key for 666),
+    REMARK 666 (verbatim from seed), HETNAM, LINK.
+    """
     keep_prefixes = ("REMARK 666", "HETNAM", "LINK")
-    out: list[str] = []
+    seed_lines: list[str] = []
     with open(seed_pdb) as fh:
         for line in fh:
             if _is_atom_line(line):
                 break
             for p in keep_prefixes:
                 if line.startswith(p):
-                    out.append(line if line.endswith("\n") else line + "\n")
+                    seed_lines.append(line if line.endswith("\n") else line + "\n")
                     break
+
+    # Inject REMARK 665 column-key header BEFORE the first REMARK 666
+    # (and only if REMARK 666 lines were found; HETNAM/LINK don't need it).
+    out: list[str] = []
+    inserted_665 = False
+    for line in seed_lines:
+        if not inserted_665 and line.startswith("REMARK 666"):
+            out.extend(_REMARK_665_HEADER)
+            inserted_665 = True
+        out.append(line)
+    # If no REMARK 666 was present, return whatever we had (HETNAM/LINK only)
     return out
 
 
@@ -1654,3 +1655,168 @@ def protonate_final_topk(
             LOGGER.warning("  failure %s: %s", name, err)
     summary["failures"] = failures
     return summary
+
+
+# ----------------------------------------------------------------------------
+# Shipping-layout reorganization
+# ----------------------------------------------------------------------------
+
+
+def reorganize_for_shipping(
+    run_dir: str | Path,
+    *,
+    strip_intermediates: bool = True,
+    pdb_subdir_name: str = "designs",
+) -> dict:
+    """Build a tidy "ready-to-ship" layout in ``run_dir``.
+
+    Production runs accumulate a heavy file tree:
+
+        run_dir/
+        ├── _seed_fpocket_workspace/
+        ├── cycle_00/  cycle_01/  cycle_02/
+        ├── final_topk/
+        │   ├── topk.tsv  topk.fasta  all_survivors.tsv
+        │   ├── topk_pdbs/                  (heavy-atom restored)
+        │   └── topk_pdbs_protonated/       (full-H, REMARK 668)
+        ├── fusion_runtime/
+        ├── manifest.json
+        ├── seed_tunnel_residues.tsv
+        └── cycle_metrics.tsv
+
+    The shipping layout collapses this to:
+
+        run_dir/
+        ├── designs/
+        │   └── <id>.pdb         (renamed from <id>.protonated.pdb;
+        │                          full-H, REMARK 665+666+667+668 + ligand)
+        ├── designs.tsv          (all top-K rows + new pdb_path column)
+        ├── designs.fasta        (one entry per design)
+        ├── cycle_metrics.tsv    (per-cycle quality dynamics)
+        └── manifest.json        (run config + counts + outputs map)
+
+    With ``strip_intermediates=False``, the heavy subtrees are KEPT alongside
+    the clean files (useful for deep diagnostics).
+
+    Args:
+        run_dir: Top-level run directory created by iterative_design_v2.
+        strip_intermediates: If True (default), remove cycle_NN/, the
+            unprotonated final_topk/topk_pdbs/, the seed fpocket workspace,
+            fusion_runtime/, seed_tunnel_residues.tsv, and the dual final_topk
+            wrapper. The final_topk/topk_pdbs_protonated/ contents become
+            the new run_dir/designs/.
+        pdb_subdir_name: Name of the per-design PDB directory.
+
+    Returns:
+        Stats dict with counts of files moved / removed.
+    """
+    import json as _json
+    import shutil as _shutil
+
+    run_dir = Path(run_dir)
+    stats = {
+        "designs_moved": 0,
+        "subdirs_removed": [],
+        "files_removed": [],
+        "designs_tsv_rows": 0,
+    }
+
+    final_dir = run_dir / "final_topk"
+    proto_dir = final_dir / "topk_pdbs_protonated"
+    raw_dir = final_dir / "topk_pdbs"
+    topk_tsv = final_dir / "topk.tsv"
+    topk_fasta = final_dir / "topk.fasta"
+
+    if not proto_dir.is_dir():
+        LOGGER.warning("reorganize_for_shipping: %s missing; nothing to do",
+                        proto_dir)
+        return stats
+
+    # 1. Move/rename protonated PDBs to run_dir/designs/<id>.pdb
+    designs_dir = run_dir / pdb_subdir_name
+    designs_dir.mkdir(exist_ok=True)
+    pdb_id_to_path: dict[str, Path] = {}
+    for src in proto_dir.iterdir():
+        if not (src.is_file() and src.name.endswith(".protonated.pdb")):
+            continue
+        # strip .protonated suffix; e.g. "FOO_lmpnn_004.protonated.pdb"
+        # -> "FOO_lmpnn_004.pdb"
+        new_name = src.name[: -len(".protonated.pdb")] + ".pdb"
+        dst = designs_dir / new_name
+        _shutil.move(str(src), str(dst))
+        pdb_id_to_path[dst.stem] = dst
+        stats["designs_moved"] += 1
+
+    # 2. Build designs.tsv from topk.tsv + a pdb_path column
+    if topk_tsv.is_file():
+        try:
+            import pandas as _pd
+            df = _pd.read_csv(topk_tsv, sep="\t")
+            if "id" in df.columns:
+                df["pdb_path"] = df["id"].map(
+                    lambda i: str(pdb_id_to_path[i]) if i in pdb_id_to_path else ""
+                )
+            df.to_csv(run_dir / "designs.tsv", sep="\t", index=False)
+            stats["designs_tsv_rows"] = len(df)
+        except Exception as exc:
+            LOGGER.warning("reorganize_for_shipping: could not write "
+                            "designs.tsv (%s); falling back to copying topk.tsv",
+                            exc)
+            _shutil.copy2(topk_tsv, run_dir / "designs.tsv")
+
+    # 3. Promote topk.fasta -> designs.fasta
+    if topk_fasta.is_file():
+        _shutil.copy2(topk_fasta, run_dir / "designs.fasta")
+
+    # 4. Remove heavy intermediates (default for shipping layout)
+    if strip_intermediates:
+        # cycle_NN/ heavy subdirs
+        for sub in run_dir.iterdir():
+            if sub.is_dir() and sub.name.startswith("cycle_"):
+                _shutil.rmtree(sub, ignore_errors=True)
+                stats["subdirs_removed"].append(sub.name)
+        # other transient dirs
+        for transient in (
+            "_seed_fpocket_workspace", "fusion_runtime",
+        ):
+            t = run_dir / transient
+            if t.exists():
+                _shutil.rmtree(t, ignore_errors=True)
+                stats["subdirs_removed"].append(transient)
+        # transient files
+        for fname in ("seed_tunnel_residues.tsv",):
+            f = run_dir / fname
+            if f.exists():
+                f.unlink()
+                stats["files_removed"].append(fname)
+        # entire final_topk/ subtree (we promoted what we needed)
+        if final_dir.is_dir():
+            _shutil.rmtree(final_dir, ignore_errors=True)
+            stats["subdirs_removed"].append("final_topk")
+
+    # 5. Update manifest.json with new output paths
+    manifest_path = run_dir / "manifest.json"
+    if manifest_path.is_file():
+        try:
+            with open(manifest_path) as f:
+                m = _json.load(f)
+            m.setdefault("outputs", {})
+            m["outputs"]["designs_dir"] = str(designs_dir)
+            m["outputs"]["designs_tsv"] = str(run_dir / "designs.tsv")
+            m["outputs"]["designs_fasta"] = str(run_dir / "designs.fasta")
+            m["shipping_layout"] = True
+            m["intermediates_stripped"] = bool(strip_intermediates)
+            with open(manifest_path, "w") as f:
+                _json.dump(m, f, indent=2)
+        except Exception as exc:
+            LOGGER.warning("reorganize_for_shipping: manifest update failed: %s",
+                            exc)
+
+    LOGGER.info(
+        "reorganize_for_shipping: %d designs -> %s; designs.tsv rows=%d; "
+        "stripped %d subdirs (%s) %d files",
+        stats["designs_moved"], designs_dir, stats["designs_tsv_rows"],
+        len(stats["subdirs_removed"]), ",".join(stats["subdirs_removed"]),
+        len(stats["files_removed"]),
+    )
+    return stats

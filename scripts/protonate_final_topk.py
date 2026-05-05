@@ -43,6 +43,18 @@ def main() -> int:
                    help="Keep .rosetta.pdb intermediates for inspection")
     p.add_argument("--summary_json", type=Path, default=None,
                    help="Write run summary stats to this JSON path")
+    p.add_argument("--shipping_layout", action="store_true",
+                   help="After protonation, REORGANIZE the parent run_dir "
+                        "into a clean shipping layout: run_dir/designs/*.pdb "
+                        "(renamed from .protonated.pdb), run_dir/designs.tsv "
+                        "(top-K with pdb_path), run_dir/designs.fasta, and "
+                        "removes heavy cycle_NN/ subtrees + the dual "
+                        "final_topk wrapper. Pair with --keep_intermediates "
+                        "if you want intermediates preserved.")
+    p.add_argument("--no_strip_intermediates", action="store_true",
+                   help="With --shipping_layout, also keep cycle_NN/ etc. "
+                        "Useful for diagnostics. Default behavior with "
+                        "--shipping_layout strips them.")
     p.add_argument("--ptm", type=str, default=None,
                    help="Comma-separated PTM declarations recorded in the "
                         "output PDB's REMARK 668 block. ANNOTATION ONLY: "
@@ -82,6 +94,16 @@ def main() -> int:
         keep_intermediate=args.keep_intermediate,
         ptm_map=args.ptm,
     )
+
+    if args.shipping_layout:
+        from protein_chisel.tools.protonate_final import reorganize_for_shipping
+        # The run_dir is the parent of topk_dir's parent (final_topk/topk_pdbs)
+        run_dir = args.topk_dir.parent.parent
+        reorg_stats = reorganize_for_shipping(
+            run_dir=run_dir,
+            strip_intermediates=not args.no_strip_intermediates,
+        )
+        summary["shipping_layout"] = reorg_stats
 
     print(json.dumps({k: v for k, v in summary.items() if k != "failures"}, indent=2))
     if summary.get("failures"):
