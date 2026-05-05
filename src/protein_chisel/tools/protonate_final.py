@@ -111,6 +111,13 @@ _SIDECHAIN_PROTON_ATOMS: dict[str, frozenset[str]] = {
 # Standard 20 AA + common Rosetta variants we will rename to 3-char form on
 # write. Anything else that has a 5-char Rosetta label is an unexpected case
 # and we'll keep the 5-char label rather than silently lose info.
+#
+# KCX is intentionally NOT mapped: it is already a 3-char code in standard
+# PDB format (no column overflow) and Rosetta dumps the carbamate atoms
+# (CX, OQ1, OQ2 [, HQ]) under the KCX resname. Renaming to LYS would leave
+# those atoms orphaned under a "LYS" residue — most parsers reject that.
+# Downstream tools should treat KCX as a non-canonical residue using
+# REMARK 666 + REMARK 668 metadata.
 _VARIANT_TO_STANDARD: dict[str, str] = {
     "HIS_D": "HIS",
     "HIS_E": "HIS",
@@ -124,7 +131,6 @@ _VARIANT_TO_STANDARD: dict[str, str] = {
     "GLU_P1": "GLU",
     "GLU_P2": "GLU",
     "LYN": "LYS",
-    "KCX": "LYS",   # write as LYS for column compliance; KCX recorded in REMARK 668
     "CYM": "CYS",
     "CYX": "CYS",
     "TYM": "TYR",
@@ -184,15 +190,25 @@ def _looks_like_hydrogen(line: str) -> bool:
 
 
 def _rewrite_resname_to_standard(line: str, new_resname: str) -> str:
-    """Rewrite cols 17-21 to a clean 3-char residue name (right-padded with
-    spaces so chain ID at col 22 is preserved). Works whether the input had
-    a 5-char Rosetta label or a normal 3-char label.
+    """Rewrite an ATOM/HETATM line so cols 17-22 hold:
+        col 17:    alt-loc indicator (blank)
+        col 18-20: 3-char residue name
+        col 21:    blank
+        col 22:    chain ID (preserved from input col 22 = Python index 21)
+
+    Works for both already-standard 3-char input and overflow 5-char input
+    (HIS_D/HIE/HIP/etc.) where the chain ID lives at col 22 on disk
+    regardless of the resname width.
     """
-    if len(line) < 21:
+    if len(line) < 22:
         return line
-    # cols 17-19 = 3-char resname, col 20-21 = blank for standard residues.
-    # Use 3-char left-aligned name + 2 spaces.
-    return line[:17] + new_resname.ljust(3) + "  " + line[22:]
+    return (
+        line[:16]                # cols 1-16: atom name region
+        + " "                     # col 17:    alt-loc blank
+        + new_resname.ljust(3)    # cols 18-20: 3-char resname
+        + " "                     # col 21:    blank
+        + line[21:]               # col 22 onward: chain ID + rest
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -377,6 +393,15 @@ _REMARK_668_HEADER: tuple[str, ...] = (
     "REMARK 668 H_ATOMS lists the side-chain protonating hydrogens present;\n",
     "REMARK 668 \"-\" means no protonating H found (deprotonated form).\n",
     "REMARK 668 -----------------------------------------------------------------\n",
+    # Header columns must align EXACTLY with the data-line format string in
+    # format_remark_668_line(). Data line layout (after "REMARK 668 " prefix):
+    #   col 12-14: IDX (>3d), col 15: space
+    #   col 16-18: CHN (>3s), col 19: space
+    #   col 20-23: RESN (<4s), col 24: space
+    #   col 25-29: RESI (>5d), col 30: space
+    #   col 31-35: STATE (>5s), col 36: space
+    #   col 37-63: H_ATOMS (<27s), col 64: space
+    #   col 65-72: ROSETTA_PATCH (<8s)
     "REMARK 668 IDX CHN RESN  RESI STATE H_ATOMS                     ROSETTA_PATCH\n",
 )
 _REMARK_668_FOOTER: tuple[str, ...] = (
@@ -728,6 +753,37 @@ def normalize_pdb_for_pyrosetta(
     return variant_map
 
 
+_PYROSETTA_INITED: bool = False
+
+
+def _ensure_pyrosetta_inited(
+    ligand_params: Optional[Iterable[str | Path]] = None,
+    extra_init_flags: Optional[Iterable[str]] = None,
+) -> None:
+    """Initialize PyRosetta once per process.
+
+    PyRosetta is a singleton — the first call to ``init`` controls the
+    options for the entire session. Subsequent calls are no-ops, so for
+    a directory of PDBs sharing the same ligand params we want to init
+    once with the right ``-extra_res_fa`` set rather than per PDB.
+    """
+    global _PYROSETTA_INITED
+    if _PYROSETTA_INITED:
+        return
+    import pyrosetta  # type: ignore[import-not-found]
+
+    flags: list[str] = ["-mute all", "-out:level 0"]
+    if ligand_params:
+        params_paths = [str(Path(p).resolve()) for p in ligand_params]
+        flags.append("-extra_res_fa " + " ".join(params_paths))
+    flags.append("-ignore_unrecognized_res")
+    flags.append("-load_PDB_components false")
+    if extra_init_flags:
+        flags.extend(extra_init_flags)
+    pyrosetta.init(" ".join(flags), silent=True)
+    _PYROSETTA_INITED = True
+
+
 def protonate_pdb_with_pyrosetta(
     input_pdb: str | Path,
     out_pdb: str | Path,
@@ -756,18 +812,9 @@ def protonate_pdb_with_pyrosetta(
     out_pdb = str(out_pdb)
     Path(out_pdb).parent.mkdir(parents=True, exist_ok=True)
 
+    _ensure_pyrosetta_inited(ligand_params=ligand_params,
+                              extra_init_flags=extra_init_flags)
     import pyrosetta  # type: ignore[import-not-found]
-
-    flags: list[str] = ["-mute all", "-out:level 0"]
-    if ligand_params:
-        params_paths = [str(Path(p).resolve()) for p in ligand_params]
-        flags.append("-extra_res_fa " + " ".join(params_paths))
-    flags.append("-ignore_unrecognized_res")
-    flags.append("-load_PDB_components false")
-    if extra_init_flags:
-        flags.extend(extra_init_flags)
-
-    pyrosetta.init(" ".join(flags), silent=True)
 
     pose = pyrosetta.pose_from_pdb(input_pdb)
 
