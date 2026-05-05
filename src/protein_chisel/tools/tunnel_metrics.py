@@ -861,20 +861,23 @@ def pyKVFinder_score(
             "pkvf__has_opening": 0,
             "pkvf__elapsed_ms": (time.perf_counter() - t0) * 1000.0,
         }
-    # pyKVFinder 0.9: spatial() returns (cavity_grid, surface_dict, volume_dict).
-    #                 depth()   returns (depth_grid, max_depth_dict, avg_depth_dict).
+    # pyKVFinder 0.9 returns:
+    #   spatial()  -> (cavity_grid, surface_dict, volume_dict)
+    #   depth()    -> (depth_grid, max_depth_dict, avg_depth_dict)
+    #   openings() -> (n_openings, openings_grid, areas_dict)
+    # We use openings() as the authoritative "is the cavity surface-
+    # connected?" signal — depth alone doesn't tell us this since both
+    # buried and open cavities have non-zero interior depth.
     spatial_out = pyKVFinder.spatial(cavities)
-    if isinstance(spatial_out, tuple) and len(spatial_out) >= 3:
-        volumes = spatial_out[2]
-    elif isinstance(spatial_out, tuple) and len(spatial_out) >= 1:
-        volumes = spatial_out[-1]
-    else:
-        volumes = spatial_out
+    volumes = spatial_out[2] if isinstance(spatial_out, tuple) and len(spatial_out) >= 3 else spatial_out
     depth_out = pyKVFinder.depth(cavities)
-    if isinstance(depth_out, tuple) and len(depth_out) >= 2:
-        max_depths = depth_out[1]
-    else:
-        max_depths = None
+    max_depths = depth_out[1] if isinstance(depth_out, tuple) and len(depth_out) >= 2 else None
+    try:
+        openings_out = pyKVFinder.openings(cavities)
+        n_openings = int(openings_out[0]) if isinstance(openings_out, tuple) else int(openings_out)
+    except Exception as exc:
+        LOGGER.debug("pyKVFinder.openings failed (%s); falling back to depth heuristic", exc)
+        n_openings = -1  # unknown
 
     # Largest cavity by volume
     if hasattr(volumes, "items") and len(volumes) > 0:
@@ -890,12 +893,17 @@ def pyKVFinder_score(
         largest_vol = 0.0
         depth_max = 0.0
     largest_vol = float(largest_vol)
-    # Has opening: cavities with non-zero max depth touch the surface
-    has_opening = int(depth_max > 0.5)
+    # has_opening: prefer pyKVFinder.openings() count (authoritative).
+    # Fall back to depth-based heuristic if that call failed.
+    if n_openings >= 0:
+        has_opening = int(n_openings > 0)
+    else:
+        has_opening = int(depth_max > 0.5)
     return {
         "pkvf__cavity_volume": largest_vol,
         "pkvf__cavity_depth_max": depth_max,
         "pkvf__n_cavities": int(ncav),
+        "pkvf__n_openings": int(n_openings) if n_openings >= 0 else -1,
         "pkvf__has_opening": has_opening,
         "pkvf__elapsed_ms": (time.perf_counter() - t0) * 1000.0,
     }

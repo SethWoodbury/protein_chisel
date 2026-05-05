@@ -1481,26 +1481,26 @@ def stage_tunnel_metrics(
     metrics_df = pd.DataFrame(rows)
     merged = df.merge(metrics_df, on="id", how="left")
 
-    # Hard-gate logic: drop rows whose pocket is unfixable. Always log
-    # WHY designs were gated for diagnostics.
+    # Hard-gate logic: drop only designs the homegrown ray-cast says are
+    # truly unfixable (verdict='buried' = backbone-dominated or no
+    # escape cones). pyKVFinder columns are surfaced as TOPSIS-rankable
+    # metrics but NOT as hard gates — n_openings > 0 is too permissive
+    # and depth_max=0 too aggressive for blanket rejection. Designs
+    # with bad pkvf signals get RANKED DOWN, not killed.
     if hard_gate:
         before = len(merged)
         bad_verdict = merged["tunnel__verdict"].astype(str).isin(
             ["buried", "ligand_too_big"]
         )
-        bad_pkvf = (
-            merged["pkvf__has_opening"].fillna(1) == 0
-            if "pkvf__has_opening" in merged.columns
-            else pd.Series(False, index=merged.index)
-        )
-        keep_mask = ~(bad_verdict | bad_pkvf)
+        keep_mask = ~bad_verdict
         merged = merged[keep_mask].reset_index(drop=True)
         n_dropped = before - len(merged)
         LOGGER.info(
             "stage_tunnel_metrics hard_gate: dropped %d / %d "
-            "(buried=%d, ligand_too_big=%d, pkvf_no_opening=%d) -> %d kept",
+            "(buried=%d, ligand_too_big=%d) -> %d kept "
+            "(pkvf_no_opening=%d kept as TOPSIS rank-down signal)",
             n_dropped, before, n_buried, n_ligand_too_big,
-            n_pkvf_no_opening, len(merged),
+            len(merged), n_pkvf_no_opening,
         )
 
     out_path = out_dir / "survivors_tunnel.tsv"
