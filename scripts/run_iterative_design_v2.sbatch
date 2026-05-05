@@ -51,13 +51,21 @@ OMIT_AA="${OMIT_AA:-CX}"
 # detected per-residue omits.
 USE_SIDE_CHAIN_CONTEXT="${USE_SIDE_CHAIN_CONTEXT:-0}"
 
-# Post-translational modifications declared for catalytic residues. The
-# final --protonate_final stage records these in the output PDB's
-# REMARK 668 block so downstream consumers (docking, MD setup) know the
-# residue should carry the PTM even if the seed PDB stores it
-# unmodified. PTE_i1 has Lys 157 as the carbamate-bearing metal-bridging
-# lysine (KCX). For other scaffolds, override via env or pass empty.
-PTM="${PTM:-A:157=KCX}"
+# Post-translational modifications declared for catalytic residues.
+# Records the modification in the output PDB's REMARK 668 block so
+# downstream consumers (docking, MD setup) know the residue should
+# carry the PTM even if the seed PDB stores it unmodified.
+#
+# ANNOTATION ONLY — residues are kept as their unmodified form for
+# Rosetta / sequence / protonation. PTM is metadata.
+#
+# Use the motif-index form so the spec stays stable across the design
+# campaign even when the catalytic-residue sequence position varies
+# between scaffolds. Format: 'CHAIN/EXPECTED_RESNAME/MOTIF_INDEX:PTM'.
+# PTE_i1: REMARK 666 motif index 3 is the catalytic Lys, which is
+# carbamylated (KCX) in the active form. Override per-scaffold by
+# setting PTM='' or PTM='A/LYS/3:KCX,A/HIS/1:MSE' etc.
+PTM="${PTM:-A/LYS/3:KCX}"
 
 # Optional pLDDT-enhanced LigandMPNN checkpoint (--enhance flag).
 # Empty string = use the standard ligand_mpnn checkpoint. Available

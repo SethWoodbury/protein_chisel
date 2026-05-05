@@ -2801,14 +2801,18 @@ def main() -> None:
                    help="Path to pyrosetta.sif used by --protonate_final.")
     p.add_argument("--ptm", type=str,
                    default="",
-                   help="Comma-separated PTM declarations for catalytic "
-                        "residues that the seed PDB doesn't express but "
-                        "downstream pipeline must know about. Empty "
-                        "default — caller must opt in per scaffold. "
-                        "PTE_i1 typically passes 'A:157=KCX' (Lys 157 is "
-                        "carbamylated). Other examples: 'A:157=KCX,A:200=SEP'. "
-                        "Use '-' as code to force no-PTM annotation "
-                        "(overrides auto-detect from seed atoms).")
+                   help="Comma-separated PTM declarations recorded in the "
+                        "output PDB's REMARK 668 block. ANNOTATION ONLY — "
+                        "residues are NOT modified for Rosetta/sequence/"
+                        "protonation handling. Two spec formats: "
+                        "(a) motif-index form 'A/LYS/3:KCX' = chain A "
+                        "REMARK 666 motif index 3 (expected LYS) -> KCX "
+                        "(preferred for catalytic residues; stable across "
+                        "a design campaign even when sequence position "
+                        "varies); (b) explicit-residue form 'A:157=KCX'. "
+                        "Empty default — caller must opt in per scaffold. "
+                        "PTE_i1: 'A/LYS/3:KCX' (catalytic lysine motif). "
+                        "Use '-' as code to force no-PTM annotation.")
     p.add_argument("--consensus_threshold", type=float, default=0.90,
                    help="Cycle k+1 consensus reinforcement: AA frequency "
                         "across cycle-k survivors required to 'agree' "

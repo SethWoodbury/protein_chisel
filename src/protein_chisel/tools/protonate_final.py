@@ -664,10 +664,11 @@ _REMARK_668_HEADER: tuple[str, ...] = (
     "REMARK 668 at this position (e.g. KCX, SEP, TPO, PTR, MLY, M3L, ALY, HYP).\n",
     "REMARK 668 \"-\" means no PTM declared. PTM is set from explicit user/CLI\n",
     "REMARK 668 declaration, the seed PDB resname, or auto-detect from the\n",
-    "REMARK 668 seed atom inventory (e.g. CX/OQ1/OQ2 -> KCX). RESN may show the\n",
-    "REMARK 668 unmodified residue (e.g. LYS) even when PTM=KCX, because the\n",
-    "REMARK 668 reference structure stored the residue in unmodified form;\n",
-    "REMARK 668 PTM tells downstream consumers what modification to apply.\n",
+    "REMARK 668 seed atom inventory (e.g. CX/OQ1/OQ2 -> KCX).\n",
+    "REMARK 668 PTM IS ANNOTATION-ONLY: the residue is kept as its unmodified\n",
+    "REMARK 668 form (RESN=LYS, not KCX) for Rosetta / sequence reading /\n",
+    "REMARK 668 protonation; the PTM column is metadata for downstream tools\n",
+    "REMARK 668 (docking, MD setup) that need to apply the modification.\n",
     "REMARK 668 ROSETTA_PATCH is the Rosetta variant_type tag actually present\n",
     "REMARK 668 in the dumped pose (HIS_D, KCX, etc.). H_ATOMS lists the side-\n",
     "REMARK 668 chain protonating hydrogens present; \"-\" means none observed.\n",
@@ -727,22 +728,96 @@ def format_remark_668_line(
     )
 
 
-def parse_ptm_map(spec: str | None) -> dict[tuple[str, int], str]:
-    """Parse a CLI/API PTM spec into a ``{(chain, resno) -> code}`` map.
+@dataclasses.dataclass
+class PtmSpec:
+    """One parsed PTM declaration.
 
-    Accepted formats (mix-and-match in a comma list):
-        "A:157=KCX"           # chain:resno=code
-        "A157=KCX"            # chain<resno>=code (no colon)
-        "157=KCX"             # default chain (treated as 'A')
-    Whitespace and trailing semicolons are tolerated.
+    Two addressing modes (exactly one set):
+
+        * ``resno`` — explicit residue number on ``chain``. Format
+          ``"A:157=KCX"``. Use when the residue is known by sequence
+          position.
+
+        * ``motif_idx`` — REMARK 666 motif index. Format
+          ``"A/LYS/3:KCX"``. Resolved against the seed PDB's REMARK 666
+          entries: the motif with trailing index 3 (5th column from the
+          end of the MATCH MOTIF line) on chain A is the catalytic
+          residue this declaration applies to. Use this for design
+          campaigns where the catalytic residue has a stable motif
+          index but its sequence position varies between scaffolds.
+          ``expected_resname`` is a sanity-check hint (e.g. "LYS") —
+          a warning is logged if the seed's motif residue at that
+          index is NOT this residue.
+
+    PTM declarations are ANNOTATION ONLY: they appear in REMARK 668 of
+    the output PDB but do NOT modify the residue's coordinates,
+    resname (still LYS, not KCX), Rosetta variant type, sequence
+    reading, or protonation. The PTM column in REMARK 668 tells
+    downstream consumers (docking, MD setup) what modification the
+    design intent calls for.
     """
-    out: dict[tuple[str, int], str] = {}
+    chain: str
+    code: str
+    resno: int | None = None
+    motif_idx: int | None = None
+    expected_resname: str | None = None
+
+
+def parse_ptm_map(
+    spec: str | Iterable[str] | None,
+) -> list[PtmSpec]:
+    """Parse a CLI/API PTM spec string (or iterable of strings) into specs.
+
+    Accepted entry formats (mix-and-match in a comma- or whitespace-
+    separated list, or pass a Python list of single-spec strings):
+
+        * Motif-index form (preferred for catalytic residues):
+            ``"A/LYS/3:KCX"``
+              chain ``A``, expected_resname ``LYS``, REMARK 666 motif
+              index 3, PTM code ``KCX``.
+
+        * Explicit-residue form (use for non-motif residues):
+            ``"A:157=KCX"``     chain:resno=code
+            ``"A157=KCX"``      chain<resno>=code (no colon)
+            ``"157=KCX"``       default chain ('A')
+
+    Use ``"-"`` as the code to FORCE no-PTM annotation at that residue
+    (overrides any auto-detect from the seed atom inventory).
+
+    Returns:
+        List of :class:`PtmSpec`. Empty list if ``spec`` is empty/None.
+    """
+    out: list[PtmSpec] = []
     if not spec:
         return out
-    parts = re.split(r"[,;\s]+", spec.strip())
+    if isinstance(spec, str):
+        # Allow comma, semicolon, or whitespace separators.
+        parts = [p for p in re.split(r"[,;\s]+", spec.strip()) if p]
+    else:
+        parts = [str(p).strip() for p in spec if str(p).strip()]
+
     for part in parts:
-        if not part:
+        # Motif-index form: "A/LYS/3:KCX"
+        m = re.match(r"^([A-Za-z])\s*/\s*([A-Za-z0-9]{1,5})\s*/\s*(\d+)\s*:\s*(\S+)$", part)
+        if m:
+            chain = m.group(1)
+            expected_resname = m.group(2).upper()
+            motif_idx = int(m.group(3))
+            code = m.group(4).strip().upper()
+            if code not in PTMS and code != "-":
+                LOGGER.warning(
+                    "parse_ptm_map: PTM code %r at motif index %d (chain %s, "
+                    "expected resname %s) is not in PTMS registry; emitting "
+                    "the annotation but downstream tools may not recognize it",
+                    code, motif_idx, chain, expected_resname,
+                )
+            out.append(PtmSpec(
+                chain=chain, code=code,
+                motif_idx=motif_idx, expected_resname=expected_resname,
+            ))
             continue
+
+        # Explicit-residue form: "A:157=KCX" / "A157=KCX" / "157=KCX"
         try:
             key, code = part.split("=", 1)
         except ValueError:
@@ -758,11 +833,11 @@ def parse_ptm_map(spec: str | None) -> dict[tuple[str, int], str]:
         resno = int(m.group(2))
         if code not in PTMS and code != "-":
             LOGGER.warning(
-                "parse_ptm_map: PTM code %r at %s%d is not in known PTMS "
-                "registry; emitting it but downstream tools may not recognize",
+                "parse_ptm_map: PTM code %r at %s%d is not in PTMS registry; "
+                "emitting the annotation but downstream tools may not recognize",
                 code, chain, resno,
             )
-        out[(chain, resno)] = code
+        out.append(PtmSpec(chain=chain, code=code, resno=resno))
     return out
 
 
@@ -807,39 +882,116 @@ def detect_ptms_from_inventory(
     return out
 
 
+def _resolve_motif_specs_to_keys(
+    seed_pdb: str | Path,
+    specs: Iterable[PtmSpec],
+) -> list[tuple[tuple[str, int], str]]:
+    """Resolve PtmSpec entries to ``[((chain, resno), code), ...]`` pairs.
+
+    For ``motif_idx`` specs, look up the corresponding REMARK 666 entry
+    in ``seed_pdb`` and use its ``motif_chain`` and ``motif_resno``.
+    Validates that the chain matches and warns if the expected resname
+    doesn't match the seed's recorded motif residue.
+
+    Specs that fail to resolve (no matching motif index, etc.) are
+    skipped with a warning.
+    """
+    motif_entries = parse_remark_666(seed_pdb)
+    by_idx: dict[int, Remark666Entry] = {e.motif_idx if False else e.motif_index: e for e in motif_entries}
+    out: list[tuple[tuple[str, int], str]] = []
+    for spec in specs:
+        if spec.resno is not None:
+            out.append(((spec.chain, spec.resno), spec.code))
+            continue
+        if spec.motif_idx is None:
+            LOGGER.warning("PtmSpec has neither resno nor motif_idx: %r", spec)
+            continue
+        entry = by_idx.get(spec.motif_idx)
+        if entry is None:
+            LOGGER.warning(
+                "PtmSpec %r references REMARK 666 motif index %d which is "
+                "not present in seed PDB; skipping. Available indices: %s",
+                spec, spec.motif_idx, sorted(by_idx.keys()),
+            )
+            continue
+        if entry.motif_chain != spec.chain:
+            LOGGER.warning(
+                "PtmSpec %r expected chain %r at motif index %d but seed "
+                "has chain %r; using the seed's chain (%r) anyway",
+                spec, spec.chain, spec.motif_idx,
+                entry.motif_chain, entry.motif_chain,
+            )
+        if (spec.expected_resname is not None
+                and entry.motif_resname != spec.expected_resname):
+            LOGGER.warning(
+                "PtmSpec %r expected resname %r at chain %s motif index %d "
+                "but seed has %r; the PTM annotation will still be applied "
+                "(no residue handling change)",
+                spec, spec.expected_resname, entry.motif_chain,
+                spec.motif_idx, entry.motif_resname,
+            )
+        out.append(((entry.motif_chain, entry.motif_resno), spec.code))
+    return out
+
+
 def resolve_ptm_map(
     seed_pdb: str | Path,
-    explicit_ptm_map: Optional[dict[tuple[str, int], str]] = None,
+    explicit_ptm: Optional[
+        dict[tuple[str, int], str] | Iterable[PtmSpec] | str
+    ] = None,
 ) -> dict[tuple[str, int], str]:
     """Resolve the final PTM map for a design from all available sources.
 
     Trust order (later wins):
         1. Auto-detect from the seed PDB's atom inventory + resnames.
-        2. Explicit ``explicit_ptm_map`` from CLI/API. Use "-" as the
-           value to FORCE no-PTM for a residue (overrides auto-detect).
+        2. Explicit user/CLI declarations from ``explicit_ptm``. Use
+           ``"-"`` as the code to FORCE no-PTM at that residue
+           (overrides auto-detect).
 
     Args:
-        seed_pdb: Reference PDB to scan for PTM markers.
-        explicit_ptm_map: User-supplied overrides.
+        seed_pdb: Reference PDB to scan for PTM markers and (when
+            spec uses motif-index form) REMARK 666 entries.
+        explicit_ptm: User-supplied overrides. Accepts:
+            * a string CLI spec (e.g. ``"A/LYS/3:KCX,A:200=SEP"``)
+            * a list of :class:`PtmSpec`
+            * a pre-resolved ``{(chain, resno) -> code}`` dict
 
     Returns:
-        Final ``{(chain, resno) -> ptm_code}`` map (without "-" entries).
+        Final ``{(chain, resno) -> ptm_code}`` map (with "-" entries
+        removed).
     """
     inventory = _collect_residue_atom_inventory(seed_pdb)
     final: dict[tuple[str, int], str] = dict(detect_ptms_from_inventory(inventory))
-    if explicit_ptm_map:
-        for key, code in explicit_ptm_map.items():
-            if code == "-":
-                final.pop(key, None)
-            else:
-                final[key] = code
+
+    if explicit_ptm is None:
+        return final
+
+    # Coerce input to list[PtmSpec]
+    specs: list[PtmSpec]
+    if isinstance(explicit_ptm, str):
+        specs = parse_ptm_map(explicit_ptm)
+    elif isinstance(explicit_ptm, dict):
+        specs = [
+            PtmSpec(chain=chain, code=code, resno=resno)
+            for (chain, resno), code in explicit_ptm.items()
+        ]
+    else:
+        specs = list(explicit_ptm)
+
+    for key, code in _resolve_motif_specs_to_keys(seed_pdb, specs):
+        if code == "-":
+            final.pop(key, None)
+        else:
+            final[key] = code
     return final
 
 
 def build_remark_668_block(
     rosetta_pdb: str | Path,
     seed_pdb: str | Path,
-    ptm_map: Optional[dict[tuple[str, int], str]] = None,
+    ptm_map: Optional[
+        dict[tuple[str, int], str] | Iterable[PtmSpec] | str
+    ] = None,
 ) -> list[str]:
     """Build the full REMARK 668 block for a hydrated design PDB.
 
@@ -849,9 +1001,13 @@ def build_remark_668_block(
     Args:
         rosetta_pdb: PyRosetta-hydrated dump (source of STATE / H_ATOMS).
         seed_pdb: Original seed PDB (source of REMARK 666 + auto-detected PTMs).
-        ptm_map: User-supplied overrides as a ``{(chain, resno) -> code}``
-            map. Use "-" as the value to FORCE no-PTM annotation for a
-            residue. ``None`` defaults to auto-detect-only from seed.
+        ptm_map: User-supplied PTM declarations. Accepts:
+            * a string spec (e.g. ``"A/LYS/3:KCX,A:200=SEP"``)
+            * a list of :class:`PtmSpec`
+            * a pre-resolved ``{(chain, resno) -> code}`` dict
+            Use ``"-"`` as the code to FORCE no-PTM annotation
+            (overrides auto-detect from seed atoms). ``None`` defaults
+            to auto-detect-only from seed atom inventory.
     """
     motif_entries = parse_remark_666(seed_pdb)
     if not motif_entries:
@@ -965,7 +1121,9 @@ def write_clean_final_pdb(
     seed_pdb: str | Path,
     out_pdb: str | Path,
     ligand_resname: Optional[str] = None,
-    ptm_map: Optional[dict[tuple[str, int], str]] = None,
+    ptm_map: Optional[
+        dict[tuple[str, int], str] | Iterable[PtmSpec] | str
+    ] = None,
 ) -> dict:
     """Combine a Rosetta-hydrated PDB with the seed's REMARK 666 + ligand.
 
@@ -1321,7 +1479,9 @@ def protonate_final_topk(
     out_dir: Optional[str | Path] = None,
     ligand_resname: Optional[str] = None,
     keep_intermediate: bool = False,
-    ptm_map: Optional[dict[tuple[str, int], str] | str] = None,
+    ptm_map: Optional[
+        dict[tuple[str, int], str] | Iterable[PtmSpec] | str
+    ] = None,
 ) -> dict:
     """End-to-end driver for the post-design protonation cleanup.
 
@@ -1350,6 +1510,9 @@ def protonate_final_topk(
     Returns:
         Stats dict aggregated across all PDBs processed.
     """
+    # Normalize ptm_map to a list[PtmSpec] for consistent downstream
+    # handling. Strings get parsed; pre-built dicts stay as dicts (still
+    # accepted by resolve_ptm_map).
     if isinstance(ptm_map, str):
         ptm_map = parse_ptm_map(ptm_map)
     topk_dir = Path(topk_dir)

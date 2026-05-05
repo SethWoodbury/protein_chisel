@@ -44,11 +44,20 @@ def main() -> int:
     p.add_argument("--summary_json", type=Path, default=None,
                    help="Write run summary stats to this JSON path")
     p.add_argument("--ptm", type=str, default=None,
-                   help="Comma-separated PTM declarations for catalytic "
-                        "residues that the seed PDB doesn't express but "
-                        "downstream pipeline must know about. Examples: "
-                        "'A:157=KCX' (lysine 157 on chain A is "
-                        "carbamylated), 'A:157=KCX,A:200=SEP' (multiple). "
+                   help="Comma-separated PTM declarations recorded in the "
+                        "output PDB's REMARK 668 block. ANNOTATION ONLY: "
+                        "the residue is left as its unmodified form (LYS, "
+                        "not KCX) for Rosetta / sequence reading / "
+                        "protonation; the PTM column is metadata for "
+                        "downstream tools. "
+                        "Two spec formats: "
+                        "(a) motif-index form 'A/LYS/3:KCX' = chain A, "
+                        "expected resname LYS, REMARK 666 motif index 3, "
+                        "PTM code KCX (preferred for catalytic residues — "
+                        "stable across a design campaign even when the "
+                        "sequence position varies between scaffolds); "
+                        "(b) explicit-residue form 'A:157=KCX' = chain A "
+                        "residue 157 -> KCX. "
                         "Use '-' as code to FORCE no-PTM (overrides "
                         "auto-detect from seed atom inventory).")
     args = p.parse_args()
