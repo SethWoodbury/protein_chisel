@@ -3007,12 +3007,31 @@ def run_cycle(
                     throat_telem["n_positions_targeted"],
                     max((p["max_penalty_nats"] for p in throat_telem["positions"]), default=0.0),
                 )
-                # Save telemetry for offline inspection
-                with open(cycle_dir / "throat_blocker_telemetry.json", "w") as fh:
-                    json.dump({
-                        "blocker_stats": {str(k): v for k, v in blocker_stats.items()},
-                        "throat_telemetry": throat_telem,
-                    }, fh, indent=2, default=str)
+                # Save telemetry for offline inspection — into BOTH the
+                # cycle dir (gets stripped by --shipping_layout) AND the
+                # run_dir top level (survives stripping).
+                cycle_telem_path = cycle_dir / "throat_blocker_telemetry.json"
+                run_dir_path = cycle_dir.parent
+                aggregate_path = run_dir_path / "throat_blocker_telemetry.json"
+                payload = {
+                    "blocker_stats": {str(k): v for k, v in blocker_stats.items()},
+                    "throat_telemetry": throat_telem,
+                }
+                with open(cycle_telem_path, "w") as fh:
+                    json.dump(payload, fh, indent=2, default=str)
+                # Append-style: read existing if present, append this cycle
+                try:
+                    if aggregate_path.is_file():
+                        existing = json.load(open(aggregate_path))
+                        if "per_cycle" not in existing:
+                            existing = {"per_cycle": {}}
+                    else:
+                        existing = {"per_cycle": {}}
+                    existing["per_cycle"][str(cycle_cfg.cycle_idx)] = payload
+                    with open(aggregate_path, "w") as fh:
+                        json.dump(existing, fh, indent=2, default=str)
+                except Exception:
+                    pass
         except Exception as exc:
             LOGGER.warning("throat-bias delta computation failed: %s", exc)
 

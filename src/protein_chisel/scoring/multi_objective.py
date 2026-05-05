@@ -169,6 +169,14 @@ DEFAULT_METRIC_SPECS: list[MetricSpec] = [
     # Pocket geometry
     MetricSpec("fpocket__bottleneck_radius","target", 0.3, target=3.65,  label="bottleneck"),
     MetricSpec("fpocket__hydrophobicity_score", "target", 0.2, target=45.0, label="pocket_hydrophobicity"),
+    # Tunnel patency / pocket accessibility (only present when --tunnel_metrics)
+    # NaN-tolerant — if these columns are absent the spec is silently skipped.
+    MetricSpec("tunnel__sidechain_blocked_fraction", "min", 0.6, label="tunnel_dsc_blocked"),
+    MetricSpec("tunnel__throat_bulky_designable_count", "min", 0.5, label="tunnel_throat_blockers"),
+    MetricSpec("tunnel__best_cone_mean_path", "max", 0.4, label="tunnel_best_cone_path"),
+    # pyKVFinder-derived signals (NaN if pyKVFinder unavailable)
+    MetricSpec("pkvf__cavity_depth_max", "max", 0.4, label="pkvf_cavity_depth"),
+    MetricSpec("pkvf__cavity_volume", "max", 0.3, label="pkvf_cavity_volume"),
 ]
 
 
