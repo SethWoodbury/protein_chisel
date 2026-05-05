@@ -2371,6 +2371,7 @@ def stage_protonate_final_topk(
     ligand_params: Path,
     pyrosetta_sif: Path,
     out_dir: Path,
+    ptm: str = "",
 ) -> Path:
     """Hydrate every top-K PDB via PyRosetta and write a downstream-clean copy.
 
@@ -2424,6 +2425,8 @@ def stage_protonate_final_topk(
         "--out_dir", str(out_dir.resolve()),
         "--summary_json", str(summary_json.resolve()),
     ]
+    if ptm:
+        args += ["--ptm", ptm]
     try:
         result = call.run_python(driver_script, args, check=True)
         LOGGER.info("stage_protonate_final_topk: done (%d clean PDBs at %s)",
@@ -2796,6 +2799,15 @@ def main() -> None:
     p.add_argument("--pyrosetta_sif", type=Path,
                    default=Path("/net/software/containers/pyrosetta.sif"),
                    help="Path to pyrosetta.sif used by --protonate_final.")
+    p.add_argument("--ptm", type=str,
+                   default="A:157=KCX",
+                   help="Comma-separated PTM declarations for catalytic "
+                        "residues that the seed PDB doesn't express but "
+                        "downstream pipeline must know about. Default for "
+                        "PTE_i1: 'A:157=KCX' (catalytic Lys 157 is "
+                        "carbamylated). Examples: 'A:157=KCX,A:200=SEP'. "
+                        "Use '-' as code to force no-PTM annotation. "
+                        "Pass '' to disable.")
     p.add_argument("--consensus_threshold", type=float, default=0.90,
                    help="Cycle k+1 consensus reinforcement: AA frequency "
                         "across cycle-k survivors required to 'agree' "
@@ -3432,6 +3444,7 @@ def main() -> None:
                 ligand_params=args.ligand_params,
                 pyrosetta_sif=args.pyrosetta_sif,
                 out_dir=final_dir / "topk_pdbs_protonated",
+                ptm=args.ptm,
             )
     else:
         LOGGER.warning("final: zero survivors across all cycles!")

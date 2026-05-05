@@ -1,4 +1,4 @@
-"""Final-output protonation + REMARK 668 emission for design PDBs.
+"""Final-output protonation + PTM annotation + REMARK 668 emission.
 
 This module is the *clean-up* counterpart to ``pdb_restoration.py``. It runs
 ONCE on the final top-K PDBs (off the hot path) to produce downstream-clean
@@ -7,11 +7,24 @@ files with:
     * full hydrogens on every residue (placed by Rosetta from ideal geometry)
     * standard 3-character residue names (``HIS`` everywhere; not ``HIS_D``)
     * REMARK 666 catalytic-motif lines preserved verbatim from the seed
-    * a NEW REMARK 668 block that documents the protonation/tautomer state
-      of each catalytic residue, indexed to the REMARK 666 motif index
+    * a NEW REMARK 668 block that documents BOTH protonation/tautomer state
+      AND post-translational modifications of each catalytic residue,
+      indexed to the REMARK 666 motif index
     * ligand HETATM block (with its hydrogens) forced to match the seed
     * clean atom serial numbering, single TER between protein and ligand,
       no CONECT or score-table junk
+
+PTM tracking:
+    Some designs intend a catalytic residue to carry a PTM that the seed
+    PDB doesn't express. Example: PTE_i1 has LYS 157 as a standard LYS in
+    the AF3 seed, but the catalytic mechanism requires it to be KCX
+    (carbamylated). REMARK 668 records both the *resolved-from-coords*
+    state (what's actually there in the PDB) and the *intended PTM*
+    (what the design pipeline knows it should be). PTM is supplied via
+    one of three channels (in trust order):
+        1. Explicit ``ptm_map={"A:157": "KCX", ...}`` from CLI/API
+        2. Auto-detected from seed atom inventory (e.g. CX+OQ1+OQ2 -> KCX)
+        3. Auto-detected from the seed residue name itself (KCX/SEP/etc.)
 
 Why two modules:
     ``pdb_restoration.py`` runs INSIDE the design loop on every cycle, so
@@ -26,11 +39,12 @@ Why two modules:
 REMARK 668 format (paired with REMARK 666):
 
     REMARK 668 ---------------------------------------------------------------
-    REMARK 668 PROTONATION STATE OF CATALYTIC RESIDUES (PAIRED WITH REMARK 666)
+    REMARK 668 PROTONATION STATE + PTM OF CATALYTIC RESIDUES (PAIRED W/ R 666)
     REMARK 668 ---------------------------------------------------------------
-    REMARK 668   <documentation block: STATE codes, ROSETTA_PATCH, H_ATOMS>
-    REMARK 668 IDX CHN RESN  RESI STATE H_ATOMS         ROSETTA_PATCH
-    REMARK 668   1   A HIS    132   HID HD1             HIS_D
+    REMARK 668   <documentation block: STATE / PTM / ROSETTA_PATCH / H_ATOMS>
+    REMARK 668 IDX CHN RESN  RESI STATE PTM H_ATOMS                ROSETTA_PATCH
+    REMARK 668   1   A HIS    132   HID  -  HD1                    HIS_D
+    REMARK 668   3   A LYS    157   LYS KCX -                      LYS
     ...
 
 The ``IDX`` field is the integer that appears as the trailing motif-index
@@ -39,8 +53,10 @@ This makes the pairing unambiguous and machine-parseable.
 
 Public entry points:
     protonate_pdb_with_pyrosetta(input_pdb, ligand_params, out_pdb)
-    write_clean_final_pdb(rosetta_pdb, seed_pdb, out_pdb, ligand_resname=None)
-    protonate_final_topk(topk_dir, seed_pdb, ligand_params, out_dir=None)
+    write_clean_final_pdb(rosetta_pdb, seed_pdb, out_pdb, ligand_resname=None,
+                           ptm_map=None)
+    protonate_final_topk(topk_dir, seed_pdb, ligand_params, ptm_map=None,
+                         out_dir=None)
         ^ end-to-end driver. Accepts a directory of design PDBs and writes
           the cleaned versions next to them (or into ``out_dir`` if given).
 """
@@ -136,6 +152,91 @@ _VARIANT_TO_STANDARD: dict[str, str] = {
     "TYM": "TYR",
 }
 
+# ----------------------------------------------------------------------------
+# Post-translational-modification (PTM) registry
+# ----------------------------------------------------------------------------
+#
+# Maps PDB-component PTM codes to a (parent_resname, marker_atoms, blurb)
+# tuple. ``parent_resname`` is the canonical 3-letter unmodified residue
+# code; ``marker_atoms`` is the set of side-chain atom names that, when
+# all present on a residue, identify the PTM uniquely; ``blurb`` is a
+# short one-line description for human-readable REMARK output.
+#
+# To extend: copy a row, look up the wwPDB Chemical Component Dictionary
+# entry to get the marker atom set, drop it in. The detector treats the
+# first PTM whose marker_atoms is a subset of the residue's atom inventory
+# as the match (so the most specific fingerprint wins — list more-
+# specific PTMs first).
+PTMS: dict[str, dict] = {
+    "KCX": {
+        "parent": "LYS",
+        "atoms": frozenset({"CX", "OQ1", "OQ2"}),
+        "blurb": "carbamylated lysine (Zn-coord; ureido)",
+    },
+    "MLY": {
+        "parent": "LYS",
+        "atoms": frozenset({"CH1", "CH2"}),
+        "blurb": "N6,N6-dimethyl-L-lysine",
+    },
+    "M3L": {
+        "parent": "LYS",
+        "atoms": frozenset({"CM1", "CM2", "CM3"}),
+        "blurb": "N6,N6,N6-trimethyl-L-lysine",
+    },
+    "ALY": {
+        "parent": "LYS",
+        "atoms": frozenset({"CH3", "OH"}),
+        "blurb": "N6-acetyl-L-lysine",
+    },
+    "SEP": {
+        "parent": "SER",
+        "atoms": frozenset({"P", "O1P", "O2P", "O3P"}),
+        "blurb": "phospho-L-serine",
+    },
+    "TPO": {
+        "parent": "THR",
+        "atoms": frozenset({"P", "O1P", "O2P", "O3P"}),
+        "blurb": "phospho-L-threonine",
+    },
+    "PTR": {
+        "parent": "TYR",
+        "atoms": frozenset({"P", "O1P", "O2P", "O3P"}),
+        "blurb": "phospho-L-tyrosine",
+    },
+    "HYP": {
+        "parent": "PRO",
+        "atoms": frozenset({"OD1"}),
+        "blurb": "4-hydroxy-L-proline",
+    },
+    "CSO": {
+        "parent": "CYS",
+        "atoms": frozenset({"OD"}),
+        "blurb": "S-hydroxy-L-cysteine (oxidized cys)",
+    },
+    "CME": {
+        "parent": "CYS",
+        "atoms": frozenset({"CE", "SD"}),
+        "blurb": "S,S-(2-hydroxyethyl)thiocysteine",
+    },
+    "5HP": {
+        "parent": "GLU",
+        "atoms": frozenset({"OE"}),
+        "blurb": "pyroglutamate (5-oxoproline)",
+    },
+    "PCA": {
+        "parent": "GLN",
+        "atoms": frozenset(),  # cyclized; detected by N-terminal context
+        "blurb": "pyroglutamate (pyrrolidone carboxylic acid)",
+    },
+}
+
+# Reverse: parent residue -> set of PTMs that derive from it. Useful for
+# narrowing the auto-detect search.
+_PARENT_TO_PTMS: dict[str, list[str]] = {}
+for _ptm_code, _info in PTMS.items():
+    _PARENT_TO_PTMS.setdefault(_info["parent"], []).append(_ptm_code)
+del _ptm_code, _info
+
 
 # ----------------------------------------------------------------------------
 # Lightweight PDB line helpers (column-aware, 5-char-resname-aware)
@@ -146,32 +247,196 @@ def _is_atom_line(line: str) -> bool:
     return line.startswith("ATOM") or line.startswith("HETATM")
 
 
+# Whitespace-split fallback for ATOM/HETATM records that look corrupted
+# (e.g. column drift from a non-PDB-strict writer). We try the column
+# parse first; if that yields nonsense, we fall back to splitting tokens
+# and matching by position. PDB record token order is:
+#   ATOM <serial> <atom_name> [altloc]<resname> <chain><resno>[icode] x y z occ b ... <element>
+# but with chain ID frequently glued to atom_name or resname after column
+# corruption. Best-effort, never raises.
+def _whitespace_parse(line: str) -> dict | None:
+    """Return ``{"atom_name", "resname", "chain", "resno", "element"}``
+    via whitespace tokenization, or None if it can't be reasonably
+    interpreted. Used when column parsing yields garbage.
+
+    Expected layouts (we try both):
+        [ATOM, serial, atom, resname,        resno, x, y, z, ...]
+        [ATOM, serial, atom, resname, chain, resno, x, y, z, ...]
+        [ATOM, serial, atom, resname_with_chain_glued, resno, x, y, z, ...]
+
+    We disambiguate by walking parts looking for the first token that
+    parses as an integer (which is resno).
+    """
+    parts = line.split()
+    if len(parts) < 6 or parts[0] not in {"ATOM", "HETATM"}:
+        return None
+
+    # Find resno: first token after parts[2] (atom_name) that parses as int.
+    # Allow trailing insertion-code letter (e.g. "132A").
+    resno = None
+    resno_idx = None
+    icode = ""
+    for i in range(3, min(len(parts), 7)):
+        tok = parts[i]
+        m = re.match(r"^(-?\d+)([A-Za-z]?)$", tok)
+        if m:
+            resno = int(m.group(1))
+            icode = m.group(2)
+            resno_idx = i
+            break
+    if resno is None:
+        return None
+
+    atom_name = parts[2]
+    # Tokens between parts[3] and parts[resno_idx] hold resname [+ chain]
+    middle = parts[3:resno_idx]
+    chain = ""
+    resname = "UNK"
+
+    if len(middle) == 1:
+        # Either glued ("HIS_DA") or no chain
+        token = middle[0]
+        if len(token) > 4:
+            # Try plausible chain split (last char is chain if alphabetic and
+            # the prefix is a known resname/variant/PTM)
+            for split_at in (5, 4, 3):
+                if split_at >= len(token):
+                    continue
+                head, tail = token[:split_at], token[split_at:]
+                if len(tail) != 1 or not tail.isalpha():
+                    continue
+                if (head in _VARIANT_TO_STANDARD or head in PTMS
+                        or (len(head) == 3 and head.isalpha())):
+                    resname = head
+                    chain = tail
+                    break
+            else:
+                resname = token  # leave as-is; downstream may still cope
+        else:
+            resname = token
+            chain = ""
+    elif len(middle) == 2:
+        # resname, chain
+        resname, chain = middle[0], middle[1]
+    elif len(middle) >= 3:
+        # Unusual: take first as resname, last as chain
+        resname = middle[0]
+        chain = middle[-1] if len(middle[-1]) == 1 and middle[-1].isalpha() else ""
+
+    return {
+        "atom_name": atom_name,
+        "resname": resname,
+        "chain": chain,
+        "resno": resno,
+        "icode": icode,
+        "element": "",
+        "raw_resname_field": "",
+    }
+
+
+def parse_atom_line(line: str) -> dict | None:
+    """Robust column-then-whitespace parser for ATOM/HETATM records.
+
+    Returns a dict with keys ``atom_name``, ``resname``, ``chain``,
+    ``resno``, ``icode``, ``element``, ``raw_resname_field`` (the literal
+    text in cols 17-21 useful for round-trip writes).
+
+    Returns None for non-ATOM lines and for lines that defeat both
+    column and whitespace parsing.
+
+    Robustness:
+        - Column parse first (PDB strict).
+        - If the parsed resno is non-integer or chain ID looks like a
+          letter that's part of a 5-char overflow (e.g. "A" right after
+          "HIS_D"), trust the column parse for resname and resno.
+        - If column parse raises, fall back to whitespace tokenization.
+    """
+    if not _is_atom_line(line) or len(line) < 26:
+        return None
+    raw_resname_field = line[16:21] if len(line) >= 21 else line[16:].rstrip("\n")
+    five = raw_resname_field.strip()
+    # Resname: prefer 5-char rosetta label if it matches our registry,
+    # otherwise the 3-char standard slot.
+    if five in _VARIANT_TO_STANDARD or five in PTMS or five in {"HIS_D", "HIS_E"}:
+        resname = five
+    else:
+        resname = line[17:20].strip()
+
+    # Chain: col 22. If the 5-char label overflowed it, the col 22 char
+    # is the chain ID itself (e.g. for "HIS_DA" the 'A' at col 22 is
+    # chain, not part of the label).
+    chain = line[21:22] if len(line) >= 22 else " "
+    if len(five) == 5 and chain.strip() == "":
+        # Some writers eat the chain when overflowing; treat as blank.
+        chain = ""
+
+    icode = line[26:27] if len(line) >= 27 else " "
+
+    # Resno: try column [22:26]; fall back to whitespace.
+    try:
+        resno = int(line[22:26])
+    except (ValueError, TypeError):
+        ws = _whitespace_parse(line)
+        if ws is None:
+            return None
+        return {**ws, "icode": "", "raw_resname_field": raw_resname_field}
+
+    atom_name = line[12:16].strip() if len(line) >= 16 else ""
+    element = ""
+    if len(line) >= 78:
+        element = line[76:78].strip()
+
+    # Extra sanity: resname must be alphabetic (and ≤5 chars).
+    if not resname or not re.match(r"^[A-Z0-9_]{1,5}$", resname):
+        ws = _whitespace_parse(line)
+        if ws is not None:
+            return {**ws, "icode": "", "raw_resname_field": raw_resname_field}
+
+    return {
+        "atom_name": atom_name,
+        "resname": resname,
+        "chain": chain,
+        "resno": resno,
+        "icode": icode if icode.strip() else "",
+        "element": element,
+        "raw_resname_field": raw_resname_field,
+    }
+
+
 def _resname_from_line(line: str) -> str:
     """Return the residue name, handling Rosetta 5-char labels (cols 17-21)."""
-    if len(line) < 21:
+    parsed = parse_atom_line(line)
+    if parsed is None:
         return ""
-    five = line[16:21].strip()
-    if five in _VARIANT_TO_STANDARD or five in {"HIS_D", "HIS_E"}:
-        return five
-    return line[17:20].strip()
+    return parsed["resname"]
 
 
 def _resno_from_line(line: str) -> int:
-    return int(line[22:26])
+    parsed = parse_atom_line(line)
+    if parsed is None:
+        raise ValueError(f"could not parse ATOM line: {line!r}")
+    return parsed["resno"]
 
 
 def _chain_from_line(line: str) -> str:
-    return line[21:22]
+    parsed = parse_atom_line(line)
+    if parsed is None:
+        return " "
+    return parsed["chain"]
 
 
 def _atom_name_from_line(line: str) -> str:
-    return line[12:16].strip()
+    parsed = parse_atom_line(line)
+    if parsed is None:
+        return ""
+    return parsed["atom_name"]
 
 
 def _element_from_line(line: str) -> str:
-    if len(line) < 78:
+    parsed = parse_atom_line(line)
+    if parsed is None:
         return ""
-    return line[76:78].strip()
+    return parsed["element"]
 
 
 def _looks_like_hydrogen(line: str) -> bool:
@@ -376,33 +641,44 @@ def detect_protonation_state(
 
 _REMARK_668_HEADER: tuple[str, ...] = (
     "REMARK 668 -----------------------------------------------------------------\n",
-    "REMARK 668 PROTONATION STATE OF CATALYTIC RESIDUES (PAIRED WITH REMARK 666)\n",
+    "REMARK 668 PROTONATION STATE + PTM OF CATALYTIC RESIDUES (PAIRED W/ R 666)\n",
     "REMARK 668 -----------------------------------------------------------------\n",
-    "REMARK 668 Each entry below documents the protonation/tautomer state of one\n",
-    "REMARK 668 catalytic residue listed in REMARK 666. The IDX field matches the\n",
-    "REMARK 668 trailing motif index of the corresponding REMARK 666 MATCH MOTIF\n",
-    "REMARK 668 line; CHN/RESN/RESI duplicate that line's chain, resname, resno\n",
-    "REMARK 668 for cross-check. STATE uses standard biochemistry conventions:\n",
+    "REMARK 668 Each entry below documents the protonation/tautomer state AND\n",
+    "REMARK 668 any post-translational modification of one catalytic residue\n",
+    "REMARK 668 listed in REMARK 666. The IDX field matches the trailing motif\n",
+    "REMARK 668 index of the corresponding REMARK 666 MATCH MOTIF line;\n",
+    "REMARK 668 CHN/RESN/RESI duplicate that line's chain, resname, resno for\n",
+    "REMARK 668 cross-check. STATE uses standard biochemistry conventions:\n",
     "REMARK 668   HIS: HID (ND1-H, delta), HIE (NE2-H, epsilon), HIP (both)\n",
     "REMARK 668   ASP: ASP (deprot), ASH (OD2-H)\n",
     "REMARK 668   GLU: GLU (deprot), GLH (OE2-H)\n",
     "REMARK 668   LYS: LYS (NH3+), LYN (NH2), KCX (carbamylated)\n",
     "REMARK 668   CYS: CYS (thiol), CYM (thiolate), CYX (disulfide)\n",
     "REMARK 668   TYR: TYR (phenol), TYM (phenolate)\n",
-    "REMARK 668 ROSETTA_PATCH is the Rosetta variant_type tag (HIS_D, KCX, ...).\n",
-    "REMARK 668 H_ATOMS lists the side-chain protonating hydrogens present;\n",
-    "REMARK 668 \"-\" means no protonating H found (deprotonated form).\n",
+    "REMARK 668 PTM is the wwPDB Chemical Component Dictionary 3-letter code\n",
+    "REMARK 668 for any post-translational modification known to be intended\n",
+    "REMARK 668 at this position (e.g. KCX, SEP, TPO, PTR, MLY, M3L, ALY, HYP).\n",
+    "REMARK 668 \"-\" means no PTM declared. PTM is set from explicit user/CLI\n",
+    "REMARK 668 declaration, the seed PDB resname, or auto-detect from the\n",
+    "REMARK 668 seed atom inventory (e.g. CX/OQ1/OQ2 -> KCX). RESN may show the\n",
+    "REMARK 668 unmodified residue (e.g. LYS) even when PTM=KCX, because the\n",
+    "REMARK 668 reference structure stored the residue in unmodified form;\n",
+    "REMARK 668 PTM tells downstream consumers what modification to apply.\n",
+    "REMARK 668 ROSETTA_PATCH is the Rosetta variant_type tag actually present\n",
+    "REMARK 668 in the dumped pose (HIS_D, KCX, etc.). H_ATOMS lists the side-\n",
+    "REMARK 668 chain protonating hydrogens present; \"-\" means none observed.\n",
     "REMARK 668 -----------------------------------------------------------------\n",
     # Header columns must align EXACTLY with the data-line format string in
     # format_remark_668_line(). Data line layout (after "REMARK 668 " prefix):
-    #   col 12-14: IDX (>3d), col 15: space
-    #   col 16-18: CHN (>3s), col 19: space
-    #   col 20-23: RESN (<4s), col 24: space
-    #   col 25-29: RESI (>5d), col 30: space
+    #   col 12-14: IDX   (>3d), col 15: space
+    #   col 16-18: CHN   (>3s), col 19: space
+    #   col 20-23: RESN  (<4s), col 24: space
+    #   col 25-29: RESI  (>5d), col 30: space
     #   col 31-35: STATE (>5s), col 36: space
-    #   col 37-63: H_ATOMS (<27s), col 64: space
+    #   col 37-39: PTM   (<3s), col 40: space
+    #   col 41-63: H_ATOMS (<23s), col 64: space
     #   col 65-72: ROSETTA_PATCH (<8s)
-    "REMARK 668 IDX CHN RESN  RESI STATE H_ATOMS                     ROSETTA_PATCH\n",
+    "REMARK 668 IDX CHN RESN  RESI STATE PTM H_ATOMS                 ROSETTA_PATCH\n",
 )
 _REMARK_668_FOOTER: tuple[str, ...] = (
     "REMARK 668 -----------------------------------------------------------------\n",
@@ -417,43 +693,174 @@ def format_remark_668_line(
     state: str,
     h_atoms: Sequence[str],
     rosetta_patch: str,
+    ptm: str = "-",
 ) -> str:
-    """Build one fixed-column REMARK 668 data row."""
+    """Build one fixed-column REMARK 668 data row.
+
+    Args:
+        idx: REMARK 666 motif index (1-based).
+        chain: chain ID (1 char).
+        resname: standard 3-char residue name (HIS, LYS, ...).
+        resno: residue sequence number.
+        state: biochemistry tautomer code (HID, HIE, HIP, LYS, GLU, ...).
+        h_atoms: list of side-chain H atom names that identify the state.
+        rosetta_patch: Rosetta variant_type tag actually in the pose.
+        ptm: 3-letter wwPDB CCD code for declared/detected PTM,
+            or "-" if none.
+    """
     h_str = ",".join(h_atoms) if h_atoms else "-"
-    # Column layout (padding tuned to fit within 80 columns):
-    #   REMARK 668 ___ ___ ____ _____ _____ _________________________ _____
     return (
-        f"REMARK 668 "                # 11 chars
-        f"{idx:>3d} "                  # IDX (cols 12-14)+space
-        f"{chain:>3s} "                # CHN (cols 16-18)+space
-        f"{resname:<4s} "              # RESN (cols 20-23)+space
-        f"{resno:>5d} "                # RESI (cols 25-29)+space
-        f"{state:>5s} "                # STATE (cols 31-35)+space
-        f"{h_str:<27s} "               # H_ATOMS (cols 37-63)+space
-        f"{rosetta_patch:<8s}"         # ROSETTA_PATCH (cols 65-72)
+        f"REMARK 668 "                # 11 chars (cols 1-11)
+        f"{idx:>3d} "                  # IDX  (12-14) + space
+        f"{chain:>3s} "                # CHN  (16-18) + space
+        f"{resname:<4s} "              # RESN (20-23) + space
+        f"{resno:>5d} "                # RESI (25-29) + space
+        f"{state:>5s} "                # STATE (31-35) + space
+        f"{ptm:<3s} "                  # PTM  (37-39) + space
+        f"{h_str:<23s} "               # H_ATOMS (41-63) + space
+        f"{rosetta_patch:<8s}"         # ROSETTA_PATCH (65-72)
         "\n"
     )
+
+
+def parse_ptm_map(spec: str | None) -> dict[tuple[str, int], str]:
+    """Parse a CLI/API PTM spec into a ``{(chain, resno) -> code}`` map.
+
+    Accepted formats (mix-and-match in a comma list):
+        "A:157=KCX"           # chain:resno=code
+        "A157=KCX"            # chain<resno>=code (no colon)
+        "157=KCX"             # default chain (treated as 'A')
+    Whitespace and trailing semicolons are tolerated.
+    """
+    out: dict[tuple[str, int], str] = {}
+    if not spec:
+        return out
+    parts = re.split(r"[,;\s]+", spec.strip())
+    for part in parts:
+        if not part:
+            continue
+        try:
+            key, code = part.split("=", 1)
+        except ValueError:
+            LOGGER.warning("parse_ptm_map: skipping malformed entry %r", part)
+            continue
+        code = code.strip().upper()
+        key = key.strip()
+        m = re.match(r"^([A-Za-z])?:?(\d+)$", key)
+        if not m:
+            LOGGER.warning("parse_ptm_map: skipping malformed key %r", key)
+            continue
+        chain = m.group(1) or "A"
+        resno = int(m.group(2))
+        if code not in PTMS and code != "-":
+            LOGGER.warning(
+                "parse_ptm_map: PTM code %r at %s%d is not in known PTMS "
+                "registry; emitting it but downstream tools may not recognize",
+                code, chain, resno,
+            )
+        out[(chain, resno)] = code
+    return out
+
+
+def detect_ptms_from_inventory(
+    inventory: dict[tuple[str, int], dict],
+) -> dict[tuple[str, int], str]:
+    """Auto-detect PTMs from a residue-atom inventory.
+
+    For each residue, if the side-chain atom set contains the marker
+    atoms of a known PTM (and the resname matches the PTM's parent or
+    is the PTM code itself), record the PTM code. The first matching
+    PTM in registration order wins per residue (so list narrower
+    fingerprints first in PTMS).
+
+    Args:
+        inventory: ``{(chain, resno) -> {"resname": str, "atoms": set, ...}}``
+            as produced by ``_collect_residue_atom_inventory``.
+
+    Returns:
+        ``{(chain, resno) -> ptm_code}``. Residues with no detectable PTM
+        are absent from the dict.
+    """
+    out: dict[tuple[str, int], str] = {}
+    for key, info in inventory.items():
+        resname = info["resname"].strip()
+        # Direct hit: resname IS a PTM code
+        if resname in PTMS:
+            out[key] = resname
+            continue
+        # Marker-atom hit: resname is the parent and all PTM marker atoms present
+        candidates = _PARENT_TO_PTMS.get(resname, [])
+        # Also handle the case where resname is a Rosetta variant of the parent
+        std = _VARIANT_TO_STANDARD.get(resname, resname)
+        if std != resname:
+            candidates = _PARENT_TO_PTMS.get(std, [])
+        atoms = info["atoms"]
+        for ptm_code in candidates:
+            markers = PTMS[ptm_code]["atoms"]
+            if markers and markers.issubset(atoms):
+                out[key] = ptm_code
+                break
+    return out
+
+
+def resolve_ptm_map(
+    seed_pdb: str | Path,
+    explicit_ptm_map: Optional[dict[tuple[str, int], str]] = None,
+) -> dict[tuple[str, int], str]:
+    """Resolve the final PTM map for a design from all available sources.
+
+    Trust order (later wins):
+        1. Auto-detect from the seed PDB's atom inventory + resnames.
+        2. Explicit ``explicit_ptm_map`` from CLI/API. Use "-" as the
+           value to FORCE no-PTM for a residue (overrides auto-detect).
+
+    Args:
+        seed_pdb: Reference PDB to scan for PTM markers.
+        explicit_ptm_map: User-supplied overrides.
+
+    Returns:
+        Final ``{(chain, resno) -> ptm_code}`` map (without "-" entries).
+    """
+    inventory = _collect_residue_atom_inventory(seed_pdb)
+    final: dict[tuple[str, int], str] = dict(detect_ptms_from_inventory(inventory))
+    if explicit_ptm_map:
+        for key, code in explicit_ptm_map.items():
+            if code == "-":
+                final.pop(key, None)
+            else:
+                final[key] = code
+    return final
 
 
 def build_remark_668_block(
     rosetta_pdb: str | Path,
     seed_pdb: str | Path,
+    ptm_map: Optional[dict[tuple[str, int], str]] = None,
 ) -> list[str]:
     """Build the full REMARK 668 block for a hydrated design PDB.
 
     Reads REMARK 666 entries from ``seed_pdb`` and per-residue protonation
     info from ``rosetta_pdb`` (the freshly hydrated, Rosetta-output PDB).
+
+    Args:
+        rosetta_pdb: PyRosetta-hydrated dump (source of STATE / H_ATOMS).
+        seed_pdb: Original seed PDB (source of REMARK 666 + auto-detected PTMs).
+        ptm_map: User-supplied overrides as a ``{(chain, resno) -> code}``
+            map. Use "-" as the value to FORCE no-PTM annotation for a
+            residue. ``None`` defaults to auto-detect-only from seed.
     """
     motif_entries = parse_remark_666(seed_pdb)
     if not motif_entries:
         return []
 
     inventory = _collect_residue_atom_inventory(rosetta_pdb)
+    resolved_ptm_map = resolve_ptm_map(seed_pdb, ptm_map)
 
     lines: list[str] = list(_REMARK_668_HEADER)
     for entry in motif_entries:
         key = (entry.motif_chain, entry.motif_resno)
         residue = inventory.get(key)
+        ptm_code = resolved_ptm_map.get(key, "-")
         if residue is None:
             # Catalytic residue missing from output — emit a placeholder so
             # the pairing is still complete and the absence is visible.
@@ -466,6 +873,7 @@ def build_remark_668_block(
                     state="???",
                     h_atoms=[],
                     rosetta_patch=entry.motif_resname,
+                    ptm=ptm_code,
                 )
             )
             continue
@@ -480,6 +888,7 @@ def build_remark_668_block(
                 state=state,
                 h_atoms=h_atoms,
                 rosetta_patch=rosetta_patch if rosetta_patch else entry.motif_resname,
+                ptm=ptm_code,
             )
         )
     lines.extend(_REMARK_668_FOOTER)
@@ -552,13 +961,14 @@ def write_clean_final_pdb(
     seed_pdb: str | Path,
     out_pdb: str | Path,
     ligand_resname: Optional[str] = None,
+    ptm_map: Optional[dict[tuple[str, int], str]] = None,
 ) -> dict:
     """Combine a Rosetta-hydrated PDB with the seed's REMARK 666 + ligand.
 
     Output file structure:
         REMARK 666 ... (from seed)
         HETNAM / LINK / REMARK PDBinfo-LABEL (from seed)
-        REMARK 668 ... (computed here)
+        REMARK 668 ... (computed here, includes PTM column)
         ATOM   ... (from rosetta_pdb, with HIS_D/etc. -> HIS, atoms renumbered)
         TER
         HETATM ... (ligand, from seed; preserves seed hydrogens exactly)
@@ -572,6 +982,9 @@ def write_clean_final_pdb(
         out_pdb: Where to write the final cleaned PDB.
         ligand_resname: Optional 3-letter ligand code. ``None`` = auto-detect
             (largest non-water HETATM group in seed).
+        ptm_map: User-supplied PTM declarations as ``{(chain, resno) -> code}``.
+            Use "-" as the value to FORCE no-PTM annotation for a residue
+            (overrides auto-detect). ``None`` = auto-detect-only from seed.
 
     Returns:
         Stats dict with counts of remark lines written, atoms renumbered,
@@ -589,6 +1002,7 @@ def write_clean_final_pdb(
         "variants_normalized": 0,
         "score_lines_dropped": 0,
         "conect_lines_dropped": 0,
+        "ptms_declared": 0,
     }
 
     # 1. Pull seed-derived header lines (REMARK 666 etc.) -------------------
@@ -596,7 +1010,13 @@ def write_clean_final_pdb(
     stats["remark_666_in"] = sum(1 for ln in header_lines if ln.startswith("REMARK 666"))
 
     # 2. Compute REMARK 668 ------------------------------------------------
-    remark_668 = build_remark_668_block(rosetta_pdb, seed_pdb)
+    remark_668 = build_remark_668_block(rosetta_pdb, seed_pdb, ptm_map=ptm_map)
+    stats["ptms_declared"] = sum(
+        1 for ln in remark_668
+        if ln.startswith("REMARK 668 ") and not ln.startswith("REMARK 668 -")
+        and "PTM" not in ln[:40]  # skip header label line
+        and " - " not in ln[31:43]  # crude PTM column check; "-" means no PTM
+    )
     stats["remark_668_lines"] = sum(1 for ln in remark_668 if not ln.lstrip("REMARK 668").strip().startswith("---") and ln.startswith("REMARK 668 "))
 
     # 3. Walk rosetta_pdb and rewrite ATOM lines to standard 3-char names. -
@@ -871,6 +1291,7 @@ def protonate_final_topk(
     out_dir: Optional[str | Path] = None,
     ligand_resname: Optional[str] = None,
     keep_intermediate: bool = False,
+    ptm_map: Optional[dict[tuple[str, int], str] | str] = None,
 ) -> dict:
     """End-to-end driver for the post-design protonation cleanup.
 
@@ -890,10 +1311,17 @@ def protonate_final_topk(
             given.
         keep_intermediate: If False (default), delete the .rosetta.pdb
             intermediates after writing the cleaned outputs.
+        ptm_map: User-supplied PTM declarations. Either a string spec
+            (e.g. ``"A:157=KCX,A:200=SEP"``) or a pre-parsed dict
+            ``{(chain, resno) -> code}``. Use ``"-"`` as the value to
+            FORCE no-PTM annotation for a residue (overrides auto-detect).
+            ``None`` = auto-detect-only from seed.
 
     Returns:
         Stats dict aggregated across all PDBs processed.
     """
+    if isinstance(ptm_map, str):
+        ptm_map = parse_ptm_map(ptm_map)
     topk_dir = Path(topk_dir)
     out_dir = Path(out_dir) if out_dir is not None else topk_dir
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -935,6 +1363,7 @@ def protonate_final_topk(
                 seed_pdb=seed_pdb,
                 out_pdb=final_pdb,
                 ligand_resname=ligand_resname,
+                ptm_map=ptm_map,
             )
             stats["variants_remapped"] = len(variant_map)
         except Exception as exc:

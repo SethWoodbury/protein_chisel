@@ -43,6 +43,14 @@ def main() -> int:
                    help="Keep .rosetta.pdb intermediates for inspection")
     p.add_argument("--summary_json", type=Path, default=None,
                    help="Write run summary stats to this JSON path")
+    p.add_argument("--ptm", type=str, default=None,
+                   help="Comma-separated PTM declarations for catalytic "
+                        "residues that the seed PDB doesn't express but "
+                        "downstream pipeline must know about. Examples: "
+                        "'A:157=KCX' (lysine 157 on chain A is "
+                        "carbamylated), 'A:157=KCX,A:200=SEP' (multiple). "
+                        "Use '-' as code to FORCE no-PTM (overrides "
+                        "auto-detect from seed atom inventory).")
     args = p.parse_args()
 
     logging.basicConfig(
@@ -63,6 +71,7 @@ def main() -> int:
         out_dir=args.out_dir,
         ligand_resname=args.ligand_resname,
         keep_intermediate=args.keep_intermediate,
+        ptm_map=args.ptm,
     )
 
     print(json.dumps({k: v for k, v in summary.items() if k != "failures"}, indent=2))
