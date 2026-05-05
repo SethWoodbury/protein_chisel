@@ -176,3 +176,28 @@ A `--throat_feedback_decay` of 0.3 (vs default 0.5) would release
 cumulative pressure faster and preserve diversity better at the cost
 of weaker convergence — try if FS269-style scaffolds keep showing
 diversity loss.
+
+
+## Decay sensitivity (FS148)
+
+Tested decay=0.3 vs default decay=0.5 on FS148 to see if faster
+release would preserve diversity at smaller pocket cost. **Faster
+decay was strictly worse**:
+
+| metric | BASELINE | decay=0.5 ★ | decay=0.3 |
+|---|---|---|---|
+| pkvf__cavity_volume | 120.1 | **140.3** | 95.1 (regression) |
+| pkvf__cavity_depth_max | 0.63 | **1.01** | 0.29 (regression) |
+| sap_max | 1.57 | 1.93 | 2.53 (much worse) |
+| best_cone_mean_path | 11.18 | **11.88** | 10.61 |
+| pairwise_hamming | 36.28 | **41.05** | 36.81 |
+| n_hbonds_to_cat_his | 2.46 | 2.08 | 1.78 |
+
+Reading: decay=0.3 doesn't accumulate enough pressure across cycles
+to actually fix the throat — the bias keeps decaying before MPNN
+explores enough alternatives. The pocket gains evaporate, and even
+diversity is no better than baseline. **Decay=0.5 is the right balance.**
+
+For scaffolds where you need MORE pressure (e.g. badly constricted
+seeds), bumping to 0.7 might help; for scaffolds with naturally open
+entrances, leaving `--throat_feedback` off entirely is fine.
