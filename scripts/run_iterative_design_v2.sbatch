@@ -160,7 +160,39 @@ apptainer exec --nv \
         --cycles "$N_CYCLES" \
         --omit_AA "$OMIT_AA" \
         --use_side_chain_context "$USE_SIDE_CHAIN_CONTEXT" \
+        --run_dir_marker "$WORK_DIR/run_dir.txt" \
         ${PTM:+--ptm "$PTM"} \
         ${ENHANCE:+--enhance "$ENHANCE"}
+
+# Stage 3 wrote run_dir's path into $WORK_DIR/run_dir.txt as soon as
+# it knew the timestamped run_dir name. Read it for stage 4. This is
+# more robust than scanning timestamps (avoids races with concurrent
+# jobs that share $WORK_ROOT).
+RUN_DIR=""
+if [[ -f "$WORK_DIR/run_dir.txt" ]]; then
+    RUN_DIR=$(< "$WORK_DIR/run_dir.txt")
+fi
+if [[ -z "$RUN_DIR" || ! -d "$RUN_DIR/final_topk/topk_pdbs" ]]; then
+    echo "WARNING: could not locate stage 3 run dir from $WORK_DIR/run_dir.txt;"
+    echo "         skipping stage 4 (protonate). Run protonate_final_topk.py"
+    echo "         manually if needed."
+else
+    echo "=== STAGE 4: protonate final top-K (pyrosetta.sif) ==="
+    echo "    run_dir = $RUN_DIR"
+    apptainer exec \
+        --bind "$REPO:/code" \
+        --bind /net/software \
+        --bind /net/scratch \
+        --bind /home/woodbuse \
+        --env "PYTHONPATH=/code/src:/pyrosetta" \
+        /net/software/containers/pyrosetta.sif \
+        python "$REPO/scripts/protonate_final_topk.py" \
+            --topk_dir "$RUN_DIR/final_topk/topk_pdbs" \
+            --seed_pdb "$SEED_PDB" \
+            --ligand_params "$LIG_PARAMS" \
+            --out_dir "$RUN_DIR/final_topk/topk_pdbs_protonated" \
+            --summary_json "$RUN_DIR/final_topk/protonation_summary.json" \
+            ${PTM:+--ptm "$PTM"}
+fi
 
 echo "=== DONE -- $WORK_DIR ==="

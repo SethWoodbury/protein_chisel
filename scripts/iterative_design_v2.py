@@ -70,9 +70,34 @@ DEFAULT_LIG_PARAMS = Path(
 )
 
 # REMARK 666 catalytic resnos (1-indexed PDB resseq) on chain A.
+# These default values match the PTE_i1 SEED1 (FS269) scaffold. They are
+# AUTO-OVERRIDDEN at the start of main() by parsing REMARK 666 in the
+# user-supplied --seed_pdb so the same code/sbatch works on every
+# scaffold in a design campaign (catalytic resnos shift between
+# scaffolds even though motif structure is preserved).
 DEFAULT_CATRES = (60, 64, 128, 131, 132, 157)
 CATALYTIC_HIS_RESNOS = (60, 64, 128, 132)
 CHAIN = "A"
+
+
+def _derive_catres_from_remark_666(seed_pdb: Path | str) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Read REMARK 666 from ``seed_pdb`` and return:
+
+        (all_catalytic_resnos, his_only_catalytic_resnos)
+
+    sorted ascending. Falls back to the module defaults
+    (PTE_i1 SEED1) if no REMARK 666 entries are found.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from protein_chisel.tools.protonate_final import parse_remark_666 as _parse666
+    entries = _parse666(seed_pdb)
+    if not entries:
+        return DEFAULT_CATRES, CATALYTIC_HIS_RESNOS
+    all_resnos = tuple(sorted({e.motif_resno for e in entries}))
+    his_resnos = tuple(sorted({
+        e.motif_resno for e in entries if e.motif_resname.upper() == "HIS"
+    }))
+    return all_resnos, his_resnos
 
 # Apptainer / cluster paths
 UNIVERSAL_SIF = Path("/net/software/containers/universal.sif")
@@ -739,7 +764,7 @@ def stage_restore_pdbs(
     pdb_basename: str,
     candidate_ids: list[str],
     chain: str = CHAIN,
-    catalytic_resnos: Iterable[int] = DEFAULT_CATRES,
+    catalytic_resnos: Optional[Iterable[int]] = None,
     catalytic_hydrogens: bool = True,
 ) -> dict[str, Path]:
     """Restore REMARK 666 / HETNAM / LINK + HIS tautomer (HIS_D / HIE / HIP)
@@ -749,6 +774,8 @@ def stage_restore_pdbs(
     see that module for the full restoration semantics. The signature is
     kept stable so call sites in this driver are unchanged.
     """
+    if catalytic_resnos is None:
+        catalytic_resnos = DEFAULT_CATRES
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
     from protein_chisel.tools.pdb_restoration import restore_sample_dir
     LOGGER.info(
@@ -1255,7 +1282,7 @@ def stage_struct_filter(
     pdb_map: dict[str, Path],
     out_dir: Path,
     sap_max_threshold: float,
-    catalytic_his_resnos: Iterable[int] = CATALYTIC_HIS_RESNOS,
+    catalytic_his_resnos: Optional[Iterable[int]] = None,
     fixed_resnos: Iterable[int] = (),
     clash_filter: bool = True,
     clash_severe_distance: float = 1.5,
@@ -1265,6 +1292,8 @@ def stage_struct_filter(
     seed_dfi_metrics: Optional[dict] = None,
 ) -> Path:
     """Apply h-bond + SAP-proxy structural filter."""
+    if catalytic_his_resnos is None:
+        catalytic_his_resnos = CATALYTIC_HIS_RESNOS
     out_dir.mkdir(parents=True, exist_ok=True)
     df = pd.read_csv(survivors_seq_tsv, sep="\t")
     LOGGER.info("stage_struct_filter: input n=%d", len(df))
@@ -2401,7 +2430,25 @@ def stage_protonate_final_topk(
         return out_dir
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-    from protein_chisel.utils.apptainer import pyrosetta_call
+    from protein_chisel.utils.apptainer import pyrosetta_call, in_apptainer
+
+    # Nested-apptainer doesn't work on this cluster: when stage 3 runs
+    # inside universal.sif, the apptainer binary isn't on PATH inside
+    # the container so spawning pyrosetta.sif from here fails. The
+    # production sbatch (run_iterative_design_v2.sbatch) handles this
+    # by running protonate_final as a separate post-stage outside any
+    # container. Detect the in-container case and skip with a clear
+    # log line so the user knows where the missing protonation is.
+    if in_apptainer():
+        LOGGER.info(
+            "stage_protonate_final_topk: detected we are running INSIDE "
+            "a container; skipping in-driver invocation. "
+            "run_iterative_design_v2.sbatch invokes the protonation as "
+            "a separate stage 4 after this driver returns. "
+            "Look for *.protonated.pdb in %s after the sbatch finishes.",
+            out_dir,
+        )
+        return out_dir
 
     n_pdbs = sum(1 for p in topk_pdb_dir.iterdir() if p.suffix == ".pdb")
     LOGGER.info("stage_protonate_final_topk: hydrating %d top-K PDBs via PyRosetta -> %s",
@@ -2468,7 +2515,7 @@ def run_cycle(
     wt_fitness: Optional[float] = None,
     position_table_df=None,           # for first-shell diversity injection
     omit_AA_per_residue: Optional[dict[str, str]] = None,
-    catalytic_his_resnos: Iterable[int] = CATALYTIC_HIS_RESNOS,
+    catalytic_his_resnos: Optional[Iterable[int]] = None,
     balance_z_threshold: float = 2.0,
     design_ph: float = 7.5,
     instability_max: float = 60.0,
@@ -2481,6 +2528,8 @@ def run_cycle(
     omit_M_at_pos1: bool = True,
 ) -> tuple[Optional[pd.DataFrame], dict[str, Path]]:
     """Run ONE iteration cycle. Returns (ranked DataFrame, pdb_map)."""
+    if catalytic_his_resnos is None:
+        catalytic_his_resnos = CATALYTIC_HIS_RESNOS
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
     from protein_chisel.sampling.iterative_fusion import (
         IterationBiasConfig, build_iteration_bias,
@@ -2724,6 +2773,11 @@ def main() -> None:
     p.add_argument("--plm_artifacts_dir", type=Path, required=True)
     p.add_argument("--position_table", type=Path, required=True)
     p.add_argument("--out_root", type=Path, default=DEFAULT_OUT_ROOT)
+    p.add_argument("--run_dir_marker", type=Path, default=None,
+                   help="If set, write the absolute path of this run's "
+                        "run_dir to this file as soon as it's created. "
+                        "Useful for shell wrappers (sbatch) that need to "
+                        "locate run_dir for downstream stages.")
     p.add_argument("--target_k", type=int, default=50)
     p.add_argument("--min_hamming", type=int, default=3)
     p.add_argument("--cycles", type=int, default=3,
@@ -2813,6 +2867,28 @@ def main() -> None:
                         "Empty default — caller must opt in per scaffold. "
                         "PTE_i1: 'A/LYS/3:KCX' (catalytic lysine motif). "
                         "Use '-' as code to force no-PTM annotation.")
+    p.add_argument("--verbose", "-v", action="store_true",
+                   help="Set log level to DEBUG. The per-cycle metrics "
+                        "snapshot (cycle_metrics.tsv + cycle_metrics.json) "
+                        "is ALWAYS written to the run dir regardless of "
+                        "this flag — it captures input n, post-seq-filter "
+                        "n, post-struct-filter n, post-fpocket-rank n, and "
+                        "the cycle's fitness mean/min/max, sap_max mean, "
+                        "druggability mean, charge mean, hamming mean. "
+                        "Useful for diagnosing how filters and bias shape "
+                        "the population during iterative optimization.")
+    p.add_argument("--quiet", "-q", action="store_true",
+                   help="Set log level to WARNING (suppresses per-stage "
+                        "INFO chatter). Mutually exclusive with --verbose.")
+    p.add_argument("--save_intermediates", action="store_true",
+                   help="Write a heavy diagnostic dump alongside the cycle "
+                        "metrics: all_designs_per_cycle.tsv contains every "
+                        "design seen across every cycle (incl. those culled "
+                        "by struct or fpocket filters) with its full metric "
+                        "panel. Use for deep diagnostics — adds ~5-50 MB to "
+                        "the run dir depending on cycle counts and survivor "
+                        "ratios. Off by default; only top-K survivors are "
+                        "retained in topk.tsv.")
     p.add_argument("--consensus_threshold", type=float, default=0.90,
                    help="Cycle k+1 consensus reinforcement: AA frequency "
                         "across cycle-k survivors required to 'agree' "
@@ -2936,10 +3012,32 @@ def main() -> None:
             "consensus). Typical range 0.5-2.0.", args.plm_strength,
         )
 
+    if args.verbose and args.quiet:
+        raise SystemExit("--verbose and --quiet are mutually exclusive")
+    log_level = logging.DEBUG if args.verbose else (
+        logging.WARNING if args.quiet else logging.INFO
+    )
     logging.basicConfig(
-        level=logging.INFO,
+        level=log_level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    # Auto-derive catalytic resnos from the seed's REMARK 666 block. This
+    # makes the same driver/sbatch work on any scaffold in the design
+    # campaign — even though the catalytic His/Lys/Glu sequence positions
+    # vary between scaffolds (e.g. SEED1 LYS 157 vs SEED2 LYS 19), the
+    # REMARK 666 block records them and we adopt those positions for the
+    # filter / fixed-residue / catres-aware code paths.
+    global DEFAULT_CATRES, CATALYTIC_HIS_RESNOS
+    derived_catres, derived_his = _derive_catres_from_remark_666(args.seed_pdb)
+    if derived_catres != DEFAULT_CATRES:
+        LOGGER.info(
+            "auto-derived catalytic resnos from seed REMARK 666: "
+            "all_catres=%s (was default %s); his_only=%s (was default %s)",
+            derived_catres, DEFAULT_CATRES, derived_his, CATALYTIC_HIS_RESNOS,
+        )
+    DEFAULT_CATRES = derived_catres
+    CATALYTIC_HIS_RESNOS = derived_his
 
     # Include microseconds + PID to prevent concurrent-job collisions on
     # second-precision timestamps (real bug observed during a 4-job
@@ -2951,6 +3049,13 @@ def main() -> None:
     run_dir = args.out_root / f"iterative_design_v2_PTE_i1_{timestamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
     LOGGER.info("=== run dir: %s ===", run_dir)
+    if args.run_dir_marker:
+        try:
+            args.run_dir_marker.parent.mkdir(parents=True, exist_ok=True)
+            args.run_dir_marker.write_text(str(run_dir.resolve()) + "\n")
+        except Exception as exc:
+            LOGGER.warning("could not write run_dir_marker %s: %s",
+                            args.run_dir_marker, exc)
 
     # ---- Detect available compute resources -----------------------------
     # Single source of truth for CPU/GPU counts; consumed by all parallel
@@ -3249,6 +3354,12 @@ def main() -> None:
     survivors_prev: Optional[pd.DataFrame] = None
     fixed_resnos = list(DEFAULT_CATRES)
 
+    # Per-cycle metrics snapshot — written to run_dir/cycle_metrics.tsv at the
+    # end so the user can grep / plot how filter populations and quality
+    # change across cycles. Always written; --verbose adds more granular
+    # debug output to the log itself but the TSV is always there.
+    cycle_metric_rows: list[dict] = []
+
     for cyc in cycles:
         cycle_dir = run_dir / f"cycle_{cyc.cycle_idx:02d}"
         ranked_df, pdb_map = run_cycle(
@@ -3329,6 +3440,50 @@ def main() -> None:
                 # Legacy: by fitness alone.
                 survivors_prev = ranked_df
         all_pdb_maps.update(pdb_map)
+
+        # Snapshot metrics for this cycle (best-effort; never blocks).
+        cycle_row: dict = {
+            "cycle": cyc.cycle_idx,
+            "strategy": getattr(cyc, "strategy", "n/a"),
+            "ranked_n": int(len(ranked_df)) if ranked_df is not None else 0,
+        }
+        try:
+            for prefix, glob in (
+                ("seq", "02_seq_filter/survivors_seq.tsv"),
+                ("struct", "03_struct_filter/survivors_struct.tsv"),
+                ("scored", "04_fitness/scored.tsv"),
+                ("pocket", "05_fpocket/ranked.tsv"),
+            ):
+                p = cycle_dir / glob
+                if p.is_file():
+                    try:
+                        n = sum(1 for _ in open(p)) - 1  # minus header
+                    except Exception:
+                        n = -1
+                    cycle_row[f"n_{prefix}"] = n
+        except Exception:
+            pass
+        if ranked_df is not None and len(ranked_df) > 0:
+            for col, prefix in (
+                ("fitness__logp_fused_mean", "fitness"),
+                ("sap_max", "sap_max"),
+                ("fpocket__druggability", "druggability"),
+                ("net_charge_no_HIS", "charge"),
+                ("pi", "pi"),
+                ("pairwise_hamming_full", "hamming"),
+            ):
+                if col in ranked_df.columns:
+                    vals = pd.to_numeric(ranked_df[col], errors="coerce").dropna()
+                    if len(vals) > 0:
+                        cycle_row[f"{prefix}_mean"] = float(vals.mean())
+                        cycle_row[f"{prefix}_min"] = float(vals.min())
+                        cycle_row[f"{prefix}_max"] = float(vals.max())
+        cycle_metric_rows.append(cycle_row)
+        if args.verbose:
+            LOGGER.info("cycle %d metrics snapshot: %s",
+                        cyc.cycle_idx,
+                        ", ".join(f"{k}={v:.3f}" if isinstance(v, float) else f"{k}={v}"
+                                   for k, v in cycle_row.items()))
 
     # ---- Final pool: concat + dedup --------------------------------
     final_dir = run_dir / "final_topk"
@@ -3454,6 +3609,67 @@ def main() -> None:
     else:
         LOGGER.warning("final: zero survivors across all cycles!")
 
+    # ---- Per-cycle metrics snapshot ---------------------------------
+    if cycle_metric_rows:
+        cycle_metrics_df = pd.DataFrame(cycle_metric_rows)
+        cycle_metrics_df.to_csv(run_dir / "cycle_metrics.tsv", sep="\t", index=False)
+        with open(run_dir / "cycle_metrics.json", "w") as fh:
+            json.dump(cycle_metric_rows, fh, indent=2, default=str)
+        LOGGER.info("wrote per-cycle metrics: %s", run_dir / "cycle_metrics.tsv")
+
+    # ---- Optional: dump every design seen across every cycle --------
+    if args.save_intermediates and all_ranked:
+        all_designs_path = run_dir / "all_designs_per_cycle.tsv"
+        all_concat = pd.concat(all_ranked, ignore_index=True)
+        all_concat.to_csv(all_designs_path, sep="\t", index=False)
+        LOGGER.info(
+            "save_intermediates: wrote %d designs across %d cycles to %s "
+            "(%.1f MB)",
+            len(all_concat), len(cycles), all_designs_path,
+            all_designs_path.stat().st_size / 1024 / 1024,
+        )
+        # Pretty-print a compact one-liner for each cycle to the log.
+        for row in cycle_metric_rows:
+            LOGGER.info(
+                "  cycle %d: ranked=%d  n_seq=%s  n_struct=%s  n_pocket=%s  "
+                "fitness=%.3f±%s  sap_max=%.2f  drugg=%.2f",
+                row.get("cycle", -1), row.get("ranked_n", 0),
+                row.get("n_seq", "?"), row.get("n_struct", "?"),
+                row.get("n_pocket", "?"),
+                row.get("fitness_mean", float("nan")),
+                f"{row.get('fitness_max', float('nan')):.3f}",
+                row.get("sap_max_mean", float("nan")),
+                row.get("druggability_mean", float("nan")),
+            )
+
+    # ---- End-of-run summary block (always printed) -------------------
+    final_topk_count = 0
+    final_unique_seqs = 0
+    final_pdb_count = 0
+    try:
+        topk_tsv_path = final_dir / "topk.tsv"
+        if topk_tsv_path.is_file():
+            final_df = pd.read_csv(topk_tsv_path, sep="\t")
+            final_topk_count = len(final_df)
+            seq_col = "sequence" if "sequence" in final_df.columns else (
+                "seq" if "seq" in final_df.columns else None
+            )
+            if seq_col is not None:
+                final_unique_seqs = final_df[seq_col].nunique()
+        pdb_out_dir = final_dir / "topk_pdbs"
+        if pdb_out_dir.is_dir():
+            final_pdb_count = sum(1 for p in pdb_out_dir.iterdir() if p.suffix == ".pdb")
+    except Exception as exc:
+        LOGGER.warning("end-of-run summary computation failed: %s", exc)
+
+    LOGGER.info(
+        "=== FINAL SUMMARY ===  top-K rows=%d  unique_seqs=%d  PDBs=%d  "
+        "(pool->dedup->topk pruned %d -> %d)",
+        final_topk_count, final_unique_seqs, final_pdb_count,
+        sum(len(df) for df in all_ranked) if all_ranked else 0,
+        final_topk_count,
+    )
+
     # ---- Manifest ---------------------------------------------------
     manifest = {
         "pipeline": "iterative_design_v2",
@@ -3461,18 +3677,24 @@ def main() -> None:
         "ligand_params": str(args.ligand_params),
         "plm_artifacts_dir": str(args.plm_artifacts_dir),
         "position_table": str(args.position_table),
-        "fixed_resnos": list(DEFAULT_CATRES),
-        "catalytic_his_resnos": list(CATALYTIC_HIS_RESNOS),
+        "fixed_resnos": list(DEFAULT_CATRES),  # auto-derived from REMARK 666 in main()
+        "catalytic_his_resnos": list(CATALYTIC_HIS_RESNOS),  # auto-derived from REMARK 666 in main()
         "wt_length": L,
         "target_k": args.target_k,
         "diversity_min_hamming": args.min_hamming,
         "n_cycles_run": len(cycles),
         "cycle_configs": [asdict(c) for c in cycles],
+        "ptm_spec": getattr(args, "ptm", ""),
+        "final_topk_count": final_topk_count,
+        "final_unique_sequences": final_unique_seqs,
+        "final_pdb_count": final_pdb_count,
         "outputs": {
             "run_dir": str(run_dir),
             "final_topk_fasta": str(final_dir / "topk.fasta"),
             "final_topk_pdbs": str(final_dir / "topk_pdbs"),
+            "final_topk_pdbs_protonated": str(final_dir / "topk_pdbs_protonated"),
             "all_survivors": str(final_dir / "all_survivors.tsv"),
+            "cycle_metrics_tsv": str(run_dir / "cycle_metrics.tsv"),
         },
         "started_at": timestamp,
     }

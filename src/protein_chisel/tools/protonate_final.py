@@ -508,28 +508,94 @@ _RE_REMARK_666 = re.compile(
 
 
 def parse_remark_666(pdb_path: str | Path) -> list[Remark666Entry]:
-    """Extract every REMARK 666 motif entry from a PDB."""
+    """Extract every REMARK 666 motif entry from a PDB.
+
+    Tries strict regex first; falls back to whitespace-split if the regex
+    doesn't match (some pipeline tools emit subtly different REMARK 666
+    formatting that the strict pattern misses). Same field semantics as
+    the established lab utility ``get_matcher_residues`` in
+    ``/net/software/lab/scripts/enzyme_design/SETH_TEMP_UTILS/``: tokens
+    after "REMARK 666 MATCH TEMPLATE" are
+        [tpl_chain, tpl_resname, tpl_resno,
+         "MATCH", "MOTIF",
+         motif_chain, motif_resname, motif_resno,
+         motif_index, matched_int]
+    """
     entries: list[Remark666Entry] = []
     with open(pdb_path) as fh:
         for line in fh:
+            if "ATOM" in line[:6]:  # stop at coordinate block
+                break
+            if not line.startswith("REMARK 666"):
+                continue
             stripped = line.rstrip()
             m = _RE_REMARK_666.match(stripped)
-            if not m:
-                continue
-            entries.append(
-                Remark666Entry(
-                    raw=line if line.endswith("\n") else line + "\n",
-                    template_chain=m.group(1),
-                    template_resname=m.group(2),
-                    template_resno=int(m.group(3)),
-                    motif_chain=m.group(4),
-                    motif_resname=m.group(5),
-                    motif_resno=int(m.group(6)),
-                    motif_index=int(m.group(7)),
-                    matched=int(m.group(8)),
+            if m:
+                entries.append(
+                    Remark666Entry(
+                        raw=line if line.endswith("\n") else line + "\n",
+                        template_chain=m.group(1),
+                        template_resname=m.group(2),
+                        template_resno=int(m.group(3)),
+                        motif_chain=m.group(4),
+                        motif_resname=m.group(5),
+                        motif_resno=int(m.group(6)),
+                        motif_index=int(m.group(7)),
+                        matched=int(m.group(8)),
+                    )
                 )
-            )
+                continue
+            # Whitespace-split fallback. Mirrors get_matcher_residues
+            # exactly (tokens 4..13).
+            try:
+                lspl = stripped.split()
+                entries.append(
+                    Remark666Entry(
+                        raw=line if line.endswith("\n") else line + "\n",
+                        template_chain=lspl[4],
+                        template_resname=lspl[5],
+                        template_resno=int(lspl[6]),
+                        motif_chain=lspl[9],
+                        motif_resname=lspl[10],
+                        motif_resno=int(lspl[11]),
+                        motif_index=int(lspl[12]),
+                        matched=int(lspl[13]) if len(lspl) > 13 else 1,
+                    )
+                )
+            except (IndexError, ValueError) as exc:
+                LOGGER.warning(
+                    "parse_remark_666: could not parse line %r (%s); "
+                    "skipping", stripped, exc,
+                )
     return entries
+
+
+def get_matcher_residues(filename: str | Path) -> dict[int, dict]:
+    """Drop-in compatible with the lab's get_matcher_residues helper.
+
+    Returns ``{motif_resno: {target_name, target_chain, target_resno,
+    chain, name3, cst_no, cst_no_var}}``. Field names match the
+    ``/net/software/lab/scripts/enzyme_design/SETH_TEMP_UTILS/
+    process_diffusion3_outputs__REORG.py`` convention so existing
+    downstream tooling that uses that helper can swap modules.
+
+    Internally we go through :func:`parse_remark_666` so the same robust
+    regex+whitespace fallback applies.
+    """
+    matches: dict[int, dict] = {}
+    for entry in parse_remark_666(filename):
+        matches[entry.motif_resno] = {
+            "target_name": entry.template_resname,
+            "target_chain": entry.template_chain,
+            "target_resno": entry.template_resno,
+            "chain": entry.motif_chain,
+            "name3": entry.motif_resname,
+            "cst_no": entry.motif_index,
+            "cst_no_var": entry.matched,
+        }
+    LOGGER.debug("get_matcher_residues: %d entries from %s",
+                  len(matches), filename)
+    return matches
 
 
 # ----------------------------------------------------------------------------
