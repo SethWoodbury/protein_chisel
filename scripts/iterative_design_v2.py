@@ -2364,6 +2364,78 @@ def stage_rosetta_final(
     return out_path
 
 
+def stage_protonate_final_topk(
+    *,
+    topk_pdb_dir: Path,
+    seed_pdb: Path,
+    ligand_params: Path,
+    pyrosetta_sif: Path,
+    out_dir: Path,
+) -> Path:
+    """Hydrate every top-K PDB via PyRosetta and write a downstream-clean copy.
+
+    For each ``*.pdb`` under ``topk_pdb_dir``:
+      1. Loads the PDB into a PyRosetta pose (places ideal hydrogens on
+         every residue based on the residue type — catalytic tautomers
+         like HIS_D are preserved by the input residue label).
+      2. Dumps the pose to a ``.rosetta.pdb`` intermediate.
+      3. Combines that with the seed's REMARK 666 + ligand HETATM block
+         (incl. seed hydrogens), normalizes 5-char Rosetta tautomer
+         labels back to standard 3-char names, emits a REMARK 668
+         protonation-state table paired by index to REMARK 666, and
+         writes ``<stem>.protonated.pdb`` into ``out_dir``.
+
+    Runs INSIDE pyrosetta.sif via subprocess. Off the hot path: only
+    runs once per pipeline, on the final top-K (~50 PDBs).
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if not topk_pdb_dir.is_dir():
+        LOGGER.warning("stage_protonate_final_topk: %s not a directory; skipping",
+                        topk_pdb_dir)
+        return out_dir
+    if not pyrosetta_sif.is_file():
+        LOGGER.warning("stage_protonate_final_topk: pyrosetta_sif %s not found; "
+                        "skipping (designs will keep HIS_D-style labels)",
+                        pyrosetta_sif)
+        return out_dir
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from protein_chisel.utils.apptainer import pyrosetta_call
+
+    n_pdbs = sum(1 for p in topk_pdb_dir.iterdir() if p.suffix == ".pdb")
+    LOGGER.info("stage_protonate_final_topk: hydrating %d top-K PDBs via PyRosetta -> %s",
+                 n_pdbs, out_dir)
+
+    summary_json = out_dir / "_protonation_summary.json"
+    driver_script = (
+        Path(__file__).resolve().parents[0] / "protonate_final_topk.py"
+    )
+    call = (
+        pyrosetta_call()
+        .with_bind(str(topk_pdb_dir.parent.resolve()))
+        .with_bind(str(out_dir.resolve()))
+        .with_bind(str(Path(seed_pdb).resolve().parent))
+        .with_bind(str(Path(ligand_params).resolve().parent))
+    )
+    args = [
+        "--topk_dir", str(topk_pdb_dir.resolve()),
+        "--seed_pdb", str(Path(seed_pdb).resolve()),
+        "--ligand_params", str(Path(ligand_params).resolve()),
+        "--out_dir", str(out_dir.resolve()),
+        "--summary_json", str(summary_json.resolve()),
+    ]
+    try:
+        result = call.run_python(driver_script, args, check=True)
+        LOGGER.info("stage_protonate_final_topk: done (%d clean PDBs at %s)",
+                     n_pdbs, out_dir)
+        if result.stdout:
+            LOGGER.debug("stage_protonate_final_topk stdout: %s",
+                          result.stdout[:2000])
+    except Exception as e:
+        LOGGER.error("stage_protonate_final_topk failed: %s", e)
+    return out_dir
+
+
 # ----------------------------------------------------------------------
 # One iteration cycle
 # ----------------------------------------------------------------------
@@ -2710,6 +2782,20 @@ def main() -> None:
                         "Rosetta no-repack metrics panel (DDG + interface "
                         "energy + ...) on the top-K only. ~30-60 s/design, "
                         "needs pyrosetta.sif. Default OFF.")
+    p.add_argument("--protonate_final", action="store_true", default=True,
+                   help="After stage_diverse_topk, hydrate every top-K PDB "
+                        "via PyRosetta and write a downstream-clean "
+                        "<stem>.protonated.pdb with full hydrogens, "
+                        "standard 3-char residue names (no HIS_D), the "
+                        "seed's REMARK 666 + ligand block, and a new "
+                        "REMARK 668 protonation table. Default ON. "
+                        "Needs pyrosetta.sif.")
+    p.add_argument("--no_protonate_final", dest="protonate_final",
+                   action="store_false",
+                   help="Disable the post-design PyRosetta protonation step.")
+    p.add_argument("--pyrosetta_sif", type=Path,
+                   default=Path("/net/software/containers/pyrosetta.sif"),
+                   help="Path to pyrosetta.sif used by --protonate_final.")
     p.add_argument("--consensus_threshold", type=float, default=0.90,
                    help="Cycle k+1 consensus reinforcement: AA frequency "
                         "across cycle-k survivors required to 'agree' "
@@ -3338,6 +3424,14 @@ def main() -> None:
                 topk_tsv=topk_tsv, pdb_map=all_pdb_maps,
                 out_dir=final_dir / "rosetta_final",
                 ligand_params=args.ligand_params,
+            )
+        if args.protonate_final:
+            stage_protonate_final_topk(
+                topk_pdb_dir=final_dir / "topk_pdbs",
+                seed_pdb=args.seed_pdb,
+                ligand_params=args.ligand_params,
+                pyrosetta_sif=args.pyrosetta_sif,
+                out_dir=final_dir / "topk_pdbs_protonated",
             )
     else:
         LOGGER.warning("final: zero survivors across all cycles!")
