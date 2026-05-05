@@ -1373,6 +1373,148 @@ def stage_struct_filter(
     return out_dir / "survivors_struct.tsv"
 
 
+def stage_tunnel_metrics(
+    *,
+    survivors_struct_tsv: Path,
+    pdb_map: dict[str, Path],
+    out_dir: Path,
+    catalytic_resnos: Iterable[int],
+    ligand_min_radius: Optional[float] = None,
+    ligand_resname: Optional[str] = None,
+    chain: str = "A",
+    hard_gate: bool = True,
+) -> Path:
+    """Pocket-accessibility / tunnel-patency scoring on struct survivors.
+
+    Annotates each survivor with two scorers in parallel:
+
+      * Homegrown ray-cast (tunnel__*): attribution-aware geometric
+        score that distinguishes BACKBONE / CATALYTIC_SC / DESIGNABLE_SC
+        blockers — only designable-sidechain blockage flows into the
+        ranker since that's all MPNN can fix.
+
+      * pyKVFinder (pkvf__*): cavity volume / depth / surface
+        connectivity. ``pkvf__has_opening == 0`` is the strongest signal
+        that the pocket is buried and inaccessible.
+
+    Optionally HARD GATES designs whose verdict ∈ {buried, ligand_too_big}
+    or whose pyKVFinder reports no opening to bulk solvent — those
+    cannot be saved by sequence redesign and shouldn't be wasted on by
+    downstream stages.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    df = pd.read_csv(survivors_struct_tsv, sep="\t")
+    if len(df) == 0:
+        LOGGER.warning("stage_tunnel_metrics: empty input; nothing to do")
+        df.to_csv(out_dir / "survivors_tunnel.tsv", sep="\t", index=False)
+        return out_dir / "survivors_tunnel.tsv"
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from protein_chisel.tools.tunnel_metrics import (
+        score_tunnels, pyKVFinder_score, TunnelConfig,
+    )
+
+    cat_list = list(catalytic_resnos)
+    cfg = TunnelConfig()
+    LOGGER.info(
+        "stage_tunnel_metrics: scoring %d designs (catres=%s, "
+        "ligand_min_radius=%s, hard_gate=%s)",
+        len(df), cat_list, ligand_min_radius, hard_gate,
+    )
+
+    # pyKVFinder is optional (depends on universal_with_tunnel_tools.sif)
+    try:
+        import pyKVFinder  # noqa: F401
+        have_pkvf = True
+    except ImportError:
+        LOGGER.warning(
+            "stage_tunnel_metrics: pyKVFinder unavailable in this "
+            "environment; pkvf__* columns will be NaN. Run inside "
+            "/net/software/containers/users/woodbuse/"
+            "universal_with_tunnel_tools.sif for full coverage."
+        )
+        have_pkvf = False
+
+    rows: list[dict] = []
+    n_buried = 0
+    n_ligand_too_big = 0
+    n_pkvf_no_opening = 0
+    for _, row in df.iterrows():
+        rec: dict = {"id": row["id"]}
+        pdb = pdb_map.get(row["id"])
+        if pdb is None or not pdb.is_file():
+            rec["tunnel__verdict"] = "missing_pdb"
+            rows.append(rec)
+            continue
+        try:
+            scores = score_tunnels(
+                pdb_path=pdb,
+                catalytic_resnos=cat_list,
+                chain=chain,
+                ligand_resname=ligand_resname,
+                ligand_min_radius=ligand_min_radius,
+                config=cfg,
+            )
+            rec.update(scores.to_dict())
+            if scores.verdict == "buried":
+                n_buried += 1
+            elif scores.verdict == "ligand_too_big":
+                n_ligand_too_big += 1
+        except Exception as exc:
+            LOGGER.warning("score_tunnels failed for %s: %s", row["id"], exc)
+            rec["tunnel__verdict"] = "error"
+
+        if have_pkvf:
+            try:
+                rec.update(pyKVFinder_score(
+                    pdb_path=pdb,
+                    catalytic_resnos=cat_list,
+                    chain=chain,
+                ))
+                if rec.get("pkvf__has_opening", 1) == 0:
+                    n_pkvf_no_opening += 1
+            except Exception as exc:
+                LOGGER.warning("pyKVFinder_score failed for %s: %s",
+                                row["id"], exc)
+        rows.append(rec)
+
+    metrics_df = pd.DataFrame(rows)
+    merged = df.merge(metrics_df, on="id", how="left")
+
+    # Hard-gate logic: drop rows whose pocket is unfixable. Always log
+    # WHY designs were gated for diagnostics.
+    if hard_gate:
+        before = len(merged)
+        bad_verdict = merged["tunnel__verdict"].astype(str).isin(
+            ["buried", "ligand_too_big"]
+        )
+        bad_pkvf = (
+            merged["pkvf__has_opening"].fillna(1) == 0
+            if "pkvf__has_opening" in merged.columns
+            else pd.Series(False, index=merged.index)
+        )
+        keep_mask = ~(bad_verdict | bad_pkvf)
+        merged = merged[keep_mask].reset_index(drop=True)
+        n_dropped = before - len(merged)
+        LOGGER.info(
+            "stage_tunnel_metrics hard_gate: dropped %d / %d "
+            "(buried=%d, ligand_too_big=%d, pkvf_no_opening=%d) -> %d kept",
+            n_dropped, before, n_buried, n_ligand_too_big,
+            n_pkvf_no_opening, len(merged),
+        )
+
+    out_path = out_dir / "survivors_tunnel.tsv"
+    merged.to_csv(out_path, sep="\t", index=False)
+    LOGGER.info(
+        "stage_tunnel_metrics: %d designs kept; mean ray-cast time=%.1f ms; "
+        "tunnel__sidechain_blocked_fraction mean=%.2f",
+        len(merged),
+        float(merged.get("tunnel__elapsed_ms", pd.Series([float('nan')])).mean()) if len(merged) else 0.0,
+        float(merged.get("tunnel__sidechain_blocked_fraction", pd.Series([float('nan')])).mean()) if len(merged) else 0.0,
+    )
+    return out_path
+
+
 def stage_fitness_score(
     *,
     survivors_struct_tsv: Path,
@@ -2527,6 +2669,10 @@ def run_cycle(
     n_term_pad: str = "",
     c_term_pad: str = "",
     omit_M_at_pos1: bool = True,
+    tunnel_metrics_enabled: bool = False,
+    tunnel_hard_gate: bool = True,
+    ligand_min_radius: Optional[float] = None,
+    ligand_resname: Optional[str] = None,
 ) -> tuple[Optional[pd.DataFrame], dict[str, Path]]:
     """Run ONE iteration cycle. Returns (ranked DataFrame, pdb_map)."""
     if catalytic_his_resnos is None:
@@ -2741,6 +2887,28 @@ def run_cycle(
                         cycle_cfg.cycle_idx)
         return None, pdb_map
 
+    # ---- 4b. Tunnel patency / pocket accessibility -----------------
+    if tunnel_metrics_enabled:
+        tunnel_dir = cycle_dir / "035_tunnel"
+        survivors_tunnel = stage_tunnel_metrics(
+            survivors_struct_tsv=survivors_struct, pdb_map=pdb_map,
+            out_dir=tunnel_dir,
+            catalytic_resnos=fixed_resnos,
+            ligand_min_radius=ligand_min_radius,
+            ligand_resname=ligand_resname,
+            chain=CHAIN,
+            hard_gate=tunnel_hard_gate,
+        )
+        n_after_tunnel = len(pd.read_csv(survivors_tunnel, sep="\t"))
+        if n_after_tunnel == 0:
+            LOGGER.warning(
+                "cycle %d: zero survivors after tunnel hard-gate "
+                "-- skipping fitness/rank for this cycle",
+                cycle_cfg.cycle_idx,
+            )
+            return None, pdb_map
+        survivors_struct = survivors_tunnel  # downstream uses this path
+
     # ---- 5. Fitness scoring -----------------------------------------
     fitness_dir = cycle_dir / "04_fitness"
     scored = stage_fitness_score(
@@ -2840,6 +3008,26 @@ def main() -> None:
                         "Rosetta no-repack metrics panel (DDG + interface "
                         "energy + ...) on the top-K only. ~30-60 s/design, "
                         "needs pyrosetta.sif. Default OFF.")
+    p.add_argument("--tunnel_metrics", action="store_true", default=True,
+                   help="Score pocket accessibility / tunnel patency "
+                        "after stage_struct_filter. Adds ~0.3 s/design "
+                        "(homegrown ray-cast + optional pyKVFinder). "
+                        "Hard-gates designs whose verdict is 'buried' or "
+                        "whose pyKVFinder cavity has no opening to bulk "
+                        "solvent (the failure mode where the pocket "
+                        "interior looks great but the entrance is plugged "
+                        "by a residue cluster). Adds 8 tunnel__ columns + "
+                        "5 pkvf__ columns to topk.tsv.")
+    p.add_argument("--no_tunnel_metrics", dest="tunnel_metrics",
+                   action="store_false")
+    p.add_argument("--tunnel_hard_gate", action="store_true", default=True,
+                   help="When --tunnel_metrics is on, drop designs with "
+                        "verdict in {buried, ligand_too_big} BEFORE TOPSIS "
+                        "ranking, since no sequence redesign can fix "
+                        "those. Off-by-default would let them be ranked "
+                        "down but kept; on (default) is more aggressive.")
+    p.add_argument("--no_tunnel_hard_gate", dest="tunnel_hard_gate",
+                   action="store_false")
     p.add_argument("--protonate_final", action="store_true", default=True,
                    help="After stage_diverse_topk, hydrate every top-K PDB "
                         "via PyRosetta and write a downstream-clean "
@@ -3181,6 +3369,28 @@ def main() -> None:
     wt_seq = extract_sequence(args.seed_pdb, chain=CHAIN)
     if len(wt_seq) != L:
         raise RuntimeError(f"WT seq length {len(wt_seq)} != PositionTable {L}")
+
+    # Compute ligand geometry summary ONCE — scaffold-invariant. The
+    # min_projected_radius is the relevant tunnel-fit threshold.
+    try:
+        from protein_chisel.tools.ligand_geometry import ligand_geometry_from_pdb
+        ligand_geometry_summary = ligand_geometry_from_pdb(args.seed_pdb)
+        LOGGER.info(
+            "ligand geometry: resname=%s n_heavy=%d n_metals=%d "
+            "Rg=%.2f min_proj_radius=%.2f bbox_diag=%.2f",
+            ligand_geometry_summary["ligand_resname"],
+            ligand_geometry_summary["n_heavy_atoms"],
+            ligand_geometry_summary["n_metal_atoms"],
+            ligand_geometry_summary["radius_of_gyration"],
+            ligand_geometry_summary["min_projected_radius"],
+            ligand_geometry_summary["bounding_box_diagonal"],
+        )
+    except Exception as exc:
+        LOGGER.warning("ligand_geometry_from_pdb failed (%s); "
+                        "tunnel ligand-fit gate will be disabled", exc)
+        ligand_geometry_summary = {
+            "ligand_resname": None, "min_projected_radius": None,
+        }
     # Threshold OmpT motifs at WT count: don't reject sequences that
     # are no worse than WT for E. coli expression. WT has dibasic motifs
     # that are forced by the catalytic K157 (KK at 157-158); a strict
@@ -3404,6 +3614,10 @@ def main() -> None:
             n_term_pad=args.n_term_pad,
             c_term_pad=args.c_term_pad,
             omit_M_at_pos1=not args.no_omit_M_at_pos1,
+            tunnel_metrics_enabled=args.tunnel_metrics,
+            tunnel_hard_gate=args.tunnel_hard_gate,
+            ligand_min_radius=ligand_geometry_summary.get("min_projected_radius"),
+            ligand_resname=ligand_geometry_summary.get("ligand_resname"),
         )
         if ranked_df is not None and len(ranked_df) > 0:
             ranked_df = ranked_df.copy()
@@ -3743,6 +3957,9 @@ def main() -> None:
         "n_cycles_run": len(cycles),
         "cycle_configs": [asdict(c) for c in cycles],
         "ptm_spec": getattr(args, "ptm", ""),
+        "ligand_geometry": ligand_geometry_summary,
+        "tunnel_metrics_enabled": getattr(args, "tunnel_metrics", False),
+        "tunnel_hard_gate": getattr(args, "tunnel_hard_gate", True),
         "final_topk_count": final_topk_count,
         "final_unique_sequences": final_unique_seqs,
         "final_pdb_count": final_pdb_count,

@@ -140,7 +140,15 @@ apptainer exec --nv \
         --esmc_model "$ESMC_MODEL" \
         --saprot_model "$SAPROT_MODEL"
 
-echo "=== STAGE 3: iterative driver (universal.sif) ==="
+# Stage 3 sif selection: prefer the user-built derivative that adds
+# pyKVFinder + RDKit on top of universal.sif (used by --tunnel_metrics).
+# Falls back to system universal.sif if the derivative is unavailable.
+STAGE3_SIF=/net/software/containers/users/woodbuse/universal_with_tunnel_tools.sif
+if [[ ! -f "$STAGE3_SIF" ]]; then
+    STAGE3_SIF=/net/software/containers/universal.sif
+    echo "WARN: $STAGE3_SIF not found; using system universal.sif (--tunnel_metrics will skip pyKVFinder)"
+fi
+echo "=== STAGE 3: iterative driver ($STAGE3_SIF) ==="
 apptainer exec --nv \
     --bind "$REPO:/code" \
     --bind /net/software \
@@ -148,7 +156,7 @@ apptainer exec --nv \
     --bind /net/scratch \
     --bind /home/woodbuse \
     --env "PYTHONPATH=/code/src:/cifutils/src" \
-    /net/software/containers/universal.sif \
+    "$STAGE3_SIF" \
     python "$REPO/scripts/iterative_design_v2.py" \
         --seed_pdb "$SEED_PDB" \
         --ligand_params "$LIG_PARAMS" \
