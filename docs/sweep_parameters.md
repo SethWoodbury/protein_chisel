@@ -366,14 +366,30 @@ For our pipeline this matters because:
   multiple sequences in batches
 
 Empirical limits at cpus=4:
-- L=202, 600m + 1.3b CPU: **14.3 GB peak** (validated)
-- L=275, 600m + 1.3b CPU: **(empirical probe in progress, results
-  written below when complete)**
+- L=202, 600m + 1.3b CPU full pipeline: **14.3 GB MaxRSS** (validated)
+- L=275, 600m + 1.3b CPU stage-2 only: **10.9 GB MaxRSS** (validated
+  via synthetic alpha-helix probe; see `/home/woodbuse/probe_275aa_mem.py`)
+  - ESM-C 600M  L=275: 8:03 wall, 5.06 GB peak
+  - SaProt 1.3B L=275: 17:37 wall, 6.38 GB peak (cumulative)
+- L=275 full pipeline estimate: **~16–17 GB MaxRSS** (stage-3 driver
+  adds 5–7 GB over stage-2 baseline due to fpocket Pool(4) fork +
+  per-design dataframes + LigandMPNN model)
 
-Estimated upper bound for L=275: ~16 GB peak (model weights are
-length-invariant; activations grow ~1.36× from L=202→275, adding
-~0.5–1 GB). 16G mem allocation has tight 1.1× headroom — recommend
-`--mem=18G` for L>250 scaffolds, or `--mem=20G` for safety.
+`--mem=` recommendation by scaffold length:
+
+| L | --mem | headroom |
+|---|---|---|
+| ≤210 | 18G | 1.26× over 14.3 GB |
+| 210–280 | **20G** ★ default | 1.18× over predicted ~17 GB |
+| 280–350 | 24G | 1.20× over predicted ~20 GB |
+
+The production default `--mem=20G` (set in
+`scripts/run_iterative_design_v2.sbatch`) covers everything measured
+and most expected scaffold sizes with comfortable headroom. Slurm
+`--mem` is total-job (not per-cpu); see "Memory: per-job vs per-cpu"
+section above. ESM-C and SaProt model weights are L-invariant
+(2.4 + 5 = 7.4 GB); only activations and per-design dataframes scale
+with L (linearly).
 
 ## Sweep B parameter reference (production)
 

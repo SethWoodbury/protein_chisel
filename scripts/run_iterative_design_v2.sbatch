@@ -3,19 +3,21 @@
 #SBATCH --partition=gpu-bf
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=16G
+#SBATCH --mem=20G
 #SBATCH --time=01:00:00
-# Resource notes (validated 2026-05-04 GPU PLM sweep + 6-way matrix):
+# Resource notes (validated 2026-05-04 GPU PLM sweep + 6-way matrix +
+# L=275 empirical memory probe):
 #   GPU runs (full pipeline, default scaffold L=202):
 #     - 300m+35m PLMs:  3:51 wall,  5.0 GB MaxRSS
 #     - 600m+650m PLMs: 7:06 wall,  9.5 GB MaxRSS
 #     - 600m+1.3b PLMs: 3:40 wall,  8.0 GB MaxRSS  <-- production default
-#   cpus=4 is the sweet spot (super-linear from fpocket Pool;
-#   hyperthread oversubscription kicks in past 4).
-#   --mem=16G is whole-job total (NOT per-cpu); leaves ~2x headroom
-#   above 1.3b peak. For scaffolds up to ~275 residues, 16G remains
-#   safe (PLM weights dominate; activations scale linearly with L
-#   and stay <2 GB extra at L=275 — see docs/sweep_parameters.md).
+#   CPU runs (cpus=4, full pipeline, L=202): 14.3 GB MaxRSS for 1.3b.
+#   L=275 stage-2 probe (CPU): 10.9 GB peak; full pipeline estimate
+#   ~16-17 GB. cpus=4 is the sweet spot (super-linear from fpocket
+#   Pool; hyperthread oversubscription kicks in past 4).
+#   --mem=20G is whole-job total (NOT per-cpu); ~1.2-1.4x headroom
+#   for typical L=200-280 scaffolds. Bump to 24G for L>300.
+#   See docs/sweep_parameters.md for the full memory model.
 #SBATCH --output=/net/scratch/woodbuse/slurm-iter-v2-%j.out
 #SBATCH --error=/net/scratch/woodbuse/slurm-iter-v2-%j.err
 
