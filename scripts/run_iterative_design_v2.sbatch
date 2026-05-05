@@ -3,16 +3,19 @@
 #SBATCH --partition=gpu-bf
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=10G
+#SBATCH --mem=16G
 #SBATCH --time=01:00:00
-# Resource notes (validated 2026-05-04 sweep E):
-#   - cpus=2 mem=8G: ~7.5 min wall, 3.5 GB peak (44% of 8G)
-#   - cpus=4 mem=10G: better with fpocket parallelization (Pool(4) cuts
-#     fpocket time ~4x; was ~41% of total wall before)
-#   - cpus=8 mem=12G: optimal if you want max parallelization, more
-#     priority cost. Most users want cpus=4.
-# Original was cpus=4 mem=16G --time=08:00:00 — overprovisioned 2x on
-# memory and 8x on time. Production runs land in 7-10 min.
+# Resource notes (validated 2026-05-04 GPU PLM sweep + 6-way matrix):
+#   GPU runs (full pipeline, default scaffold L=202):
+#     - 300m+35m PLMs:  3:51 wall,  5.0 GB MaxRSS
+#     - 600m+650m PLMs: 7:06 wall,  9.5 GB MaxRSS
+#     - 600m+1.3b PLMs: 3:40 wall,  8.0 GB MaxRSS  <-- production default
+#   cpus=4 is the sweet spot (super-linear from fpocket Pool;
+#   hyperthread oversubscription kicks in past 4).
+#   --mem=16G is whole-job total (NOT per-cpu); leaves ~2x headroom
+#   above 1.3b peak. For scaffolds up to ~275 residues, 16G remains
+#   safe (PLM weights dominate; activations scale linearly with L
+#   and stay <2 GB extra at L=275 — see docs/sweep_parameters.md).
 #SBATCH --output=/net/scratch/woodbuse/slurm-iter-v2-%j.out
 #SBATCH --error=/net/scratch/woodbuse/slurm-iter-v2-%j.err
 
@@ -54,18 +57,20 @@ USE_SIDE_CHAIN_CONTEXT="${USE_SIDE_CHAIN_CONTEXT:-0}"
 ENHANCE="${ENHANCE:-}"
 
 # PLM model variants (only matter for stage 2 — precompute_plm_artifacts).
-# Defaults are the smallest+fastest in each family.
-#   ESMC_MODEL  : esmc_300m (default, ~46s) | esmc_600m
-#   SAPROT_MODEL: saprot_35m (default, ~10s) | saprot_650m | saprot_1.3b
-# Larger models give marginally better masked-LM probs but cost more
-# VRAM and time. Stage 2 runs ONCE per scaffold so the time cost is
-# amortized across all subsequent design runs.
-ESMC_MODEL="${ESMC_MODEL:-esmc_300m}"
-SAPROT_MODEL="${SAPROT_MODEL:-saprot_35m}"
-
-# Optional pLDDT-enhanced fused_mpnn checkpoint name (without .pth);
-# empty string = disabled. Adds ~+0.02 nats/residue mean fitness.
-ENHANCE="${ENHANCE:-}"
+#   ESMC_MODEL  : esmc_300m (~46s GPU) | esmc_600m (default, ~90s GPU)
+#   SAPROT_MODEL: saprot_35m (~10s GPU) | saprot_650m | saprot_650m_af2
+#                 | saprot_1.3b (default, ~30s GPU, 6 GB VRAM)
+# Defaults set by 6-way validation 2026-05-04: esmc_600m + saprot_1.3b
+# delivered the best balance of fitness (-1.79 mean), sap_max (~0.85,
+# 2x lower than 35m default), pocket volume (+30%), and pairwise
+# diversity (+20%) at no wall-time cost vs the small-model default
+# (3:40 GPU). See docs/sweep_parameters.md for the full PLM-combo
+# matrix. Override per scaffold if memory is tight (esmc_300m +
+# saprot_35m fits in ~5 GB).
+# Stage 2 runs ONCE per scaffold so its cost is amortized across all
+# subsequent design rounds.
+ESMC_MODEL="${ESMC_MODEL:-esmc_600m}"
+SAPROT_MODEL="${SAPROT_MODEL:-saprot_1.3b}"
 
 # Working dir for this job (ms + PID for collision safety with concurrent jobs)
 TS=$(python3 -c 'import datetime,os; t=datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]; print(f"{t}-pid{os.getpid()}")' 2>/dev/null || date +%Y%m%d-%H%M%S)
