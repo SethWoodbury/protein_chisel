@@ -142,11 +142,23 @@ apptainer exec --nv \
 
 # Stage 3 sif selection: prefer the user-built derivative that adds
 # pyKVFinder + RDKit on top of universal.sif (used by --tunnel_metrics).
-# Falls back to system universal.sif if the derivative is unavailable.
-STAGE3_SIF=/net/software/containers/users/woodbuse/universal_with_tunnel_tools.sif
-if [[ ! -f "$STAGE3_SIF" ]]; then
+# Empirically /net/software/containers/users/woodbuse/ has slow NFS
+# metadata propagation to gpu-train compute nodes (newly built sifs
+# can take >1 hr to be visible there), so we prefer the /net/scratch
+# copy first — that filesystem is hot and propagates immediately.
+# Falls back to the canonical user-tools location, then to the system
+# universal.sif (which means pyKVFinder will be unavailable; the
+# homegrown ray-cast still runs in tunnel_metrics).
+SIF_SCRATCH=/net/scratch/woodbuse/sif/universal_with_tunnel_tools.sif
+SIF_CANON=/net/software/containers/users/woodbuse/universal_with_tunnel_tools.sif
+if [[ -f "$SIF_SCRATCH" ]]; then
+    STAGE3_SIF="$SIF_SCRATCH"
+elif [[ -f "$SIF_CANON" ]]; then
+    STAGE3_SIF="$SIF_CANON"
+else
     STAGE3_SIF=/net/software/containers/universal.sif
-    echo "WARN: $STAGE3_SIF not found; using system universal.sif (--tunnel_metrics will skip pyKVFinder)"
+    echo "WARN: tunnel-tools sif not found at scratch or canonical paths;"
+    echo "      using system universal.sif (--tunnel_metrics will skip pyKVFinder)"
 fi
 echo "=== STAGE 3: iterative driver ($STAGE3_SIF) ==="
 apptainer exec --nv \
