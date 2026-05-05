@@ -907,3 +907,205 @@ def pyKVFinder_score(
         "pkvf__has_opening": has_opening,
         "pkvf__elapsed_ms": (time.perf_counter() - t0) * 1000.0,
     }
+
+
+# ----------------------------------------------------------------------------
+# Throat-blocker feedback (cycle-to-cycle MPNN bias reinforcement)
+# ----------------------------------------------------------------------------
+
+
+def aggregate_blocker_stats(
+    pdb_paths: Iterable[str | Path],
+    catalytic_resnos: Iterable[int],
+    *,
+    chain: str = "A",
+    ligand_resname: Optional[str] = None,
+    config: Optional[TunnelConfig] = None,
+) -> dict[int, dict]:
+    """Aggregate per-design throat-blocker breakdowns across many designs.
+
+    For each PDB in ``pdb_paths``, runs ``score_tunnels(return_breakdown=True)``
+    and accumulates per-(resno) statistics:
+
+        {
+            resno: {
+                "n_observed":   int,            # designs with this position blocked
+                "total_weight": float,          # sum of mass_weights at this pos
+                "avg_weight":   float,          # total_weight / n_designs
+                "aa_counts":    {AA: count},    # how often each AA appears here
+                "top_aa":       str,            # most-frequent blocker AA
+            }
+        }
+
+    Args:
+        pdb_paths: iterable of design PDBs (typically a cycle's survivors).
+        catalytic_resnos: catres to pass to ``score_tunnels``.
+        chain: protein chain ID.
+        ligand_resname: optional ligand auto-detect.
+        config: TunnelConfig (defaults shared with score_tunnels).
+
+    Returns:
+        ``{resno: stats_dict}``. Empty dict if no designs scored.
+    """
+    from collections import Counter, defaultdict
+
+    pdb_paths = [Path(p) for p in pdb_paths]
+    if not pdb_paths:
+        return {}
+    if config is None:
+        config = TunnelConfig()
+
+    pos_total: dict[int, float] = defaultdict(float)
+    pos_aa_count: dict[int, Counter] = defaultdict(Counter)
+    n_designs_scored = 0
+
+    for pdb in pdb_paths:
+        try:
+            _scores, breakdown = score_tunnels(
+                pdb_path=pdb,
+                catalytic_resnos=list(catalytic_resnos),
+                chain=chain,
+                ligand_resname=ligand_resname,
+                config=config,
+                return_breakdown=True,
+            )
+        except Exception as exc:
+            LOGGER.debug("aggregate_blocker_stats: skipping %s (%s)",
+                          pdb.name, exc)
+            continue
+        n_designs_scored += 1
+        for resno, resname, weight in breakdown:
+            pos_total[resno] += float(weight)
+            pos_aa_count[resno][resname] += 1
+
+    if n_designs_scored == 0:
+        return {}
+
+    out: dict[int, dict] = {}
+    for resno, total_w in pos_total.items():
+        counts = pos_aa_count[resno]
+        if not counts:
+            continue
+        top_aa, _ = counts.most_common(1)[0]
+        out[resno] = {
+            "n_observed": sum(counts.values()),
+            "total_weight": float(total_w),
+            "avg_weight": float(total_w / n_designs_scored),
+            "aa_counts": dict(counts),
+            "top_aa": top_aa,
+            "n_designs_scored": n_designs_scored,
+        }
+    return out
+
+
+# Mass-weight threshold above which an AA is considered "bulky enough to
+# pre-emptively downweight at known throat positions."
+_BULKY_THRESHOLD: float = 0.55
+
+
+def build_throat_bias_delta(
+    blocker_stats: dict[int, dict],
+    *,
+    L: int,
+    protein_resnos: Iterable[int],
+    fixed_resnos: Iterable[int],
+    avg_weight_threshold: float = 0.30,
+    base_strength: float = 1.0,
+    observed_extra: float = 0.5,
+    bulky_threshold: float = _BULKY_THRESHOLD,
+    max_total_per_aa: float = 2.0,
+) -> tuple[np.ndarray, dict]:
+    """Convert aggregated blocker stats into a (L, 20) bias delta.
+
+    Algorithm:
+      For each position with avg_weight >= threshold:
+        For each AA whose blocker mass-weight >= bulky_threshold (i.e. all
+        bulky AAs that COULD become blockers there):
+          delta[res_idx, aa_idx] -= base_strength * mass_weight(AA)
+        For the OBSERVED top blocker AA at that position, additionally:
+          delta[res_idx, top_aa_idx] -= observed_extra
+        Cap the magnitude per (position, AA) to max_total_per_aa.
+
+      Catalytic / fixed residues are SKIPPED entirely (their identity is
+      pinned by REMARK 666).
+
+    Args:
+        blocker_stats: output of ``aggregate_blocker_stats``.
+        L: protein length (for bias shape).
+        protein_resnos: 1-indexed PDB resnos in protein-array order.
+        fixed_resnos: catalytic / pinned positions to SKIP.
+        avg_weight_threshold: only positions with avg_weight >= this trigger.
+        base_strength: nats applied to each bulky AA at the position.
+        observed_extra: extra nats applied to the OBSERVED top blocker AA.
+        bulky_threshold: minimum mass-weight for an AA to count as bulky.
+        max_total_per_aa: cap on the total magnitude at any (pos, AA).
+
+    Returns:
+        (delta [L, 20] float32, telemetry dict with positions + AAs touched)
+    """
+    AA_ORDER = "ACDEFGHIKLMNPQRSTVWY"
+    aa_to_idx = {a: i for i, a in enumerate(AA_ORDER)}
+
+    delta = np.zeros((L, 20), dtype=np.float32)
+    resno_to_idx = {int(r): i for i, r in enumerate(protein_resnos)}
+    fixed_set = {int(r) for r in fixed_resnos}
+
+    telem: dict = {
+        "n_positions_targeted": 0,
+        "positions": [],  # list of {resno, top_aa, avg_weight, n_aas_biased}
+    }
+
+    for resno, stats in blocker_stats.items():
+        if resno in fixed_set:
+            continue
+        if stats["avg_weight"] < avg_weight_threshold:
+            continue
+        idx = resno_to_idx.get(int(resno))
+        if idx is None:
+            continue
+
+        n_aas_biased = 0
+        # Pre-emptive bulky-AA downweight at this position
+        for aa_3 in _BLOCKER_WEIGHT:
+            mw = _BLOCKER_WEIGHT[aa_3]
+            if mw < bulky_threshold:
+                continue
+            # Convert 3-letter to 1-letter via an inline map
+            aa_1 = {
+                "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
+                "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
+                "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
+                "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
+            }.get(aa_3)
+            if aa_1 is None or aa_1 not in aa_to_idx:
+                continue
+            ai = aa_to_idx[aa_1]
+            delta[idx, ai] -= base_strength * mw
+
+        # Extra penalty on the OBSERVED top blocker AA
+        top_aa_3 = stats["top_aa"]
+        top_aa_1 = {
+            "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
+            "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
+            "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
+            "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
+        }.get(top_aa_3)
+        if top_aa_1 and top_aa_1 in aa_to_idx:
+            delta[idx, aa_to_idx[top_aa_1]] -= observed_extra
+            n_aas_biased += 1
+
+        # Cap magnitudes per (pos, AA) — never apply more than max_total_per_aa
+        delta[idx] = np.maximum(delta[idx], -max_total_per_aa)
+
+        n_aas_biased = int((delta[idx] < -1e-6).sum())
+        telem["positions"].append({
+            "resno": int(resno),
+            "top_aa": top_aa_3,
+            "avg_weight": float(stats["avg_weight"]),
+            "n_observed": int(stats["n_observed"]),
+            "n_aas_biased": n_aas_biased,
+            "max_penalty_nats": float(-delta[idx].min()),
+        })
+
+    telem["n_positions_targeted"] = len(telem["positions"])
+    return delta, telem

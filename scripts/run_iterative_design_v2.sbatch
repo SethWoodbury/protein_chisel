@@ -182,7 +182,8 @@ apptainer exec --nv \
         --use_side_chain_context "$USE_SIDE_CHAIN_CONTEXT" \
         --run_dir_marker "$WORK_DIR/run_dir.txt" \
         ${PTM:+--ptm "$PTM"} \
-        ${ENHANCE:+--enhance "$ENHANCE"}
+        ${ENHANCE:+--enhance "$ENHANCE"} \
+        ${EXTRA_DRIVER_FLAGS:-}
 
 # Stage 3 wrote run_dir's path into $WORK_DIR/run_dir.txt as soon as
 # it knew the timestamped run_dir name. Read it for stage 4. This is

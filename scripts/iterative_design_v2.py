@@ -2673,8 +2673,15 @@ def run_cycle(
     tunnel_hard_gate: bool = True,
     ligand_min_radius: Optional[float] = None,
     ligand_resname: Optional[str] = None,
-) -> tuple[Optional[pd.DataFrame], dict[str, Path]]:
-    """Run ONE iteration cycle. Returns (ranked DataFrame, pdb_map)."""
+    throat_bias_prev: Optional[np.ndarray] = None,
+    throat_bias_decay: float = 0.5,
+) -> tuple[Optional[pd.DataFrame], dict[str, Path], dict]:
+    """Run ONE iteration cycle. Returns (ranked DataFrame, pdb_map, cycle_telemetry).
+
+    ``cycle_telemetry`` carries forward-looking signals to the next cycle:
+        - ``throat_bias_delta``: (L, 20) delta to apply (decayed) at next cycle
+        - ``blocker_stats``: aggregated per-position blocker stats from this cycle
+    """
     if catalytic_his_resnos is None:
         catalytic_his_resnos = CATALYTIC_HIS_RESNOS
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -2715,6 +2722,30 @@ def run_cycle(
             "augmented_resnos_1idx": t.augmented_resnos,
             "capped": t.capped,
         }
+    # ---- 0a-bis. Throat-blocker bias (cycle-to-cycle reinforcement) ---
+    # Apply (decayed) bias from the previous cycle's throat-blocker
+    # observations so MPNN actively avoids placing bulky AAs at known-
+    # constricting positions. cumulative across cycles with exponential
+    # decay so positions that successfully open up release pressure.
+    throat_bias_applied: Optional[np.ndarray] = None
+    if throat_bias_prev is not None and throat_bias_prev.shape == bias_k.shape:
+        throat_bias_applied = (throat_bias_prev * throat_bias_decay).astype(bias_k.dtype)
+        bias_k = bias_k + throat_bias_applied
+        n_pos_touched = int((np.abs(throat_bias_applied) > 1e-6).any(axis=1).sum())
+        n_aa_touched = int((np.abs(throat_bias_applied) > 1e-6).sum())
+        max_penalty = float(throat_bias_applied.min()) if throat_bias_applied.size else 0.0
+        LOGGER.info(
+            "cycle %d: applied THROAT bias (decayed by %.2f) at %d positions, "
+            "%d (pos,AA) cells, max penalty %.2f nats",
+            cycle_cfg.cycle_idx, throat_bias_decay,
+            n_pos_touched, n_aa_touched, max_penalty,
+        )
+        telem["throat_bias_n_positions"] = n_pos_touched
+        telem["throat_bias_max_penalty"] = max_penalty
+    else:
+        telem["throat_bias_n_positions"] = 0
+        telem["throat_bias_max_penalty"] = 0.0
+
     np.save(bias_dir / "bias.npy", bias_k)
     with open(bias_dir / "telemetry.json", "w") as fh:
         json.dump(telem, fh, indent=2)
@@ -2885,7 +2916,7 @@ def run_cycle(
     if n_struct == 0:
         LOGGER.warning("cycle %d: zero struct survivors -- nothing to score/rank",
                         cycle_cfg.cycle_idx)
-        return None, pdb_map
+        return None, pdb_map, {}
 
     # ---- 4b. Tunnel patency / pocket accessibility -----------------
     if tunnel_metrics_enabled:
@@ -2906,7 +2937,7 @@ def run_cycle(
                 "-- skipping fitness/rank for this cycle",
                 cycle_cfg.cycle_idx,
             )
-            return None, pdb_map
+            return None, pdb_map, {}
         survivors_struct = survivors_tunnel  # downstream uses this path
 
     # ---- 5. Fitness scoring -----------------------------------------
@@ -2927,7 +2958,65 @@ def run_cycle(
         catalytic_resnos=fixed_resnos,
     )
     ranked_df = pd.read_csv(ranked, sep="\t")
-    return ranked_df, pdb_map
+
+    # ---- 7. Compute throat-bias delta for next cycle ----------------
+    cycle_telem: dict = {}
+    if tunnel_metrics_enabled and len(ranked_df) > 0:
+        try:
+            from protein_chisel.tools.tunnel_metrics import (
+                aggregate_blocker_stats, build_throat_bias_delta,
+            )
+            # Use this cycle's TOP-RANKED survivors (these will inform
+            # which throats are recurring problems). Cap at 100 for cost.
+            top_ids = ranked_df["id"].astype(str).tolist()[:100]
+            top_pdbs = [pdb_map[i] for i in top_ids if i in pdb_map and pdb_map[i].is_file()]
+            if top_pdbs:
+                blocker_stats = aggregate_blocker_stats(
+                    pdb_paths=top_pdbs,
+                    catalytic_resnos=fixed_resnos,
+                    chain=CHAIN,
+                    ligand_resname=ligand_resname,
+                )
+                # Build the new (L, 20) delta. Decay applied at the
+                # NEXT cycle when consumed.
+                L_bias = bias_k.shape[0]
+                bias_delta_new, throat_telem = build_throat_bias_delta(
+                    blocker_stats=blocker_stats,
+                    L=L_bias,
+                    protein_resnos=protein_resnos,
+                    fixed_resnos=fixed_resnos,
+                )
+                # ACCUMULATE: combine the previously-applied (decayed)
+                # bias with this cycle's new observations. This makes
+                # throat pressure cumulative while letting one-off
+                # observations decay if they don't recur.
+                if throat_bias_applied is not None:
+                    bias_delta_carry = throat_bias_applied + bias_delta_new
+                else:
+                    bias_delta_carry = bias_delta_new
+
+                cycle_telem["throat_bias_delta"] = bias_delta_carry
+                cycle_telem["blocker_stats"] = {
+                    int(k): v for k, v in blocker_stats.items()
+                }
+                cycle_telem["throat_telemetry"] = throat_telem
+                LOGGER.info(
+                    "cycle %d: collected throat blockers from %d top survivors; "
+                    "%d positions targeted for next-cycle bias (max penalty %.2f nats)",
+                    cycle_cfg.cycle_idx, len(top_pdbs),
+                    throat_telem["n_positions_targeted"],
+                    max((p["max_penalty_nats"] for p in throat_telem["positions"]), default=0.0),
+                )
+                # Save telemetry for offline inspection
+                with open(cycle_dir / "throat_blocker_telemetry.json", "w") as fh:
+                    json.dump({
+                        "blocker_stats": {str(k): v for k, v in blocker_stats.items()},
+                        "throat_telemetry": throat_telem,
+                    }, fh, indent=2, default=str)
+        except Exception as exc:
+            LOGGER.warning("throat-bias delta computation failed: %s", exc)
+
+    return ranked_df, pdb_map, cycle_telem
 
 
 # ----------------------------------------------------------------------
@@ -3028,6 +3117,21 @@ def main() -> None:
                         "down but kept; on (default) is more aggressive.")
     p.add_argument("--no_tunnel_hard_gate", dest="tunnel_hard_gate",
                    action="store_false")
+    p.add_argument("--throat_feedback", action="store_true", default=True,
+                   help="Aggregate throat-blocker observations from cycle k's "
+                        "TOP survivors and add a (decayed) per-position "
+                        "negative bias to MPNN's bias_AA at those positions in "
+                        "cycle k+1 — actively pressures MPNN to swap bulky "
+                        "residues at the entrance. Cumulative across cycles "
+                        "with exponential decay (default 0.5) so positions "
+                        "that successfully open up release pressure. Default ON.")
+    p.add_argument("--no_throat_feedback", dest="throat_feedback",
+                   action="store_false")
+    p.add_argument("--throat_feedback_decay", type=float, default=0.5,
+                   help="Exponential decay applied to the carried-forward "
+                        "throat bias at the start of each cycle. 0.5 = halve "
+                        "the previous bias before adding new observations. "
+                        "Lower values release pressure faster.")
     p.add_argument("--protonate_final", action="store_true", default=True,
                    help="After stage_diverse_topk, hydrate every top-K PDB "
                         "via PyRosetta and write a downstream-clean "
@@ -3564,6 +3668,9 @@ def main() -> None:
     fitness_cache: dict = {}
     survivors_prev: Optional[pd.DataFrame] = None
     fixed_resnos = list(DEFAULT_CATRES)
+    # Throat-blocker bias delta carried forward across cycles. None for
+    # cycle 0 (no prior data); populated from cycle k for cycle k+1.
+    throat_bias_prev: Optional[np.ndarray] = None
 
     # Per-cycle metrics snapshot — written to run_dir/cycle_metrics.tsv at the
     # end so the user can grep / plot how filter populations and quality
@@ -3573,7 +3680,7 @@ def main() -> None:
 
     for cyc in cycles:
         cycle_dir = run_dir / f"cycle_{cyc.cycle_idx:02d}"
-        ranked_df, pdb_map = run_cycle(
+        ranked_df, pdb_map, cyc_telem = run_cycle(
             cycle_cfg=cyc, seed_pdb=args.seed_pdb,
             base_bias=base_bias,
             log_probs_esmc=log_probs_esmc,
@@ -3618,6 +3725,15 @@ def main() -> None:
             tunnel_hard_gate=args.tunnel_hard_gate,
             ligand_min_radius=ligand_geometry_summary.get("min_projected_radius"),
             ligand_resname=ligand_geometry_summary.get("ligand_resname"),
+            throat_bias_prev=throat_bias_prev,
+            throat_bias_decay=args.throat_feedback_decay,
+        )
+        # Carry throat-bias forward to next cycle (None if disabled or
+        # this cycle didn't produce one).
+        throat_bias_prev = (
+            cyc_telem.get("throat_bias_delta")
+            if (args.throat_feedback and cyc_telem)
+            else None
         )
         if ranked_df is not None and len(ranked_df) > 0:
             ranked_df = ranked_df.copy()
