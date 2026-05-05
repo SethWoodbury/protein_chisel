@@ -1010,10 +1010,10 @@ def build_throat_bias_delta(
     protein_resnos: Iterable[int],
     fixed_resnos: Iterable[int],
     avg_weight_threshold: float = 0.10,
-    base_strength: float = 1.5,
+    base_strength: float = 1.0,
     observed_extra: float = 0.5,
-    bulky_threshold: float = _BULKY_THRESHOLD,
-    max_total_per_aa: float = 2.5,
+    bulky_threshold: float = 0.70,
+    max_total_per_aa: float = 2.0,
 ) -> tuple[np.ndarray, dict]:
     """Convert aggregated blocker stats into a (L, 20) bias delta.
 
