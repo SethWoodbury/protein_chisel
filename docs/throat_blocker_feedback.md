@@ -141,3 +141,38 @@ Use `--no_throat_feedback` when:
   next cycle.
 - `src/protein_chisel/scoring/multi_objective.py` — `DEFAULT_METRIC_SPECS`
   carries 5 tunnel/pkvf criteria with halved weights.
+
+
+## Cross-scaffold validation (SEED1 FS269 vs SEED2 FS148)
+
+Same production defaults, two different scaffolds. SEED1 has unusually
+high baseline diversity (hamming ~53) while SEED2 is more constricted.
+Treatment behavior is scaffold-dependent:
+
+| metric | FS148 baseline | FS148 treatment | FS269 baseline | FS269 treatment |
+|---|---|---|---|---|
+| pairwise_hamming | 36.3 | **41.1** ↑ | **53.3** | 38.4 ↓ |
+| sap_max | 1.57 | 1.93 ↑ | 1.68 | **1.27** ↓ ✓✓ |
+| n_hbonds_to_cat_his | 2.46 | 2.08 ↓ | **1.06** | **1.76** ↑ ✓ |
+| pkvf__cavity_volume | 120 | **140** ↑ | 131.5 | 125.1 ↓ (small) |
+| druggability | 0.969 | 0.961 | 0.949 | **0.974** ↑ |
+| fitness | -1.800 | -1.815 | -1.779 | -1.783 |
+
+Reading: when a scaffold has a **clear** entrance-blockage problem
+(FS148 with 4+ recurring blockers), treatment substantially improves
+pocket geometry while preserving (even improving) diversity.
+For scaffolds that are already accessible (FS269 with only 1 position
+flagged at 1.0 nat), treatment still helps sap and h-bonds but at
+the cost of diversity (which was already abundant).
+
+This is the expected behavior: **bias matters when there's a problem
+to fix, and is roughly neutral when there isn't**. For production
+runs, pick `--throat_feedback` (default ON) when designing on a
+scaffold known or suspected to have constricted entrance, and
+consider `--no_throat_feedback` for scaffolds with naturally open
+pockets where extra constraint is unnecessary.
+
+A `--throat_feedback_decay` of 0.3 (vs default 0.5) would release
+cumulative pressure faster and preserve diversity better at the cost
+of weaker convergence — try if FS269-style scaffolds keep showing
+diversity loss.
