@@ -51,6 +51,14 @@ OMIT_AA="${OMIT_AA:-CX}"
 # detected per-residue omits.
 USE_SIDE_CHAIN_CONTEXT="${USE_SIDE_CHAIN_CONTEXT:-0}"
 
+# Post-translational modifications declared for catalytic residues. The
+# final --protonate_final stage records these in the output PDB's
+# REMARK 668 block so downstream consumers (docking, MD setup) know the
+# residue should carry the PTM even if the seed PDB stores it
+# unmodified. PTE_i1 has Lys 157 as the carbamate-bearing metal-bridging
+# lysine (KCX). For other scaffolds, override via env or pass empty.
+PTM="${PTM:-A:157=KCX}"
+
 # Optional pLDDT-enhanced LigandMPNN checkpoint (--enhance flag).
 # Empty string = use the standard ligand_mpnn checkpoint. Available
 # names listed in iterative_design_v2.py AVAILABLE_ENHANCE_CHECKPOINTS;
@@ -144,6 +152,7 @@ apptainer exec --nv \
         --cycles "$N_CYCLES" \
         --omit_AA "$OMIT_AA" \
         --use_side_chain_context "$USE_SIDE_CHAIN_CONTEXT" \
+        ${PTM:+--ptm "$PTM"} \
         ${ENHANCE:+--enhance "$ENHANCE"}
 
 echo "=== DONE -- $WORK_DIR ==="

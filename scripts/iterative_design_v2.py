@@ -2800,14 +2800,15 @@ def main() -> None:
                    default=Path("/net/software/containers/pyrosetta.sif"),
                    help="Path to pyrosetta.sif used by --protonate_final.")
     p.add_argument("--ptm", type=str,
-                   default="A:157=KCX",
+                   default="",
                    help="Comma-separated PTM declarations for catalytic "
                         "residues that the seed PDB doesn't express but "
-                        "downstream pipeline must know about. Default for "
-                        "PTE_i1: 'A:157=KCX' (catalytic Lys 157 is "
-                        "carbamylated). Examples: 'A:157=KCX,A:200=SEP'. "
-                        "Use '-' as code to force no-PTM annotation. "
-                        "Pass '' to disable.")
+                        "downstream pipeline must know about. Empty "
+                        "default — caller must opt in per scaffold. "
+                        "PTE_i1 typically passes 'A:157=KCX' (Lys 157 is "
+                        "carbamylated). Other examples: 'A:157=KCX,A:200=SEP'. "
+                        "Use '-' as code to force no-PTM annotation "
+                        "(overrides auto-detect from seed atoms).")
     p.add_argument("--consensus_threshold", type=float, default=0.90,
                    help="Cycle k+1 consensus reinforcement: AA frequency "
                         "across cycle-k survivors required to 'agree' "

@@ -188,19 +188,23 @@ PTMS: dict[str, dict] = {
         "atoms": frozenset({"CH3", "OH"}),
         "blurb": "N6-acetyl-L-lysine",
     },
+    # Phospho-residues: just rely on the phosphorus atom. The 2020 wwPDB
+    # remediation renamed phosphate oxygens from O1P/O2P/O3P to
+    # OP1/OP2/OP3, so depending on a specific oxygen-name set is fragile.
+    # A P atom on a Ser/Thr/Tyr side chain is itself sufficient.
     "SEP": {
         "parent": "SER",
-        "atoms": frozenset({"P", "O1P", "O2P", "O3P"}),
+        "atoms": frozenset({"P"}),
         "blurb": "phospho-L-serine",
     },
     "TPO": {
         "parent": "THR",
-        "atoms": frozenset({"P", "O1P", "O2P", "O3P"}),
+        "atoms": frozenset({"P"}),
         "blurb": "phospho-L-threonine",
     },
     "PTR": {
         "parent": "TYR",
-        "atoms": frozenset({"P", "O1P", "O2P", "O3P"}),
+        "atoms": frozenset({"P"}),
         "blurb": "phospho-L-tyrosine",
     },
     "HYP": {
@@ -1011,13 +1015,23 @@ def write_clean_final_pdb(
 
     # 2. Compute REMARK 668 ------------------------------------------------
     remark_668 = build_remark_668_block(rosetta_pdb, seed_pdb, ptm_map=ptm_map)
+    # Count data rows (skip header/footer/separator/documentation lines).
+    # Data rows start with "REMARK 668 " followed by a digit (the IDX field).
+    data_row_pattern = re.compile(r"^REMARK 668\s+\d+\s")
+    data_rows = [ln for ln in remark_668 if data_row_pattern.match(ln)]
+    # PTM field is at fixed cols 37-39 (Python slice 36:39) per the format
+    # string in format_remark_668_line. "-" means no PTM declared.
     stats["ptms_declared"] = sum(
-        1 for ln in remark_668
-        if ln.startswith("REMARK 668 ") and not ln.startswith("REMARK 668 -")
-        and "PTM" not in ln[:40]  # skip header label line
-        and " - " not in ln[31:43]  # crude PTM column check; "-" means no PTM
+        1 for ln in data_rows if ln[36:39].strip() not in ("", "-")
     )
-    stats["remark_668_lines"] = sum(1 for ln in remark_668 if not ln.lstrip("REMARK 668").strip().startswith("---") and ln.startswith("REMARK 668 "))
+    # Count any REMARK 668 line that is NOT a separator (cosmetic dashes).
+    # Note: str.lstrip(chars) takes a character SET, not a prefix — a previous
+    # version used it as a prefix-strip and worked only by accident.
+    stats["remark_668_lines"] = sum(
+        1 for ln in remark_668
+        if ln.startswith("REMARK 668 ")
+        and not ln[11:].lstrip().startswith("---")
+    )
 
     # 3. Walk rosetta_pdb and rewrite ATOM lines to standard 3-char names. -
     protein_atom_lines: list[str] = []
@@ -1174,6 +1188,7 @@ def normalize_pdb_for_pyrosetta(
 
 
 _PYROSETTA_INITED: bool = False
+_PYROSETTA_INIT_PARAMS: tuple = ()
 
 
 def _ensure_pyrosetta_inited(
@@ -1186,15 +1201,29 @@ def _ensure_pyrosetta_inited(
     options for the entire session. Subsequent calls are no-ops, so for
     a directory of PDBs sharing the same ligand params we want to init
     once with the right ``-extra_res_fa`` set rather than per PDB.
+
+    If a later caller passes a DIFFERENT ``ligand_params`` set, that
+    second-call ligand params are silently ignored by Rosetta — we log
+    a loud warning so the user can spot the misuse.
     """
-    global _PYROSETTA_INITED
+    global _PYROSETTA_INITED, _PYROSETTA_INIT_PARAMS
+    params_paths = tuple(
+        sorted(str(Path(p).resolve()) for p in (ligand_params or ()))
+    )
     if _PYROSETTA_INITED:
+        if params_paths != _PYROSETTA_INIT_PARAMS:
+            LOGGER.warning(
+                "PyRosetta is already initialized with ligand_params=%r; "
+                "the new request for %r is being IGNORED. "
+                "If you need different ligand params, run in a fresh Python "
+                "process (or restructure to init once with the union set).",
+                _PYROSETTA_INIT_PARAMS, params_paths,
+            )
         return
     import pyrosetta  # type: ignore[import-not-found]
 
     flags: list[str] = ["-mute all", "-out:level 0"]
-    if ligand_params:
-        params_paths = [str(Path(p).resolve()) for p in ligand_params]
+    if params_paths:
         flags.append("-extra_res_fa " + " ".join(params_paths))
     flags.append("-ignore_unrecognized_res")
     flags.append("-load_PDB_components false")
@@ -1202,6 +1231,7 @@ def _ensure_pyrosetta_inited(
         flags.extend(extra_init_flags)
     pyrosetta.init(" ".join(flags), silent=True)
     _PYROSETTA_INITED = True
+    _PYROSETTA_INIT_PARAMS = params_paths
 
 
 def protonate_pdb_with_pyrosetta(
