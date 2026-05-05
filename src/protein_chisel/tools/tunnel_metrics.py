@@ -732,13 +732,16 @@ def score_tunnels(
     )
 
     # ---- Verdict --------------------------------------------------------
+    # Note: the straight-line bottleneck along the best cone axis is
+    # NOT reliable for ligand-fit gating because real tunnels CURVE
+    # through proteins; a cone axis hits residues every few Å even on a
+    # patent tunnel. We therefore do NOT use it as a hard gate here.
+    # The ligand-fit gate is enforced downstream via pyKVFinder's
+    # cavity_volume / has_opening when that scorer is available.
     if (n_escape_cones == 0 and
             best_cone_mean_path < config.burial_mean_path_threshold):
         verdict = "buried"
-    elif ligand_min_radius is not None and bottleneck < ligand_min_radius:
-        verdict = "ligand_too_big"
-    elif (bb_frac > config.backbone_blocked_gate
-          or (ligand_min_radius is not None and bottleneck < ligand_min_radius)):
+    elif bb_frac > config.backbone_blocked_gate:
         verdict = "buried"  # backbone-dominated → unfixable
     else:
         # Distinguish "OK" (well above thresholds) from "fixable" (open
