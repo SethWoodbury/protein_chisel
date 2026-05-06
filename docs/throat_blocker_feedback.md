@@ -206,48 +206,65 @@ entrances, leaving `--throat_feedback` off entirely is fine.
 ## Output layout modes
 
 The `--shipping_layout` flag (default ON via the sbatch) controls
-post-run reorganization. There are two modes:
+post-run reorganization. There are two modes.
+
+> **Naming conventions (post commit `8a61d9b`)**: the shipped metrics
+> file is `chiseled_design_metrics.tsv` (was `designs.tsv` before the
+> minimal-layout work) and PDB filenames carry the `_chisel_NNN`
+> suffix (was `_lmpnn_NNN`). The `id` column inside the TSV uses the
+> same `_chisel_NNN` suffix. Both renames are applied by
+> `reorganize_for_shipping` regardless of `minimal=`. Old runs predating
+> this commit still carry the legacy names; downstream code (e.g.
+> `scripts/load_chiseled_runs.py`) globs on the new names only.
 
 ### Standard shipping layout (default)
 ```
 run_dir/
-├── designs/                       (PDBs)
-├── designs.tsv                    (50 × ~150 metric cols)
-├── designs.fasta                  (sequences)
-├── cycle_metrics.tsv              (per-cycle dynamics)
-├── cycle_metrics.json             (same, JSON)
-├── manifest.json                  (run config)
+├── designs/                          (PDBs, named <seed>_chisel_NNN.pdb)
+├── chiseled_design_metrics.tsv       (50 × ~150 metric cols)
+├── designs.fasta                     (sequences)
+├── cycle_metrics.tsv                 (per-cycle dynamics)
+├── cycle_metrics.json                (same, JSON)
+├── manifest.json                     (run config)
 ├── protonation_summary.json
-└── throat_blocker_telemetry.json  (per-cycle blocker stats)
+└── throat_blocker_telemetry.json     (per-cycle blocker stats)
 ```
 ~6 MB for 50 PDBs at L=210. **8 entries** at run_dir top level.
 
 ### Minimal layout (`MINIMAL=1` env var or `--minimal_layout`)
 ```
 run_dir/
-├── designs/      (PDBs)
-└── designs.tsv   (50 × ~150 metric cols, with RUN_META as first comment line)
+├── designs/                          (PDBs, named <seed>_chisel_NNN.pdb)
+└── chiseled_design_metrics.tsv       (50 × ~150 cols, with RUN_META as first comment line)
 ```
 ~5.9 MB for the same 50 PDBs (only ~100 KB saved on small files, but
 **2 entries** total — friendlier for /net/scratch sweeps and
 file-system inode limits).
 
-The first line of `designs.tsv` looks like:
+When the sbatch is called with **both** `MINIMAL=1` *and* an explicit
+`WORK_ROOT=...` (per-PDB sweep mode), it additionally consolidates the
+timestamped `run_dir/` one level up into `WORK_ROOT/`, leaving:
+```
+WORK_ROOT/<seed_stem>_chisel_NNN.pdb     (50 flat PDBs)
+WORK_ROOT/chiseled_design_metrics.tsv    (1 TSV with embedded RUN_META)
+```
+Override with `CONSOLIDATE_TO_WORK_ROOT=0`.
+
+The first line of `chiseled_design_metrics.tsv` looks like:
 ```
 # RUN_META: {"manifest":{...}, "cycle_metrics":[...], "throat_blocker_telemetry":{...}, "protonation_summary":{...}}
 id<TAB>sequence<TAB>...
-ZAPP_..._lmpnn_001<TAB>MLERFD...<TAB>...
+ZAPP_..._chisel_001<TAB>MLERFD...<TAB>...
 ```
 
-Read it with:
+Read it with `scripts/load_chiseled_runs.py` (recommended; handles
+multi-run concatenation and lifts manifest fields into `_meta_*`
+columns), or directly:
 ```python
 import pandas as pd, json, re
 
-# Skip the comment line for the metric DataFrame
-df = pd.read_csv("designs.tsv", sep="\t", comment="#")
-
-# Extract embedded run metadata
-with open("designs.tsv") as f:
+df = pd.read_csv("chiseled_design_metrics.tsv", sep="\t", comment="#")
+with open("chiseled_design_metrics.tsv") as f:
     m = re.match(r"^# RUN_META: (\{.*\})\s*$", f.readline())
 meta = json.loads(m.group(1))  # dict with manifest/cycle_metrics/etc keys
 ```

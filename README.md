@@ -1,77 +1,212 @@
 # protein_chisel
 
-Iterative de-novo enzyme design pipeline driven by **ESM-C + SaProt PLM logit fusion** as a per-residue bias to **LigandMPNN**, with class-balanced AA bias, cross-cycle consensus reinforcement, and **multi-objective TOPSIS** ranking over a basket of structural / sequence / pocket metrics. Tuned for the **PTE (phosphotriesterase)** scaffold but the architecture is scaffold-agnostic — swap the seed PDB, ligand params, and catalytic resnos and the pipeline runs unchanged.
+Iterative de-novo enzyme design pipeline driven by **ESM-C + SaProt PLM logit fusion** as a per-residue bias to **LigandMPNN**, with class-balanced AA bias, cross-cycle consensus reinforcement, **throat-blocker feedback**, and **multi-objective TOPSIS** ranking over a basket of structural / sequence / pocket metrics. Tuned for the **PTE (phosphotriesterase) PTE_i1** scaffold but the architecture is scaffold-agnostic — swap the seed PDB, ligand params, and (optionally) the catalytic motif spec via REMARK 666 / `--ptm` and the pipeline runs unchanged.
 
-## Quickstart
+---
+
+## Quickstart (cluster users)
 
 ```bash
-# One-liner (defaults: 3 cycles × 500/400/300 samples, target_k=50, MSG/GSA termini, pH 7.8)
-sbatch /home/woodbuse/codebase_projects/protein_chisel/scripts/run_iterative_design_v2.sbatch
+# 1. Clone into your home directory
+git clone git@github.com:SethWoodbury/protein_chisel.git ~/protein_chisel
+cd ~/protein_chisel
 
-# CPU partition (~3.6× slower than GPU but viable for high-throughput / low-priority sweeps)
-sbatch -p cpu -c 8 --mem=24G --time=04:00:00 \
-    scripts/run_iterative_design_v2.sbatch
+# 2. Confirm read access to the cluster-shared resources (all read-only,
+#    nothing here writes into anyone else's home).
+ls -lh /net/scratch/woodbuse/sif/universal_with_tunnel_tools.sif         # preferred (fast NFS)
+ls -lh /net/software/containers/users/woodbuse/universal_with_tunnel_tools.sif  # fallback
+ls -ld /net/software/lab/CAVER/caver_3.0.3                               # offline tunnel validation
+ls -ld /net/software/containers/pyrosetta.sif                            # stage 1 + stage 4
+ls -ld /net/software/containers/users/woodbuse/esmc.sif                  # stage 2
 
-# Manual invocation — production-recommended config (best from 2026-05-04 sweep)
-python scripts/iterative_design_v2.py \
-    --seed_pdb $SEED_PDB \
-    --ligand_params $LIG_PARAMS \
-    --plm_artifacts_dir $WORK/plm_artifacts \
-    --position_table $WORK/classify/positions.tsv \
-    --target_k 50 --min_hamming 3 --cycles 3 \
-    --strategy annealing \
-    --plm_strength 1.25 \
-    --consensus_threshold 0.90 --consensus_strength 1.0 --consensus_max_fraction 0.15 \
-    --n_term_pad MSG --c_term_pad GSA \
-    --design_ph 7.8
+# 3. Submit a run. SEED_PDB is REQUIRED; LIG_PARAMS defaults to PTE_i1's
+#    YYE.params but should be set for any other ligand.
+SEED_PDB=/path/to/your_seed.pdb \
+LIG_PARAMS=/path/to/your_lig.params \
+    sbatch scripts/run_iterative_design_v2.sbatch
+
+# 4. Multi-PDB sweep example: per-PDB output dir + minimal layout. Each
+#    PDB lands in its own flat folder of {chiseled_design_metrics.tsv,
+#    *_chisel_NNN.pdb}, easy to glob across.
+for pdb in inputs/*.pdb; do
+    stem=$(basename "$pdb" .pdb)
+    SEED_PDB="$pdb" \
+    LIG_PARAMS=/path/to/lig.params \
+    WORK_ROOT=/net/scratch/$USER/chisel_sweep/$stem \
+    MINIMAL=1 \
+        sbatch scripts/run_iterative_design_v2.sbatch
+done
 ```
 
-The four `--strategy / --plm_strength / --consensus_*` flags above were
-empirically tuned across 8 PTE_i1 design rounds. With this exact config,
-Sweep B gave the best diversity (global hamming 56, primary-sphere
-unique-AAs 6.2/pos), best sap_max (1.24), tied-best preorganization
-strength, while keeping fitness, charge, pI, druggability, and clash
-filter all in their target ranges.
+The sbatch auto-detects its own checkout location — clone anywhere you have write access and it will work. All paths it reads (`/net/software/...`, `/net/databases/...`) are cluster-shared read-only resources usable by any account with cluster access; both `woodbuse` and `aruder2` are validated.
 
-Outputs land in `$WORK/iterative_design_v2_PTE_i1_<ts-pid>/{classify,plm_artifacts,cycle_00,cycle_01,cycle_02,final_topk,manifest.json}`. The shipped artifact is `final_topk/topk.fasta` + `final_topk/topk_pdbs/` + `final_topk/all_survivors.tsv`.
+---
 
-## Architecture (high-level)
+## What lands on disk
+
+The driver writes a timestamped run dir under `$WORK_ROOT/iterative_design_v2_PTE_i1_<ts-pid>/`. After stage 4 (protonation + shipping reorganization) it ships in one of two layouts:
+
+### Standard shipping layout (default)
+
+```
+run_dir/
+├── designs/                       # PDBs (50, named <seed>_chisel_NNN.pdb)
+├── chiseled_design_metrics.tsv    # 50 rows × ~150 metric cols
+├── designs.fasta                  # sequences
+├── cycle_metrics.tsv              # per-cycle dynamics
+├── cycle_metrics.json             # same, JSON
+├── manifest.json                  # full run config
+├── protonation_summary.json
+└── throat_blocker_telemetry.json  # per-cycle throat-feedback stats
+```
+
+Set `SAVE_INTERMEDIATES=1` to additionally keep the per-cycle subtrees (`cycle_00/`, `cycle_01/`, ...) for diagnostics.
+
+### Minimal layout (`MINIMAL=1`)
+
+```
+run_dir/
+├── designs/                          # PDBs (or flattened to run_dir/ — see below)
+└── chiseled_design_metrics.tsv       # with first line = '# RUN_META: {...}'
+```
+
+The first line embeds the full run manifest + cycle metrics + throat telemetry as a single-line JSON comment, so a downstream notebook only needs the TSV to recover full provenance. Minimal mode saves inodes on `/net/scratch` for production sweeps.
+
+When `MINIMAL=1` **and** `WORK_ROOT` was explicitly set by the caller (per-PDB sweep mode), the sbatch additionally consolidates everything one level up into `WORK_ROOT/`, so the final tree is exactly:
+
+```
+WORK_ROOT/<seed_stem>_chisel_NNN.pdb       # 50 flat PDBs
+WORK_ROOT/chiseled_design_metrics.tsv      # 1 TSV with embedded RUN_META
+```
+
+Override the consolidation step with `CONSOLIDATE_TO_WORK_ROOT=0`.
+
+---
+
+## Reading outputs in JupyterHub
+
+`scripts/load_chiseled_runs.py` glob-loads any number of runs into a single DataFrame, lifts the embedded RUN_META JSON into `_meta_*` columns, and adds a `run_id` provenance column:
+
+```python
+from protein_chisel.tools.load_chiseled_runs import load_runs
+df = load_runs(
+    "/net/scratch/woodbuse/chisel_sweep/*/chiseled_design_metrics.tsv"
+)
+df.shape  # (n_runs * 50, ~160)  -- 145 metrics + ~15 _meta_* cols + run_id
+```
+
+Or as a CLI:
+
+```bash
+python scripts/load_chiseled_runs.py \
+    '/net/scratch/$USER/chisel_sweep/*/chiseled_design_metrics.tsv' \
+    --out /tmp/all_runs.tsv
+```
+
+---
+
+## Key environment variables / flags
+
+| env var | default | role |
+|---|---|---|
+| `SEED_PDB` | **REQUIRED** | input backbone, with REMARK 666 catalytic motif lines |
+| `LIG_PARAMS` | PTE_i1 YYE.params | Rosetta ligand params; required for non-PTE substrates |
+| `WORK_ROOT` | `/net/scratch/$USER` | top-level output dir; per-PDB sweeps should set this to a per-PDB subdir |
+| `TARGET_K` | `50` | top-K size shipped at end of run |
+| `N_CYCLES` | `3` | active-set design rounds |
+| `MIN_HAMMING` | `3` | per-class diversity floor |
+| `OMIT_AA` | `CX` | AAs MPNN never samples |
+| `PTM` | `A/LYS/3:KCX` | PTM annotations (PTE_i1 catalytic carbamylated Lys at REMARK 666 motif index 3) |
+| `ESMC_MODEL` | `esmc_600m` | ESM-C variant for stage 2 PLM logits |
+| `SAPROT_MODEL` | `saprot_1.3b` | SaProt variant for stage 2 PLM logits |
+| `ENHANCE` | `""` | optional pLDDT-enhanced LigandMPNN checkpoint (empty = stock) |
+| `MINIMAL` | unset | `1` triggers minimal shipping layout + (with explicit `WORK_ROOT`) per-PDB consolidation |
+| `SAVE_INTERMEDIATES` | unset | `1` keeps `cycle_NN/` subtrees for diagnostics |
+| `CONSOLIDATE_TO_WORK_ROOT` | `1` | flatten run_dir into WORK_ROOT when MINIMAL=1 + custom WORK_ROOT |
+| `EXTRA_DRIVER_FLAGS` | `""` | passthrough to `iterative_design_v2.py` (e.g. `"--no_throat_feedback"`) |
+
+The pipeline default `--throat_feedback ON` is set inside the driver; pass `EXTRA_DRIVER_FLAGS="--no_throat_feedback"` to disable for diagnostic runs (see "Throat-blocker feedback" below).
+
+---
+
+## Cluster resources
+
+- **Apptainer / Singularity** must be on PATH (it is on `gpu-train` and `gpu-bf`).
+- **GPU partition**: `gpu-bf` (default in the sbatch) or `gpu-train`. L40 / A100 / H100 all validated. Stage 2 (PLM) and stage 3 (driver) both use the GPU.
+- **Walltime**: ~3:40–7:00 on a representative L=202 PTE_i1 job depending on PLM combo. Pre-throat-feedback rounds were ~6–8 min on gpu-train L40 and ~16–19 min in earlier sweeps.
+- **Memory**: `--mem=20G` (whole-job; not per-cpu). Empirical peak 14.3 GB at L=210 with ESM-C 600m + SaProt 1.3b; bump to 24G for L>300. See [`docs/sweep_parameters.md`](docs/sweep_parameters.md) for the full memory model.
+- **Scratch**: write access to `/net/scratch/$USER` for run output.
+- **CPU partition**: viable but ~3.6× slower wall (~30 min for full 3-cycle); set `cpus=4` (the super-linear sweet spot) and drop `--nv`.
+
+---
+
+## Pipeline stages
 
 ```mermaid
 flowchart LR
-    seed[(seed PDB<br/>+ REMARK 666<br/>+ ligand params)]
+    seed[(seed PDB<br/>REMARK 666<br/>+ ligand params)]
     seed --> S1[Stage 1: classify_positions<br/>pyrosetta.sif<br/>directional 6-class taxonomy]
     seed --> S2[Stage 2: precompute_plm_artifacts<br/>esmc.sif - GPU<br/>ESM-C + SaProt logits + fusion]
     S1 --> S3
-    S2 --> S3[Stage 3: iterative_design_v2<br/>universal.sif - GPU or CPU<br/>sample / filter / score / rank<br/>3 cycles + final top-K]
-    S3 --> out[(final_topk/<br/>topk.fasta + PDBs<br/>all_survivors.tsv<br/>manifest.json)]
+    S2 --> S3[Stage 3: iterative_design_v2<br/>universal_with_tunnel_tools.sif - GPU/CPU<br/>sample / filter / score / rank<br/>3 cycles + final top-K]
+    S3 --> S4[Stage 4: protonate_final_topk<br/>pyrosetta.sif<br/>protonate + reorganize_for_shipping]
+    S4 --> out[(run_dir/<br/>designs/ + chiseled_design_metrics.tsv<br/>+ manifest + telemetry)]
 ```
 
-See [`docs/architecture.md`](docs/architecture.md) for the full per-cycle data flow, consensus reinforcement, and TOPSIS internals.
+1. **classify_positions** (`pyrosetta.sif`) — directional 6-class taxonomy: `primary_sphere / secondary_sphere / nearby_surface / distal_buried / distal_surface / ligand`, with sidechain-orientation gates (Tawfik / Markin preorganization framing).
+2. **precompute_plm_artifacts** (`esmc.sif`, GPU) — runs ESM-C (default 600m) + SaProt (default 1.3b) on the seed sequence; computes log-odds, entropy-match, and the fused per-position bias matrix used by stage 3.
+3. **iterative_design_v2** (`universal_with_tunnel_tools.sif`, GPU or CPU) — the main driver. Per cycle: sample LigandMPNN with the running bias, filter (charge/pI/clash/length), score (~145 metrics), rank by multi-objective TOPSIS, accumulate consensus + throat-blocker bias for the next cycle. After N_CYCLES, picks top-K with Hamming-diversity constraint.
+4. **protonate_final_topk** (`pyrosetta.sif`) — protonates the top-K (PROPKA + PyRosetta, with PTM annotations preserved in REMARK 668), then `reorganize_for_shipping(minimal=...)` produces the standard or minimal output layout.
 
-## What's in the box
+See [`docs/architecture.md`](docs/architecture.md) for the full per-cycle data flow, PLM fusion math, consensus + class-balance, TOPSIS internals, and the container split.
+
+---
+
+## Throat-blocker feedback (default ON)
+
+After each cycle, top survivors are scored for pocket-entrance accessibility (homegrown ray-cast + pyKVFinder cavity detection). For each design the score includes a **breakdown** of `(resno, resname, mass_weight)` for designable bulky side chains in the throat band that block the best escape cone. These observations are aggregated, turned into a `(L, 20)` per-(position, AA) bias delta with exponential decay (default 0.5/cycle), and added to the LigandMPNN bias for cycle k+1 — actively pressuring MPNN to swap bulky residues at recurring throat positions.
+
+**Cross-scaffold caveat**: throat feedback gives substantial gains on constricted scaffolds (validated on FS148 — pocket volume +17%, mean tunnel path +6%, sidechain-blocked −9%, with diversity actually *growing*) but is roughly neutral or slightly costly on scaffolds with already-open entrances (FS269, where there's no recurring blockage problem to fix). The "bias matters when there's a problem to fix, neutral when there isn't" intuition holds. Disable with `EXTRA_DRIVER_FLAGS="--no_throat_feedback"` for already-open scaffolds or when catalytic h-bond geometry is the primary objective.
+
+Full mechanism, A/B sweep results, decay sensitivity, and cross-scaffold validation: [`docs/throat_blocker_feedback.md`](docs/throat_blocker_feedback.md).
+
+---
+
+## Stage-3 sif build
+
+The stage-3 sif (`universal_with_tunnel_tools.sif`) is just the lab `universal.sif` with `pyKVFinder` and `rdkit` pip-installed on top — a ~5-minute apptainer build (commit `9196bc2` and predecessors). The fast `/net/scratch` copy is preferred over the canonical `/net/software/containers/users/woodbuse/` location because newly built sifs can take >1 hr to propagate over NFS to gpu-train compute nodes; the sbatch tries scratch first, then canonical, then falls back to the system `universal.sif` (which loses pyKVFinder; the homegrown ray-cast still runs).
+
+---
+
+## Repo layout
 
 ```
 protein_chisel/
 ├── scripts/
-│   ├── iterative_design_v2.py            # main driver (~3200 lines)
-│   ├── run_iterative_design_v2.sbatch    # 3-stage / 3-sif slurm wrapper
-│   ├── classify_positions_pte_i1.py      # Stage 1 entrypoint
-│   ├── precompute_plm_artifacts.py       # Stage 2 entrypoint
-│   └── audit_*, *_ablation.py, ...       # diagnostic / one-off tools
+│   ├── iterative_design_v2.py          # main driver
+│   ├── run_iterative_design_v2.sbatch  # 4-stage / 3-sif slurm wrapper (PRODUCTION ENTRY)
+│   ├── classify_positions_pte_i1.py    # stage 1 entrypoint
+│   ├── precompute_plm_artifacts.py     # stage 2 entrypoint
+│   ├── protonate_final_topk.py         # stage 4 entrypoint
+│   ├── load_chiseled_runs.py           # JupyterHub loader for output TSVs
+│   ├── run_caver.sh                    # offline CAVER tunnel validation
+│   └── audit_*, *_ablation.py, ...     # diagnostic / one-off tools
 ├── src/protein_chisel/
 │   ├── sampling/{plm_fusion, iterative_fusion, biased_mpnn, fitness_score}.py
 │   ├── scoring/{multi_objective, dfi, preorganization, diversity, pareto}.py
 │   ├── expression/{aa_class_balance, aa_composition, builtin_rules, engine, profiles}.py
-│   ├── tools/{classify_positions, ligand_mpnn, geometric_interactions, ...}.py
+│   ├── tools/{classify_positions, ligand_mpnn, tunnel_metrics, protonate_final,
+│   │          ligand_geometry, fpocket_run, prolif_fingerprint, ...}.py
 │   ├── filters/{protparam, protease_sites, length}.py
 │   ├── structure/{clash_check, ss_provider, ...}.py
 │   ├── io/{schemas, pdb, fasta}.py
 │   └── utils/{apptainer, slurm, pose, geometry}.py
-├── docs/                                  # see table below
+├── docs/                                # see table below
 ├── configs/, examples/, tests/
 └── pyproject.toml
 ```
+
+---
 
 ## Documentation
 
@@ -80,37 +215,41 @@ protein_chisel/
 | [`docs/architecture.md`](docs/architecture.md) | Pipeline diagram, per-cycle data flow, PLM fusion math, consensus + class-balance, TOPSIS, container split |
 | [`docs/usage.md`](docs/usage.md) | sbatch + manual invocation, env knobs, common run patterns |
 | [`docs/cli_reference.md`](docs/cli_reference.md) | All `iterative_design_v2.py` flags grouped by topic |
-| [`docs/metrics_reference.md`](docs/metrics_reference.md) | Every column in `all_survivors.tsv` with formula / units / range |
+| [`docs/metrics_reference.md`](docs/metrics_reference.md) | Every column in `chiseled_design_metrics.tsv` with formula / units / range |
 | [`docs/dependencies.md`](docs/dependencies.md) | SIFs, binaries, model checkpoints, HF caches, cluster paths |
 | [`docs/troubleshooting.md`](docs/troubleshooting.md) | Known gotchas (libgfortran, freesasa fallback, AA-skew, position-1 M, consensus diversity) |
-| [`docs/plans/`](docs/plans/) | Active design notes (directional taxonomy, efficiency, doc deployment) |
+| [`docs/sweep_parameters.md`](docs/sweep_parameters.md) | 8 PTE_i1 design rounds + 6-way PLM-combo matrix + CPU scaling + memory model |
+| [`docs/throat_blocker_feedback.md`](docs/throat_blocker_feedback.md) | Throat-blocker mechanism, A/B sweep, decay sensitivity, cross-scaffold validation |
+| [`docs/tunnel_analysis.md`](docs/tunnel_analysis.md) | CAVER 3.0.3 offline validation wrapper + comparison to inline `tunnel_metrics` |
+| [`docs/plans/`](docs/plans/) | Active design notes |
 
-Legacy / overlapping references kept for now: [`docs/sampling.md`](docs/sampling.md), [`docs/scoring.md`](docs/scoring.md), [`docs/filters.md`](docs/filters.md), [`docs/tools.md`](docs/tools.md), [`docs/pipelines.md`](docs/pipelines.md), [`docs/io_and_schemas.md`](docs/io_and_schemas.md), [`docs/setup.md`](docs/setup.md), [`docs/testing.md`](docs/testing.md).
+Legacy / overlapping references: [`docs/sampling.md`](docs/sampling.md), [`docs/scoring.md`](docs/scoring.md), [`docs/filters.md`](docs/filters.md), [`docs/tools.md`](docs/tools.md), [`docs/pipelines.md`](docs/pipelines.md), [`docs/io_and_schemas.md`](docs/io_and_schemas.md), [`docs/setup.md`](docs/setup.md), [`docs/testing.md`](docs/testing.md), [`docs/capabilities.md`](docs/capabilities.md), [`docs/future_plans.md`](docs/future_plans.md).
+
+---
 
 ## Strengths
 
-- **Avoids AF2/AF3/Boltz in the inner loop.** Fixed-backbone PyRosetta + cheap structural metrics + PLM marginals — AF3 only as a final external filter on the top-K.
-- **Calibrated PLM fusion.** Log-odds + entropy-match + position-class weights + cosine-disagreement shrinkage. Per-class strength tunable via single `--plm_strength` knob.
-- **Directional 6-class taxonomy.** `primary_sphere / secondary_sphere / nearby_surface / distal_buried / distal_surface / ligand` with sidechain-orientation gates (Tawfik / Markin preorganization framing). Replaces flat SASA + distance bins.
-- **Class-balanced AA bias** with extreme-over fallback. SWAPS within an over/under-rep class (e.g. `E z=+5` paired with `D z=−2` → push E down + pull D up) instead of just suppressing the over-rep AA.
-- **Consensus reinforcement** that's actually working. Cycle k+1 bias = base + `+strength` nats at agreed AAs in cycle-k survivors, capped at 30 % of L. Tunable via `--consensus_threshold/--consensus_strength/--consensus_max_fraction`.
-- **Multi-objective TOPSIS** over 14 default metrics (fitness, druggability, lig-interaction strength, preorg strength, hbonds-to-cat, instability, sap_max, boman, aliphatic, gravy, charge, pi, bottleneck, pocket-hydrophobicity), every weight + target overridable via `--rank_weights / --rank_targets`.
-- **Annealing strategy** (`--strategy annealing`): light-filter relaxation in cycle 0, defaults by cycle 2; cycles 1+ use TOPSIS for survivor selection. Hard filters (charge / pI / severe clash) stay constant across both strategies.
-- **N/C-term padding** (`MSG`/`GSA` defaults). Sequence-only metrics (charge, pI, GRAVY, instability, aliphatic, boman) reflect the full expressed protein. Position-1 M is hard-omitted (start codon is in the vector tag).
-- **Five charge variants @ pH 7.8.** `full_HH` is the filter; the others (`no_HIS`, `HIS_half`, `DE_KR_only`, Biopython) are diagnostic for sensitivity analysis.
-- **DFI (GNM-based dynamic flexibility), aliphatic_index, boman_index** as cheap diagnostics on every survivor.
-- **CPU pipeline validated end-to-end** at ~3.6× the GPU wall (8.2 min GPU → 9.8 min CPU per cycle on a representative PTE_i1 run). Viable for high-throughput / low-priority sweeps.
-- **Full provenance.** Every run writes a `manifest.json` + per-cycle bias / telemetry / class-balance JSONs + survivor TSVs at every stage; restartable.
+- **Avoids AF2/AF3/Boltz in the inner loop.** Fixed-backbone PyRosetta + cheap structural metrics + PLM marginals — AF3 only as an external filter on the top-K.
+- **Calibrated PLM fusion.** Log-odds + entropy-match + position-class weights + cosine-disagreement shrinkage. Per-class strength tunable via `--plm_strength`.
+- **Directional 6-class taxonomy.** Replaces flat SASA + distance bins.
+- **Class-balanced AA bias** with extreme-over fallback (SWAPS over/under-rep AAs within a class instead of just suppressing the over-rep AA).
+- **Consensus reinforcement** that's actually working. Cycle k+1 bias = base + `+strength` nats at agreed AAs in cycle-k survivors, capped at 30 % of L.
+- **Throat-blocker feedback** (default ON) that targets recurring bulky pocket-entrance blockers.
+- **Multi-objective TOPSIS** over ~14 default metrics; every weight + target overridable via `--rank_weights / --rank_targets`.
+- **Annealing strategy** (`--strategy annealing`): light-filter relaxation in cycle 0, defaults by cycle 2; cycles 1+ use TOPSIS for survivor selection.
+- **N/C-term padding** (`MSG`/`GSA`) so sequence-only metrics reflect the full expressed protein.
+- **CPU pipeline validated end-to-end** at ~3.6× the GPU wall.
+- **Full provenance.** Manifest + per-cycle bias / telemetry / class-balance JSONs + survivor TSVs at every stage; restartable.
 
 ## Weaknesses / scaffold-specific tuning notes
 
-- **PTE_i1-tuned defaults baked in.** `DEFAULT_CATRES = (60, 64, 128, 131, 132, 157)`, `CATALYTIC_HIS_RESNOS = (60, 64, 128, 132)`, `CHAIN = "A"` are hard-coded in `scripts/iterative_design_v2.py`. Adapting to a new scaffold currently requires editing those constants (or running through `classify_positions` + a fork of the driver). A scaffold-agnostic CLI for these is planned but not done.
-- **Charge band `[-18, -4]` and pI band `[5.0, 7.5]` are PTE-specific.** WT PTE_i1 sits at net charge ≈ −12 / pI ≈ 4.6; bands picked to drift designs toward the pH 8 assay buffer without losing structural integrity. Override per scaffold via `--net_charge_max/--pi_min/--pi_max` when adapting.
-- **Static PLM bias drift.** PLM marginals are computed once on the seed sequence; consensus reinforcement partly compensates but doesn't refresh the underlying PLM context. Refresh-on-survivors is a future improvement.
-- **Fixed backbone, no AF2/AF3 in the loop.** Foldability, induced fit, water-mediated networks, alternate ligand poses — none of those are scored. The cheap filters are a **veto**, not a ranker; near-tied survivors should be treated as equivalent and triaged downstream by AF3.
-- **fpocket dominates GPU runtime** (~37 % of cycle wall). Parallelization is on the efficiency plan but not implemented.
-- **Position-table schema migration** is one-shot per run when the input is the legacy 5-class parquet. ~50 ms; benign but logged as a warning.
-- **Catalytic K157 → forced KK dibasic at 157-158.** Pre-empted at sample time by `compute_catalytic_neighbor_omit_dict` (forbids K/R at 156/158); the WT itself trips the OmpT regex so we threshold at WT-count.
+- **PTE_i1-tuned defaults baked in.** `DEFAULT_CATRES`, `CATALYTIC_HIS_RESNOS`, `CHAIN = "A"` are hard-coded in `scripts/iterative_design_v2.py`. Adapting to a new scaffold currently requires editing those constants (or running through `classify_positions` + a fork of the driver). A scaffold-agnostic CLI for these is planned but not done.
+- **Charge band `[-18, -4]` and pI band `[5.0, 7.5]` are PTE-specific.** Override per scaffold via `--net_charge_max/--pi_min/--pi_max` when adapting.
+- **Static PLM bias drift.** PLM marginals are computed once on the seed sequence; consensus + throat-feedback partly compensate but don't refresh the underlying PLM context.
+- **Fixed backbone, no AF2/AF3 in the loop.** Foldability, induced fit, water networks, alternate ligand poses — not scored. Cheap filters are a *veto*, not a ranker.
+- **fpocket dominates GPU runtime** (~37 % of cycle wall). Parallelization on the efficiency plan but not implemented.
+
+---
 
 ## Citation / license
 
@@ -119,8 +258,9 @@ TBD — internal Baker Lab tool, license placeholder.
 
 Citation:
     Woodbury et al., protein_chisel: PLM-fusion-driven iterative
-    enzyme design with class-balanced AA bias and multi-objective
-    TOPSIS ranking. (Manuscript in preparation, 2026.)
+    enzyme design with class-balanced AA bias, throat-blocker
+    feedback, and multi-objective TOPSIS ranking. (Manuscript in
+    preparation, 2026.)
 ```
 
 Repository: `git@github.com:SethWoodbury/protein_chisel.git`
