@@ -201,3 +201,57 @@ diversity is no better than baseline. **Decay=0.5 is the right balance.**
 For scaffolds where you need MORE pressure (e.g. badly constricted
 seeds), bumping to 0.7 might help; for scaffolds with naturally open
 entrances, leaving `--throat_feedback` off entirely is fine.
+
+
+## Output layout modes
+
+The `--shipping_layout` flag (default ON via the sbatch) controls
+post-run reorganization. There are two modes:
+
+### Standard shipping layout (default)
+```
+run_dir/
+├── designs/                       (PDBs)
+├── designs.tsv                    (50 × ~150 metric cols)
+├── designs.fasta                  (sequences)
+├── cycle_metrics.tsv              (per-cycle dynamics)
+├── cycle_metrics.json             (same, JSON)
+├── manifest.json                  (run config)
+├── protonation_summary.json
+└── throat_blocker_telemetry.json  (per-cycle blocker stats)
+```
+~6 MB for 50 PDBs at L=210. **8 entries** at run_dir top level.
+
+### Minimal layout (`MINIMAL=1` env var or `--minimal_layout`)
+```
+run_dir/
+├── designs/      (PDBs)
+└── designs.tsv   (50 × ~150 metric cols, with RUN_META as first comment line)
+```
+~5.9 MB for the same 50 PDBs (only ~100 KB saved on small files, but
+**2 entries** total — friendlier for /net/scratch sweeps and
+file-system inode limits).
+
+The first line of `designs.tsv` looks like:
+```
+# RUN_META: {"manifest":{...}, "cycle_metrics":[...], "throat_blocker_telemetry":{...}, "protonation_summary":{...}}
+id<TAB>sequence<TAB>...
+ZAPP_..._lmpnn_001<TAB>MLERFD...<TAB>...
+```
+
+Read it with:
+```python
+import pandas as pd, json, re
+
+# Skip the comment line for the metric DataFrame
+df = pd.read_csv("designs.tsv", sep="\t", comment="#")
+
+# Extract embedded run metadata
+with open("designs.tsv") as f:
+    m = re.match(r"^# RUN_META: (\{.*\})\s*$", f.readline())
+meta = json.loads(m.group(1))  # dict with manifest/cycle_metrics/etc keys
+```
+
+Use minimal mode for production sweeps where you'll process hundreds
+of seeds and want to keep the file count manageable. Use standard
+shipping layout when you're inspecting individual runs by hand.

@@ -1667,6 +1667,7 @@ def reorganize_for_shipping(
     *,
     strip_intermediates: bool = True,
     pdb_subdir_name: str = "designs",
+    minimal: bool = False,
 ) -> dict:
     """Build a tidy "ready-to-ship" layout in ``run_dir``.
 
@@ -1812,11 +1813,70 @@ def reorganize_for_shipping(
             LOGGER.warning("reorganize_for_shipping: manifest update failed: %s",
                             exc)
 
+    # 6. Minimal layout: collapse to JUST {designs/, designs.tsv}.
+    # Embed manifest + cycle_metrics + throat telemetry as a commented
+    # JSON header at the top of designs.tsv (lines starting with "#" are
+    # standard pandas read_csv comment syntax — pass `comment="#"` to
+    # pd.read_csv to skip them transparently). Drops the auxiliary files.
+    if minimal:
+        # Collect all meta JSON contents into a single dict
+        meta_payload: dict = {}
+        for fname in (
+            "manifest.json", "cycle_metrics.json",
+            "throat_blocker_telemetry.json", "protonation_summary.json",
+        ):
+            p = run_dir / fname
+            if p.is_file():
+                try:
+                    meta_payload[p.stem] = _json.loads(p.read_text())
+                except Exception as exc:
+                    LOGGER.warning("minimal_layout: could not read %s: %s",
+                                    p.name, exc)
+
+        # Prepend meta as a `# RUN_META: <single-line-json>` comment at
+        # top of designs.tsv. One line keeps it pandas-friendly.
+        designs_tsv = run_dir / "designs.tsv"
+        if designs_tsv.is_file() and meta_payload:
+            try:
+                meta_blob = _json.dumps(meta_payload, default=str,
+                                         separators=(",", ":"))
+                body = designs_tsv.read_text()
+                with open(designs_tsv, "w") as f:
+                    f.write(f"# RUN_META: {meta_blob}\n")
+                    f.write(body)
+                LOGGER.info(
+                    "minimal_layout: prepended %d-byte RUN_META JSON "
+                    "header to designs.tsv (read with "
+                    "pd.read_csv(path, sep='\\t', comment='#'))",
+                    len(meta_blob),
+                )
+            except Exception as exc:
+                LOGGER.warning("minimal_layout: could not write meta header: %s",
+                                exc)
+
+        # Strip every aux file — designs/ + designs.tsv is the ONLY
+        # output. Reproducibility is preserved via the embedded RUN_META.
+        for fname in (
+            "manifest.json", "cycle_metrics.tsv", "cycle_metrics.json",
+            "throat_blocker_telemetry.json", "protonation_summary.json",
+            "designs.fasta",
+        ):
+            p = run_dir / fname
+            if p.is_file():
+                try:
+                    p.unlink()
+                    stats["files_removed"].append(fname)
+                except Exception:
+                    pass
+        LOGGER.info(
+            "minimal_layout: final tree = run_dir/{designs/, designs.tsv} only"
+        )
+
     LOGGER.info(
         "reorganize_for_shipping: %d designs -> %s; designs.tsv rows=%d; "
-        "stripped %d subdirs (%s) %d files",
+        "stripped %d subdirs (%s) %d files; minimal=%s",
         stats["designs_moved"], designs_dir, stats["designs_tsv_rows"],
         len(stats["subdirs_removed"]), ",".join(stats["subdirs_removed"]),
-        len(stats["files_removed"]),
+        len(stats["files_removed"]), minimal,
     )
     return stats

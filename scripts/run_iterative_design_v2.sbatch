@@ -207,6 +207,12 @@ else
     if [[ "${SAVE_INTERMEDIATES:-}" == "1" ]]; then
         SHIPPING_FLAGS="--shipping_layout --no_strip_intermediates"
     fi
+    if [[ "${MINIMAL:-}" == "1" ]]; then
+        # Minimal mode: just designs/ + designs.tsv (with embedded
+        # RUN_META JSON header). Drops manifest.json and all aux files.
+        # /net/scratch space-saver for production sweeps.
+        SHIPPING_FLAGS="$SHIPPING_FLAGS --minimal_layout"
+    fi
     apptainer exec \
         --bind "$REPO:/code" \
         --bind /net/software \

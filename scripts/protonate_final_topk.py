@@ -55,6 +55,17 @@ def main() -> int:
                    help="With --shipping_layout, also keep cycle_NN/ etc. "
                         "Useful for diagnostics. Default behavior with "
                         "--shipping_layout strips them.")
+    p.add_argument("--minimal_layout", action="store_true",
+                   help="With --shipping_layout, collapse the run_dir to "
+                        "ONLY {designs/, designs.tsv}. Embeds manifest + "
+                        "cycle_metrics + throat_blocker_telemetry + "
+                        "protonation_summary as a single-line "
+                        "'# RUN_META: <json>' comment at the top of "
+                        "designs.tsv (load with "
+                        "pd.read_csv(path, sep='\\t', comment='#')). "
+                        "Drops designs.fasta (sequence column is in the "
+                        "TSV) and all aux JSON files. Use for /net/scratch "
+                        "space efficiency on production sweeps.")
     p.add_argument("--ptm", type=str, default=None,
                    help="Comma-separated PTM declarations recorded in the "
                         "output PDB's REMARK 668 block. ANNOTATION ONLY: "
@@ -102,6 +113,7 @@ def main() -> int:
         reorg_stats = reorganize_for_shipping(
             run_dir=run_dir,
             strip_intermediates=not args.no_strip_intermediates,
+            minimal=args.minimal_layout,
         )
         summary["shipping_layout"] = reorg_stats
 
