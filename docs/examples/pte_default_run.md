@@ -8,7 +8,7 @@ and active-site diversity in the empirical sweep.
 ## Command
 
 Submit the reference sbatch and override only what differs from the
-defaults baked into `run_iterative_design_v2.sbatch`:
+defaults baked into `run_chisel_design.sh`:
 
 ```bash
 SEED_PDB=/net/scratch/aruder2/projects/PTE_i1/af3_out/filtered_i1/ref_pdbs/ZAPP_p1D1_rotP_1_ORI_11_C7_i_20_model_1__eV2_T0_20__8_1_FS269.pdb
@@ -16,7 +16,7 @@ LIG_PARAMS=/home/woodbuse/testing_space/scaffold_optimization/ZZZ_MERGED_PRELIM_
 
 sbatch \
     --export=ALL,SEED_PDB=$SEED_PDB,LIG_PARAMS=$LIG_PARAMS,OMIT_AA=CX,N_CYCLES=3 \
-    /home/woodbuse/codebase_projects/protein_chisel/scripts/run_iterative_design_v2.sbatch
+    /home/woodbuse/codebase_projects/protein_chisel/scripts/run_chisel_design.sh
 ```
 
 If you need to pass non-default `iterative_design_v2.py` flags (the

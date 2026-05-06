@@ -125,7 +125,7 @@ filter for other criteria.**
 
 Same as A above, just submit to the cpu partition without `--nv`:
 ```
-sbatch -p cpu -c 8 --mem=12G --time=01:30:00 scripts/run_iterative_design_v2.sbatch
+sbatch -p cpu -c 8 --mem=12G --time=01:30:00 scripts/run_chisel_design.sh
 ```
 
 ~3.6× slower wall time but zero GPU priority cost.
@@ -407,7 +407,7 @@ Empirical limits at cpus=4:
 | 280–350 | 24G | 1.20× over predicted ~20 GB |
 
 The production default `--mem=20G` (set in
-`scripts/run_iterative_design_v2.sbatch`) covers everything measured
+`scripts/run_chisel_design.sh`) covers everything measured
 and most expected scaffold sizes with comfortable headroom. Slurm
 `--mem` is total-job (not per-cpu); see "Memory: per-job vs per-cpu"
 section above. ESM-C and SaProt model weights are L-invariant

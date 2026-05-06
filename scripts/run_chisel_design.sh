@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=PTE_i1_iter_v2
+#SBATCH --job-name=chisel_design
 #SBATCH --partition=gpu-bf
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
@@ -18,20 +18,30 @@
 #   --mem=20G is whole-job total (NOT per-cpu); ~1.2-1.4x headroom
 #   for typical L=200-280 scaffolds. Bump to 24G for L>300.
 #   See docs/sweep_parameters.md for the full memory model.
-#SBATCH --output=/net/scratch/%u/slurm-iter-v2-%j.out
-#SBATCH --error=/net/scratch/%u/slurm-iter-v2-%j.err
+#SBATCH --output=/net/scratch/%u/slurm-chisel-%j.out
+#SBATCH --error=/net/scratch/%u/slurm-chisel-%j.err
 
-# PLM-fusion-driven iterative design for the PTE_i1 scaffold.
+# protein_chisel — PLM-fusion-driven iterative design pipeline.
 #
-# Three stages, three sifs:
-#   1. classify_positions   -> pyrosetta.sif (CPU only, but already on a GPU
-#                              node so we just use what we have)
-#   2. precompute PLM logits + fusion  -> esmc.sif (GPU)
-#   3. iterative driver (sample/filter/score/dedup/diverse)  -> universal.sif
+# Four stages, three sifs (composed via shared filesystem; apptainer
+# can only exec one image at a time, so each stage runs in its image):
+#   1. classify_positions    -> pyrosetta.sif                 (CPU)
+#   2. precompute PLM logits -> protein_chisel_plm.sif        (GPU recommended)
+#   3. iterative driver      -> protein_chisel_design.sif     (GPU or CPU)
+#   4. protonate top-K       -> pyrosetta.sif                 (CPU)
 #
-# Outputs go under /net/scratch/woodbuse/iterative_design_v2_PTE_i1_<ts>/.
-# Within each run: classify/, plm_artifacts/, cycle_00/, cycle_01/,
-#   cycle_02/, final_topk/, manifest.json.
+# Outputs go under $OUTPUT_DIR (alias WORK_ROOT). Default
+# /net/scratch/$USER/. Each run creates a timestamped subdir
+# unless MINIMAL=1 + a non-default OUTPUT_DIR triggers consolidation
+# to a flat layout (PDBs + chiseled_design_metrics.tsv only).
+#
+# Two callable patterns:
+#   (a) sbatch run_chisel_design.sh   — honors the #SBATCH directives above.
+#   (b) bash run_chisel_design.sh     — useful inside an outer slurm
+#                                       array job (the #SBATCH lines
+#                                       become inert comments in this
+#                                       mode; outer array's resources win).
+# Both are first-class supported.
 
 set -euo pipefail
 
@@ -47,13 +57,21 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO="${REPO:-$(dirname "$SCRIPT_DIR")}"
 
 # === Required inputs (per-design caller MUST set these) ============
-# SEED_PDB: starting backbone (with the desired catalytic motif and
-#   ligand placement; REMARK 666 lines drive auto-derivation of the
-#   catalytic residues so you don't hardcode resnos here)
-# LIG_PARAMS: Rosetta params for the ligand. We auto-detect a sensible
-#   default for the PTE_i1 substrate (YYE), but for any other ligand
-#   the caller MUST set LIG_PARAMS=...
-SEED_PDB="${SEED_PDB:?Set SEED_PDB to your input PDB (with REMARK 666)}"
+# Both names accepted at the sbatch surface (caller picks what reads
+# best). Internally the script + python driver use the SEED_*/WORK_*
+# names because that's their semantic role (the seed for a design
+# campaign + the working-dir root). The INPUT_PDB / OUTPUT_DIR aliases
+# are caller ergonomics only.
+#
+# SEED_PDB | INPUT_PDB: starting backbone with REMARK 666 catalytic
+#   motif + ligand placement. REMARK 666 drives auto-derivation of
+#   catalytic residues so you don't hardcode resnos here. REQUIRED.
+# LIG_PARAMS: Rosetta .params file for the ligand. REQUIRED.
+SEED_PDB="${SEED_PDB:-${INPUT_PDB:-}}"
+if [[ -z "$SEED_PDB" ]]; then
+    echo "ERROR: set SEED_PDB or INPUT_PDB to your input PDB (with REMARK 666)" >&2
+    exit 1
+fi
 LIG_PARAMS="${LIG_PARAMS:?Set LIG_PARAMS to your ligand .params file}"
 TARGET_K="${TARGET_K:-50}"
 MIN_HAMMING="${MIN_HAMMING:-3}"
@@ -108,18 +126,19 @@ ESMC_MODEL="${ESMC_MODEL:-esmc_600m}"
 SAPROT_MODEL="${SAPROT_MODEL:-saprot_1.3b}"
 
 # === Output base ====================================================
-# WORK_ROOT is the top-level directory under which work_dir/ and run_dir/
-# get created. Defaults to /net/scratch/$USER. Override per-call (e.g.
-# from a sweep notebook) to put each input PDB's outputs in its own
-# isolated subdirectory:
-#   WORK_ROOT=/net/scratch/aruder2/.../chisel_out/i1__ref_pdbs/<pdb_stem>
-#   bash run_iterative_design_v2.sbatch
-WORK_ROOT="${WORK_ROOT:-/net/scratch/$USER}"
+# OUTPUT_DIR | WORK_ROOT (caller picks; WORK_ROOT remains the internal
+# variable). Top-level directory under which work_dir/ and run_dir/ get
+# created. Defaults to /net/scratch/$USER. Override per-call (e.g. from
+# a sweep notebook) to put each input PDB's outputs in its own isolated
+# subdirectory:
+#   OUTPUT_DIR=/net/scratch/aruder2/.../chisel_out/<pdb_stem> \
+#       bash scripts/run_chisel_design.sh
+WORK_ROOT="${WORK_ROOT:-${OUTPUT_DIR:-/net/scratch/$USER}}"
 mkdir -p "$WORK_ROOT"
 
 # Working dir for this job (ms + PID for collision safety with concurrent jobs)
 TS=$(python3 -c 'import datetime,os; t=datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]; print(f"{t}-pid{os.getpid()}")' 2>/dev/null || date +%Y%m%d-%H%M%S)
-WORK_DIR="$WORK_ROOT/iterative_design_v2_PTE_i1_${TS}"
+WORK_DIR="$WORK_ROOT/chisel_design_${TS}"
 mkdir -p "$WORK_DIR"
 echo "=== work dir: $WORK_DIR ==="
 

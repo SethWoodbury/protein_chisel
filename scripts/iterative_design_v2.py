@@ -66,7 +66,7 @@ LOGGER = logging.getLogger("iterative_design_v2")
 # --ligand_params explicitly (or set them via env vars in the sbatch
 # wrapper). The previous values pointed at woodbuse-private paths and
 # weren't portable. The sbatch wrapper enforces these as REQUIRED env
-# vars, so anyone using run_iterative_design_v2.sbatch already provides
+# vars, so anyone using run_chisel_design.sh already provides
 # them; this just removes the silent footgun for direct CLI users.
 DEFAULT_INPUT_PDB: Optional[Path] = None
 DEFAULT_LIG_PARAMS: Optional[Path] = None
@@ -2581,7 +2581,7 @@ def stage_protonate_final_topk(
     # Nested-apptainer doesn't work on this cluster: when stage 3 runs
     # inside universal.sif, the apptainer binary isn't on PATH inside
     # the container so spawning pyrosetta.sif from here fails. The
-    # production sbatch (run_iterative_design_v2.sbatch) handles this
+    # production sbatch (run_chisel_design.sh) handles this
     # by running protonate_final as a separate post-stage outside any
     # container. Detect the in-container case and skip with a clear
     # log line so the user knows where the missing protonation is.
@@ -2589,7 +2589,7 @@ def stage_protonate_final_topk(
         LOGGER.info(
             "stage_protonate_final_topk: detected we are running INSIDE "
             "a container; skipping in-driver invocation. "
-            "run_iterative_design_v2.sbatch invokes the protonation as "
+            "run_chisel_design.sh invokes the protonation as "
             "a separate stage 4 after this driver returns. "
             "Look for *.protonated.pdb in %s after the sbatch finishes.",
             out_dir,

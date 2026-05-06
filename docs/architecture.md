@@ -1,6 +1,6 @@
 # Architecture
 
-`protein_chisel`'s production pipeline is `scripts/iterative_design_v2.py` (the "v2 driver"), wrapped by `scripts/run_iterative_design_v2.sbatch`. It runs in three stages across three apptainer images, with file-based handoffs so each stage is independently restartable.
+`protein_chisel`'s production pipeline is `scripts/iterative_design_v2.py` (the "v2 driver"), wrapped by `scripts/run_chisel_design.sh`. It runs in three stages across three apptainer images, with file-based handoffs so each stage is independently restartable.
 
 ## Pipeline
 
@@ -60,7 +60,7 @@ flowchart LR
 | `protein_chisel_plm.sif` (→ `esmc.sif`) | ESM-C 600M + SaProt 650M masked-LM marginals, py_contact_ms (CMS), PROPKA | Stage 2; optional `--cms_final` enrichment | GPU (16 GB VRAM, fp32) |
 | `protein_chisel_design.sif` (→ `universal_with_tunnel_tools.sif`) | LigandMPNN, pyKVFinder, RDKit, MDAnalysis, prody, fpocket binary, freesasa, biopython, pandas, the protein_chisel package | Stage 3 (the iterative driver) | GPU preferred; CPU validated |
 
-Bind-mount pattern: `--bind <REPO>:/code --env PYTHONPATH=/code/src` (where `<REPO>` is the auto-detected git checkout) lets every container import the package without a host-side `pip install`. See `scripts/run_iterative_design_v2.sbatch` for the canonical bind set.
+Bind-mount pattern: `--bind <REPO>:/code --env PYTHONPATH=/code/src` (where `<REPO>` is the auto-detected git checkout) lets every container import the package without a host-side `pip install`. See `scripts/run_chisel_design.sh` for the canonical bind set.
 
 ## Per-cycle data flow
 

@@ -15,7 +15,7 @@ imports only what it needs:
 | 2. PLM precompute | `esmc.sif` (GPU) | ESM-C + SaProt masked-LM marginals -> calibrated cycle-0 fusion bias |
 | 3. iterative driver | `universal.sif` (GPU or CPU) | LigandMPNN sampling, filter cascade, fpocket scoring, TOPSIS rank, diverse top-K |
 
-All three are wired together by `scripts/run_iterative_design_v2.sbatch`.
+All three are wired together by `scripts/run_chisel_design.sh`.
 
 ## Running on Slurm (recommended)
 
@@ -24,7 +24,7 @@ and runs all three stages back-to-back on a GPU node:
 
 ```bash
 # default PTE_i1 run: target_k=50, min_hamming=3, 3 cycles, no Cys
-sbatch /home/woodbuse/codebase_projects/protein_chisel/scripts/run_iterative_design_v2.sbatch
+sbatch /home/woodbuse/codebase_projects/protein_chisel/scripts/run_chisel_design.sh
 ```
 
 The script holds the full apptainer pattern. Reproduced verbatim, the
@@ -87,7 +87,7 @@ Override the env knobs at submission time:
 ```bash
 sbatch \
   --export=ALL,SEED_PDB=/path/to/other.pdb,LIG_PARAMS=/path/to/other.params,N_CYCLES=3,OMIT_AA=CX \
-  scripts/run_iterative_design_v2.sbatch
+  scripts/run_chisel_design.sh
 ```
 
 A typical 3-cycle run on an A100-class GPU lands in **~8 min wall** and
@@ -97,7 +97,7 @@ writes ~2 GB of artifacts to `/net/scratch/woodbuse/iterative_design_v2_<scaffol
 
 When a stage misbehaves, run the same containers interactively. Note
 that each stage has its own bind set + PYTHONPATH; copy them from
-`run_iterative_design_v2.sbatch` to avoid drift:
+`run_chisel_design.sh` to avoid drift:
 
 ```bash
 # stage 3 shell, GPU node:

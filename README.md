@@ -18,21 +18,23 @@ ls -lh /net/software/containers/users/woodbuse/protein_chisel_design.sif  # stag
 ls -ld /net/software/containers/pyrosetta.sif                             # stages 1 + 4 (system)
 ls -ld /net/software/lab/CAVER/caver_3.0.3                                # offline tunnel validation (optional)
 
-# 3. Submit a run. SEED_PDB and LIG_PARAMS are REQUIRED.
-SEED_PDB=/path/to/your_seed.pdb \
+# 3. Submit a run. INPUT_PDB and LIG_PARAMS are REQUIRED. (SEED_PDB
+#    is also accepted as an alias for INPUT_PDB; OUTPUT_DIR is
+#    accepted as an alias for WORK_ROOT below.)
+INPUT_PDB=/path/to/your_seed.pdb \
 LIG_PARAMS=/path/to/your_lig.params \
-    sbatch scripts/run_iterative_design_v2.sbatch
+    sbatch scripts/run_chisel_design.sh
 
 # 4. Multi-PDB sweep example: per-PDB output dir + minimal layout. Each
 #    PDB lands in its own flat folder of {chiseled_design_metrics.tsv,
 #    *_chisel_NNN.pdb}, easy to glob across.
 for pdb in inputs/*.pdb; do
     stem=$(basename "$pdb" .pdb)
-    SEED_PDB="$pdb" \
+    INPUT_PDB="$pdb" \
     LIG_PARAMS=/path/to/lig.params \
-    WORK_ROOT=/net/scratch/$USER/chisel_sweep/$stem \
+    OUTPUT_DIR=/net/scratch/$USER/chisel_sweep/$stem \
     MINIMAL=1 \
-        sbatch scripts/run_iterative_design_v2.sbatch
+        sbatch scripts/run_chisel_design.sh
 done
 ```
 
@@ -42,7 +44,7 @@ The sbatch auto-detects its own checkout location — clone anywhere you have wr
 
 ## What lands on disk
 
-The driver writes a timestamped run dir under `$WORK_ROOT/iterative_design_v2_PTE_i1_<ts-pid>/`. After stage 4 (protonation + shipping reorganization) it ships in one of two layouts:
+The driver writes a timestamped run dir under `$OUTPUT_DIR/chisel_design_<ts-pid>/` (`$OUTPUT_DIR` defaults to `/net/scratch/$USER`; `WORK_ROOT` is the legacy alias). After stage 4 (protonation + shipping reorganization) it ships in one of two layouts:
 
 ### Standard shipping layout (default)
 
@@ -107,14 +109,15 @@ python scripts/load_chiseled_runs.py \
 
 | env var | default | role |
 |---|---|---|
-| `SEED_PDB` | **REQUIRED** | input backbone, with REMARK 666 catalytic motif lines |
-| `LIG_PARAMS` | PTE_i1 YYE.params | Rosetta ligand params; required for non-PTE substrates |
-| `WORK_ROOT` | `/net/scratch/$USER` | top-level output dir; per-PDB sweeps should set this to a per-PDB subdir |
+| `INPUT_PDB` (alias `SEED_PDB`) | **REQUIRED** | input backbone, with REMARK 666 catalytic motif lines |
+| `LIG_PARAMS` | **REQUIRED** | Rosetta ligand .params file |
+| `OUTPUT_DIR` (alias `WORK_ROOT`) | `/net/scratch/$USER` | top-level output dir; per-PDB sweeps should set this to a per-PDB subdir |
+| `USE_GPU` | auto-detect | force GPU (`1`) or CPU (`0`) for stages 2 + 3; default probes `nvidia-smi` |
 | `TARGET_K` | `50` | top-K size shipped at end of run |
 | `N_CYCLES` | `3` | active-set design rounds |
 | `MIN_HAMMING` | `3` | per-class diversity floor |
 | `OMIT_AA` | `CX` | AAs MPNN never samples |
-| `PTM` | `A/LYS/3:KCX` | PTM annotations (PTE_i1 catalytic carbamylated Lys at REMARK 666 motif index 3) |
+| `PTM` | `""` (empty) | PTM annotations, motif-index form. Example for PTE_i1 carbamylated catalytic Lys: `A/LYS/3:KCX` |
 | `ESMC_MODEL` | `esmc_600m` | ESM-C variant for stage 2 PLM logits |
 | `SAPROT_MODEL` | `saprot_1.3b` | SaProt variant for stage 2 PLM logits |
 | `ENHANCE` | `""` | optional pLDDT-enhanced LigandMPNN checkpoint (empty = stock) |
@@ -172,7 +175,7 @@ Full mechanism, A/B sweep results, decay sensitivity, and cross-scaffold validat
 
 ## Apptainer images (three-sif suite)
 
-The pipeline composes three apptainer/singularity containers via the shared filesystem (`run_iterative_design_v2.sbatch` runs each stage in the appropriate sif and they exchange artifacts on disk — apptainer can only `exec` one image at a time, so multi-sif is the standard pattern in HPC bioinformatics):
+The pipeline composes three apptainer/singularity containers via the shared filesystem (`run_chisel_design.sh` runs each stage in the appropriate sif and they exchange artifacts on disk — apptainer can only `exec` one image at a time, so multi-sif is the standard pattern in HPC bioinformatics):
 
 | stage(s) | sif | source | GPU? | what's inside |
 |---|---|---|---|---|
@@ -196,7 +199,7 @@ The user-suite sifs are aliased via symlink for friendly naming; the canonical f
 protein_chisel/
 ├── scripts/
 │   ├── iterative_design_v2.py          # main driver
-│   ├── run_iterative_design_v2.sbatch  # 4-stage / 3-sif slurm wrapper (PRODUCTION ENTRY)
+│   ├── run_chisel_design.sh  # 4-stage / 3-sif slurm wrapper (PRODUCTION ENTRY)
 │   ├── classify_positions_pte_i1.py    # stage 1 entrypoint
 │   ├── precompute_plm_artifacts.py     # stage 2 entrypoint
 │   ├── protonate_final_topk.py         # stage 4 entrypoint

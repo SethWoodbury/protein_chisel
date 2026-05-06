@@ -30,7 +30,7 @@ docs/
 **Writes:** README.md (top-level orientation, what this pipeline does, quickstart, link tree), docs/architecture.md (Mermaid pipeline diagram, stage descriptions, data-flow + artifacts).
 
 ### Agent 2 — Usage + examples
-**Reads:** scripts/run_iterative_design_v2.sbatch, recent run dirs, plans/.
+**Reads:** scripts/run_chisel_design.sh, recent run dirs, plans/.
 **Writes:** docs/usage.md (running locally vs slurm vs interactive, all 3 stages, common patterns), docs/examples/{pte_default_run.md, pte_diverse_run.md, new_scaffold_setup.md}.
 
 ### Agent 3 — CLI reference

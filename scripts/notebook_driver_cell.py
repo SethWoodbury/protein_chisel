@@ -86,10 +86,10 @@ if not Path(INPUT_DIR).is_dir():
     raise FileNotFoundError(f"INPUT_DIR not a directory: {INPUT_DIR}")
 if not Path(LIG_PARAMS).is_file():
     raise FileNotFoundError(f"LIG_PARAMS file not found: {LIG_PARAMS}")
-if not Path(REPO).is_dir() or not Path(f"{REPO}/scripts/run_iterative_design_v2.sbatch").is_file():
+if not Path(REPO).is_dir() or not Path(f"{REPO}/scripts/run_chisel_design.sh").is_file():
     raise FileNotFoundError(
         f"REPO doesn't look like a protein_chisel checkout: {REPO}\n"
-        f"  expected scripts/run_iterative_design_v2.sbatch"
+        f"  expected scripts/run_chisel_design.sh"
     )
 
 os.makedirs(OUTPUT_BASE, exist_ok=True)
@@ -113,8 +113,11 @@ for pdb_path in input_pdbs:
         continue
     os.makedirs(work_root, exist_ok=True)
 
+    # Surface env-var names: caller-friendly INPUT_PDB / OUTPUT_DIR.
+    # The sbatch accepts these as aliases for the legacy SEED_PDB /
+    # WORK_ROOT and resolves them internally.
     env_vars = {
-        "SEED_PDB":     pdb_path,
+        "INPUT_PDB":    pdb_path,
         "LIG_PARAMS":   LIG_PARAMS,
         "PTM":          PTM_SPEC,
         "TARGET_K":     str(TARGET_K),
@@ -123,7 +126,7 @@ for pdb_path in input_pdbs:
         "OMIT_AA":      OMIT_AA,
         "ESMC_MODEL":   ESMC_MODEL,
         "SAPROT_MODEL": SAPROT_MODEL,
-        "WORK_ROOT":    work_root,
+        "OUTPUT_DIR":   work_root,
         "MINIMAL":      "1",                    # flat layout: PDBs + 1 TSV
     }
     if SAVE_INTERMEDIATES:
@@ -156,7 +159,7 @@ for pdb_path in input_pdbs:
         f"--time={TIME_LIMIT} "
         f"--job-name=chisel_{stem[-12:]} "
         f"--export=ALL,{export_str} "
-        f"{REPO}/scripts/run_iterative_design_v2.sbatch"
+        f"{REPO}/scripts/run_chisel_design.sh"
     )
     commands.append((stem, cmd))
 
