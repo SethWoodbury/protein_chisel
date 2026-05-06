@@ -41,6 +41,7 @@ import argparse
 import datetime as _dt
 import json
 import logging
+import os
 import random
 import re
 import shutil
@@ -104,7 +105,8 @@ def _derive_catres_from_remark_666(seed_pdb: Path | str) -> tuple[tuple[int, ...
 UNIVERSAL_SIF = Path("/net/software/containers/universal.sif")
 FPOCKET_BIN = Path("/net/software/lab/fpocket/bin/fpocket")
 
-DEFAULT_OUT_ROOT = Path("/net/scratch/woodbuse")
+DEFAULT_OUT_ROOT = Path(os.environ.get("WORK_ROOT") or
+                          f"/net/scratch/{os.environ.get('USER', 'unknown')}")
 
 # fused_mpnn checkpoints (same as v1 driver; see notes there)
 LMPNN_CKPT = "/net/databases/mpnn/ligand_mpnn_model_weights/s25_r010_t300_p.pt"
@@ -2282,9 +2284,10 @@ def stage_arpeggio_final(
     )
 
     json_out = out_dir / "arpeggio_per_design.json"
+    _repo_root = str(Path(__file__).resolve().parents[1])
     cmd = [
         "apptainer", "exec",
-        "--bind", "/home/woodbuse/codebase_projects/protein_chisel:/code",
+        "--bind", f"{_repo_root}:/code",
         "--bind", "/net/scratch",
         "--env", "PYTHONPATH=/code/src",
         "/net/software/containers/users/woodbuse/esmc.sif",

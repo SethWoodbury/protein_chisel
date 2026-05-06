@@ -53,11 +53,25 @@ PTM_SPEC           = ""              # set to e.g. "A/LYS/3:KCX" for PTE_i1
 TARGET_K           = 50              # final designs per PDB
 N_CYCLES           = 3               # iterative-design cycles
 MIN_HAMMING        = 3               # diversity floor in final top-K
+OMIT_AA            = "X"             # AAs MPNN can never sample. PTE_i1 callers
+                                     # typically set "CX" (exclude Cys+Unknown).
 ESMC_MODEL         = "esmc_600m"     # esmc_300m | esmc_600m (default)
 SAPROT_MODEL       = "saprot_1.3b"   # saprot_35m | saprot_650m | saprot_1.3b
 THROAT_FEEDBACK    = True            # iterative bias against entrance blockers
+THROAT_DECAY       = 0.5             # 0.5 default; lower releases pressure faster
 TUNNEL_METRICS     = True            # ray-cast + pyKVFinder pocket scoring
+TUNNEL_HARD_GATE   = True            # drop 'buried' designs before TOPSIS rank
 SAVE_INTERMEDIATES = False           # keep cycle_NN/ for diagnostics
+VERBOSE            = False           # add --verbose to driver (DEBUG log level)
+ENHANCE            = ""              # optional pLDDT-enhanced LigandMPNN ckpt
+                                     # name (without .pth). Empty = standard
+                                     # checkpoint. See iterative_design_v2.py
+                                     # AVAILABLE_ENHANCE_CHECKPOINTS for names.
+
+# Re-run protection: by default we refuse to overwrite an existing
+# per-PDB output that already has *_chisel_*.pdb in it. Set
+# FORCE_OVERWRITE=True to clobber existing sweep outputs.
+FORCE_OVERWRITE    = False
 
 # ─── 3. Slurm settings ────────────────────────────────────────────────
 PARTITION  = "gpu-train"             # 'gpu-train' (L40, faster) or 'gpu-bf' (A4000)
@@ -65,17 +79,38 @@ TIME_LIMIT = "00:30:00"              # generous; typical 6-8 min on gpu-train
 MEM        = "20G"                   # whole-job; bump to 24G for L>300
 CPUS       = 4
 
-# ─── 4. Generate one sbatch command per input PDB ─────────────────────
+# ─── 4. Sanity checks + per-PDB command generation ───────────────────
+# Verify the inputs exist BEFORE generating commands so we fail loudly
+# rather than silently submit zero or bogus jobs.
+if not Path(INPUT_DIR).is_dir():
+    raise FileNotFoundError(f"INPUT_DIR not a directory: {INPUT_DIR}")
+if not Path(LIG_PARAMS).is_file():
+    raise FileNotFoundError(f"LIG_PARAMS file not found: {LIG_PARAMS}")
+if not Path(REPO).is_dir() or not Path(f"{REPO}/scripts/run_iterative_design_v2.sbatch").is_file():
+    raise FileNotFoundError(
+        f"REPO doesn't look like a protein_chisel checkout: {REPO}\n"
+        f"  expected scripts/run_iterative_design_v2.sbatch"
+    )
+
 os.makedirs(OUTPUT_BASE, exist_ok=True)
 input_pdbs = sorted(glob.glob(f"{INPUT_DIR}/*.pdb"))
+if not input_pdbs:
+    raise FileNotFoundError(f"No *.pdb files in INPUT_DIR={INPUT_DIR}")
 print(f"Found {len(input_pdbs)} input PDBs in {INPUT_DIR}")
 print(f"Output base: {OUTPUT_BASE}")
 print()
 
 commands: list[tuple[str, str]] = []
+skipped_existing: list[str] = []
 for pdb_path in input_pdbs:
     stem = Path(pdb_path).stem                # e.g. ZAPP_..._FS148
     work_root = f"{OUTPUT_BASE}/{stem}"        # per-PDB output dir
+
+    # Re-run protection
+    existing = list(Path(work_root).glob("*_chisel_*.pdb")) if Path(work_root).is_dir() else []
+    if existing and not FORCE_OVERWRITE:
+        skipped_existing.append(stem)
+        continue
     os.makedirs(work_root, exist_ok=True)
 
     env_vars = {
@@ -85,6 +120,7 @@ for pdb_path in input_pdbs:
         "TARGET_K":     str(TARGET_K),
         "N_CYCLES":     str(N_CYCLES),
         "MIN_HAMMING":  str(MIN_HAMMING),
+        "OMIT_AA":      OMIT_AA,
         "ESMC_MODEL":   ESMC_MODEL,
         "SAPROT_MODEL": SAPROT_MODEL,
         "WORK_ROOT":    work_root,
@@ -92,12 +128,20 @@ for pdb_path in input_pdbs:
     }
     if SAVE_INTERMEDIATES:
         env_vars["SAVE_INTERMEDIATES"] = "1"
+    if ENHANCE:
+        env_vars["ENHANCE"] = ENHANCE
 
     extras: list[str] = []
     if not THROAT_FEEDBACK:
         extras.append("--no_throat_feedback")
+    if THROAT_FEEDBACK and THROAT_DECAY != 0.5:
+        extras += ["--throat_feedback_decay", str(THROAT_DECAY)]
     if not TUNNEL_METRICS:
         extras.append("--no_tunnel_metrics")
+    if not TUNNEL_HARD_GATE:
+        extras.append("--no_tunnel_hard_gate")
+    if VERBOSE:
+        extras.append("--verbose")
     if extras:
         env_vars["EXTRA_DRIVER_FLAGS"] = " ".join(extras)
 
@@ -116,6 +160,15 @@ for pdb_path in input_pdbs:
     )
     commands.append((stem, cmd))
 
+if skipped_existing:
+    print(f"Skipped {len(skipped_existing)} PDBs with existing outputs "
+          f"(set FORCE_OVERWRITE=True to re-run):")
+    for s in skipped_existing[:5]:
+        print(f"  - {s}")
+    if len(skipped_existing) > 5:
+        print(f"  ... and {len(skipped_existing) - 5} more")
+    print()
+
 # ─── 5a. Preview (dry run — print, don't submit) ──────────────────────
 print(f"Generated {len(commands)} sbatch commands.")
 print()
@@ -125,9 +178,24 @@ for stem, cmd in commands[:3]:
     print(cmd)
     print()
 
-# ─── 5b. UNCOMMENT to submit them all ─────────────────────────────────
-# print("Submitting...")
+# ─── 5b. UNCOMMENT to submit them all (collects failures) ────────────
+# print(f"Submitting {len(commands)} jobs...")
+# submitted: list[tuple[str, str]] = []   # (stem, jid)
+# failures:  list[tuple[str, str]] = []   # (stem, stderr)
 # for stem, cmd in commands:
 #     out = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-#     jid = out.stdout.strip().split()[-1] if out.stdout.strip() else "FAILED"
-#     print(f"  {stem}: {jid}")
+#     stdout = (out.stdout or "").strip()
+#     if out.returncode == 0 and stdout:
+#         jid = stdout.split()[-1]
+#         submitted.append((stem, jid))
+#     else:
+#         err = (out.stderr or "").strip() or stdout or "no stderr"
+#         failures.append((stem, err.splitlines()[-1][:200]))
+# print(f"\n=== SUMMARY: {len(submitted)} submitted, {len(failures)} failed ===")
+# for stem, jid in submitted[:10]:
+#     print(f"  OK   {stem} -> {jid}")
+# if len(submitted) > 10:
+#     print(f"  ... ({len(submitted)} total submitted)")
+# for stem, err in failures:
+#     print(f"  FAIL {stem}: {err}")
+# print(f"\nMonitor: squeue -u $USER")

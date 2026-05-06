@@ -3,14 +3,14 @@
 Designed for jupyterhub use:
 
     >>> from protein_chisel.tools.load_chiseled_runs import load_runs, load_one
-    >>> df = load_runs("/net/scratch/woodbuse/iterative_design_*/chiseled_design_metrics.tsv")
+    >>> df = load_runs("/net/scratch/$USER/iterative_design_*/chiseled_design_metrics.tsv")
     >>> df.shape
     (N_runs * 50, ~150)
 
 Or via CLI:
 
     $ python scripts/load_chiseled_runs.py \\
-        '/net/scratch/woodbuse/iterative_design_*/chiseled_design_metrics.tsv' \\
+        '/net/scratch/$USER/iterative_design_*/chiseled_design_metrics.tsv' \\
         --out /tmp/all_runs.tsv
 
 Each row in the returned DataFrame includes:
@@ -119,7 +119,7 @@ def load_runs(
 
     Args:
         pattern_or_paths: a glob string (e.g.
-            ``"/net/scratch/woodbuse/iterative_design_*/chiseled_design_metrics.tsv"``)
+            ``"/net/scratch/$USER/iterative_design_*/chiseled_design_metrics.tsv"``)
             or an iterable of explicit paths.
         with_meta: pull manifest fields into ``_meta_*`` columns.
         add_run_id: add a ``run_id`` short-name column derived from the
