@@ -18,8 +18,8 @@
 #   --mem=20G is whole-job total (NOT per-cpu); ~1.2-1.4x headroom
 #   for typical L=200-280 scaffolds. Bump to 24G for L>300.
 #   See docs/sweep_parameters.md for the full memory model.
-#SBATCH --output=/net/scratch/woodbuse/slurm-iter-v2-%j.out
-#SBATCH --error=/net/scratch/woodbuse/slurm-iter-v2-%j.err
+#SBATCH --output=/net/scratch/%u/slurm-iter-v2-%j.out
+#SBATCH --error=/net/scratch/%u/slurm-iter-v2-%j.err
 
 # PLM-fusion-driven iterative design for the PTE_i1 scaffold.
 #
@@ -35,8 +35,25 @@
 
 set -euo pipefail
 
-REPO=/home/woodbuse/codebase_projects/protein_chisel
-SEED_PDB="${SEED_PDB:-/net/scratch/aruder2/projects/PTE_i1/af3_out/filtered_i1/ref_pdbs/ZAPP_p1D1_rotP_1_ORI_11_C7_i_20_model_1__eV2_T0_20__8_1_FS269.pdb}"
+# === Portability ====================================================
+# REPO is auto-detected from this script's location, so any user can
+# `git clone` into their own home and the sbatch just works. Override
+# REPO=... only if you're calling this script from a different checkout.
+# Other site-specific paths (apptainer images, model weights at
+# /net/software, /net/databases) are CLUSTER-SHARED resources that any
+# user with read access can hit; nothing here writes into another
+# user's home.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+REPO="${REPO:-$(dirname "$SCRIPT_DIR")}"
+
+# === Required inputs (per-design caller MUST set these) ============
+# SEED_PDB: starting backbone (with the desired catalytic motif and
+#   ligand placement; REMARK 666 lines drive auto-derivation of the
+#   catalytic residues so you don't hardcode resnos here)
+# LIG_PARAMS: Rosetta params for the ligand. We auto-detect a sensible
+#   default for the PTE_i1 substrate (YYE), but for any other ligand
+#   the caller MUST set LIG_PARAMS=...
+SEED_PDB="${SEED_PDB:?Set SEED_PDB to your input PDB (with REMARK 666)}"
 LIG_PARAMS="${LIG_PARAMS:-/home/woodbuse/testing_space/scaffold_optimization/ZZZ_MERGED_PRELIM_FILTER_DIR_ZZZ/params/YYE.params}"
 TARGET_K="${TARGET_K:-50}"
 MIN_HAMMING="${MIN_HAMMING:-3}"
@@ -90,9 +107,18 @@ ENHANCE="${ENHANCE:-}"
 ESMC_MODEL="${ESMC_MODEL:-esmc_600m}"
 SAPROT_MODEL="${SAPROT_MODEL:-saprot_1.3b}"
 
+# === Output base ====================================================
+# WORK_ROOT is the top-level directory under which work_dir/ and run_dir/
+# get created. Defaults to /net/scratch/$USER. Override per-call (e.g.
+# from a sweep notebook) to put each input PDB's outputs in its own
+# isolated subdirectory:
+#   WORK_ROOT=/net/scratch/aruder2/.../chisel_out/i1__ref_pdbs/<pdb_stem>
+#   bash run_iterative_design_v2.sbatch
+WORK_ROOT="${WORK_ROOT:-/net/scratch/$USER}"
+mkdir -p "$WORK_ROOT"
+
 # Working dir for this job (ms + PID for collision safety with concurrent jobs)
 TS=$(python3 -c 'import datetime,os; t=datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]; print(f"{t}-pid{os.getpid()}")' 2>/dev/null || date +%Y%m%d-%H%M%S)
-WORK_ROOT=/net/scratch/woodbuse
 WORK_DIR="$WORK_ROOT/iterative_design_v2_PTE_i1_${TS}"
 mkdir -p "$WORK_DIR"
 echo "=== work dir: $WORK_DIR ==="
@@ -111,7 +137,7 @@ apptainer exec \
     --bind "$REPO:/code" \
     --bind /net/software \
     --bind /net/scratch \
-    --bind /home/woodbuse \
+    --bind "$HOME" \
     --env "PYTHONPATH=/code/src:/pyrosetta" \
     /net/software/containers/pyrosetta.sif \
     python "$REPO/scripts/classify_positions_pte_i1.py" \
@@ -125,7 +151,7 @@ apptainer exec --nv \
     --bind /net/software \
     --bind /net/databases \
     --bind /net/scratch \
-    --bind /home/woodbuse \
+    --bind "$HOME" \
     --bind /net/databases/huggingface/esmc \
     --bind /net/databases/huggingface/saprot \
     --env "PYTHONPATH=/code/src" \
@@ -166,7 +192,7 @@ apptainer exec --nv \
     --bind /net/software \
     --bind /net/databases \
     --bind /net/scratch \
-    --bind /home/woodbuse \
+    --bind "$HOME" \
     --env "PYTHONPATH=/code/src:/cifutils/src" \
     "$STAGE3_SIF" \
     python "$REPO/scripts/iterative_design_v2.py" \
@@ -217,7 +243,7 @@ else
         --bind "$REPO:/code" \
         --bind /net/software \
         --bind /net/scratch \
-        --bind /home/woodbuse \
+        --bind "$HOME" \
         --env "PYTHONPATH=/code/src:/pyrosetta" \
         /net/software/containers/pyrosetta.sif \
         python "$REPO/scripts/protonate_final_topk.py" \
@@ -230,4 +256,48 @@ else
             ${PTM:+--ptm "$PTM"}
 fi
 
-echo "=== DONE -- $WORK_DIR ==="
+# === Per-PDB-sweep consolidation ====================================
+# When the user pre-set WORK_ROOT to a PER-PDB output dir AND requested
+# MINIMAL mode, flatten the output one more level: move RUN_DIR's
+# contents up into WORK_ROOT and remove the (now empty) RUN_DIR +
+# WORK_DIR, so the final layout is exactly:
+#     WORK_ROOT/<pdb>_chisel_NNN.pdb         (N PDBs, flat)
+#     WORK_ROOT/chiseled_design_metrics.tsv  (1 TSV with embedded RUN_META)
+#
+# Triggered when CONSOLIDATE_TO_WORK_ROOT=1 (default ON when MINIMAL=1
+# AND WORK_ROOT was explicitly set by the caller — i.e. you're running
+# a sweep). Safe-guards:
+#   - skipped if WORK_ROOT was the default /net/scratch/$USER (since
+#     then collisions between concurrent runs are a real risk)
+#   - skipped if RUN_DIR doesn't exist (pipeline failed earlier)
+#   - skipped if the merge would clobber existing files
+USER_DEFAULT_WORK_ROOT="/net/scratch/$USER"
+if [[ "${MINIMAL:-}" == "1" \
+      && "${CONSOLIDATE_TO_WORK_ROOT:-1}" == "1" \
+      && "$WORK_ROOT" != "$USER_DEFAULT_WORK_ROOT" \
+      && -d "${RUN_DIR:-/nonexistent}" ]]; then
+    echo "=== CONSOLIDATE: $RUN_DIR/* -> $WORK_ROOT/ ==="
+    # Use a temp-then-rename to avoid mid-move racing
+    shopt -s dotglob nullglob
+    moved_any=0
+    for f in "$RUN_DIR"/*; do
+        bn=$(basename "$f")
+        if [[ -e "$WORK_ROOT/$bn" ]]; then
+            echo "WARN: refusing to overwrite $WORK_ROOT/$bn — skipping"
+            continue
+        fi
+        mv "$f" "$WORK_ROOT/$bn"
+        moved_any=1
+    done
+    shopt -u dotglob nullglob
+    # Clean up empty timestamped dirs
+    rmdir "$RUN_DIR" 2>/dev/null || true
+    rm -rf "$WORK_DIR" 2>/dev/null || true
+    if (( moved_any )); then
+        echo "=== DONE -- consolidated to $WORK_ROOT ==="
+    else
+        echo "WARN: consolidation moved no files; check $RUN_DIR / $WORK_DIR"
+    fi
+else
+    echo "=== DONE -- $WORK_DIR ==="
+fi
