@@ -132,6 +132,39 @@ mkdir -p "$CLASSIFY_DIR" "$PLM_DIR"
 # PYTHONPATH for esmc.sif and universal.sif holds /cifutils/src etc. that
 # we must preserve.
 
+# === GPU/CPU mode selection ========================================
+# Auto-detect by default; override with USE_GPU=1 (force --nv) or
+# USE_GPU=0 (force CPU, drop --nv from stages 2 + 3). Stages 1 + 4
+# never use --nv (PyRosetta is CPU-only) and are unaffected.
+#
+# Why this matters: when this script is run via `bash <file>` inside
+# an outer slurm array job (the lab-standard pattern), the #SBATCH
+# directives at the top become inert comments and the job inherits
+# whatever resources the outer array requested. If that outer array
+# is on a CPU partition, `apptainer exec --nv` fails (or silently
+# yields no GPU). Auto-detection avoids that footgun.
+NV_FLAGS=()
+if [[ "${USE_GPU:-auto}" == "0" ]]; then
+    GPU_MODE="CPU (USE_GPU=0 override)"
+elif [[ "${USE_GPU:-auto}" == "1" ]]; then
+    NV_FLAGS=("--nv")
+    GPU_MODE="GPU (USE_GPU=1 override)"
+elif command -v nvidia-smi &>/dev/null && nvidia-smi -L 2>/dev/null | grep -q "GPU"; then
+    NV_FLAGS=("--nv")
+    GPU_MODE="GPU (auto-detected: $(nvidia-smi -L 2>/dev/null | head -1 | sed 's/ (UUID.*//'))"
+else
+    GPU_MODE="CPU (no GPU detected)"
+fi
+echo "================================================================"
+echo "  protein_chisel mode: $GPU_MODE"
+if [[ "$GPU_MODE" == CPU* ]]; then
+    echo "  CPU NOTE: stage 2 (ESM-C $ESMC_MODEL + SaProt $SAPROT_MODEL)"
+    echo "  is ~10-14x slower than GPU. Benchmark 2026-05-04 (L=202,"
+    echo "  600m+1.3b, cpus=4): 50:32 wall, 14.3 GB MaxRSS. Allow 60-90"
+    echo "  min walltime; bump cpus to 4 if slurm priority allows."
+fi
+echo "================================================================"
+
 echo "=== STAGE 1: classify_positions (pyrosetta.sif) ==="
 apptainer exec \
     --bind "$REPO:/code" \
@@ -157,7 +190,7 @@ else
     STAGE2_SIF="$PLM_SIF_OLD"
 fi
 echo "=== STAGE 2: PLM logits + fusion ($STAGE2_SIF) ==="
-apptainer exec --nv \
+apptainer exec "${NV_FLAGS[@]}" \
     --bind "$REPO:/code" \
     --bind /net/software \
     --bind /net/databases \
@@ -199,7 +232,7 @@ else
     echo "      universal.sif (--tunnel_metrics will skip pyKVFinder)"
 fi
 echo "=== STAGE 3: iterative driver ($STAGE3_SIF) ==="
-apptainer exec --nv \
+apptainer exec "${NV_FLAGS[@]}" \
     --bind "$REPO:/code" \
     --bind /net/software \
     --bind /net/databases \
