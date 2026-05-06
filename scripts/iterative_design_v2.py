@@ -1327,9 +1327,20 @@ def stage_struct_filter(
     if n_workers == 1:
         results = [_struct_filter_worker(a) for a in work_args]
     else:
-        from multiprocessing import Pool
-        with Pool(n_workers) as pool:
-            results = pool.map(_struct_filter_worker, work_args, chunksize=1)
+        # ThreadPoolExecutor (NOT multiprocessing.Pool) — same reasoning
+        # as stage_fpocket_rank: stage_struct_filter runs *after*
+        # stage_sample, which initializes torch.cuda inside LigandMPNN.
+        # multiprocessing.Pool with the default fork start method then
+        # forks a CUDA-initialized parent, which is fork-unsafe and is
+        # the leading hypothesis for the catastrophic failure mode where
+        # downstream subprocess work (e.g. fpocket) collapses across the
+        # whole batch. The struct-filter worker is dominated by numpy
+        # geometry + freesasa C calls + biopython parsing, all of which
+        # release the GIL, so threads scale well enough in practice and
+        # are fork-safe.
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            results = list(pool.map(_struct_filter_worker, work_args))
     by_cid = {cid: (row, hbonds, reasons) for cid, row, hbonds, reasons in results}
 
     rows: list[dict] = []
@@ -3981,10 +3992,10 @@ def main() -> None:
                 LOGGER.error(
                     "All %d designs filtered out by fpocket-druggability >= %.2f. "
                     "Writing empty final artifacts and exiting cleanly. "
-                    "Inspect cycle_NN/05_fpocket/ranked.tsv and "
-                    "fpocket__status/fpocket__returncode columns to "
-                    "diagnose whether fpocket failed or designs are "
-                    "genuinely low-druggability.",
+                    "Diagnose: (a) inspect cycle_NN/05_fpocket/ranked.tsv "
+                    "fpocket__status column for tool-failure counts, "
+                    "(b) grep slurm-stderr for 'fpocket failed for ... rc=' "
+                    "to see specific subprocess return codes.",
                     n_before, druggability_min,
                 )
                 pool.to_csv(final_dir / "all_survivors.tsv", sep="\t", index=False)
