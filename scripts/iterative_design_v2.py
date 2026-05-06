@@ -3364,7 +3364,7 @@ def main() -> None:
     import os as _os_pid
     ts_micro = _dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]  # ms precision
     timestamp = f"{ts_micro}-pid{_os_pid.getpid()}"
-    run_dir = args.out_root / f"iterative_design_v2_PTE_i1_{timestamp}"
+    run_dir = args.out_root / f"chisel_design_{timestamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
     LOGGER.info("=== run dir: %s ===", run_dir)
     if args.run_dir_marker:
