@@ -49,7 +49,7 @@ Public API:
     For literature-defensible cavity/opening detection, see also
     ``pyKVFinder_score()`` which wraps pyKVFinder in box-mode anchored on
     the catalytic centroid (~50-300 ms/PDB; requires the
-    ``universal_with_tunnel_tools.sif`` image at
+    ``protein_chisel_design.sif`` image at
     ``/net/software/containers/users/woodbuse/``). The two scorers
     measure related but non-identical quantities; running BOTH and
     flagging disagreement is itself signal.
@@ -796,8 +796,8 @@ def pyKVFinder_score(
         pkvf__elapsed_ms:       wall time
 
     Requires pyKVFinder; raises ImportError if unavailable. Designed to
-    run inside ``universal_with_tunnel_tools.sif`` (which has it pip-
-    installed). Cost ~50-300 ms/PDB per the survey.
+    run inside ``protein_chisel_design.sif`` (which has it pip-installed).
+    Cost ~50-300 ms/PDB per the survey.
     """
     import time
     t0 = time.perf_counter()
@@ -806,7 +806,7 @@ def pyKVFinder_score(
     except ImportError:
         raise ImportError(
             "pyKVFinder not installed. Run from "
-            "/net/software/containers/users/woodbuse/universal_with_tunnel_tools.sif "
+            "/net/software/containers/users/woodbuse/protein_chisel_design.sif "
             "or pip install pyKVFinder."
         )
 

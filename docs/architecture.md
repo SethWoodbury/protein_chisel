@@ -14,7 +14,7 @@ flowchart TD
         S1A --> S1B
     end
 
-    subgraph Stage2["Stage 2: precompute_plm_artifacts  (esmc.sif, GPU)"]
+    subgraph Stage2["Stage 2: precompute_plm_artifacts  (protein_chisel_plm.sif, GPU)"]
         S2A[ESM-C masked-LM marginals  (L,20)]
         S2B[SaProt masked-LM marginals  (L,20)]
         S2C[calibrate → log-odds<br/>entropy-match across models<br/>cosine-disagreement shrinkage<br/>per-class β/γ weights]
@@ -56,11 +56,11 @@ flowchart LR
 
 | SIF | Purpose | Stage | Hardware |
 |---|---|---|---|
-| `pyrosetta.sif` | PyRosetta (DSSP, SASA, classifier), parse REMARK 666 / cstfile, write canonical PositionTable | Stage 1; optional `--rosetta_final` enrichment | CPU |
-| `esmc.sif` | ESM-C 600M + SaProt 650M masked-LM marginals, py_contact_ms (CMS), PROPKA | Stage 2; optional `--cms_final` enrichment | GPU (16 GB VRAM, fp32) |
-| `universal.sif` | LigandMPNN (`/net/software/lab/fused_mpnn/seth_temp/`), fpocket binary, freesasa, biopython, pandas, the protein_chisel package | Stage 3 (the iterative driver) | GPU preferred; CPU validated |
+| `pyrosetta.sif` | PyRosetta (DSSP, SASA, classifier), parse REMARK 666 / cstfile, write canonical PositionTable | Stages 1 + 4 (final protonation) | CPU |
+| `protein_chisel_plm.sif` (→ `esmc.sif`) | ESM-C 600M + SaProt 650M masked-LM marginals, py_contact_ms (CMS), PROPKA | Stage 2; optional `--cms_final` enrichment | GPU (16 GB VRAM, fp32) |
+| `protein_chisel_design.sif` (→ `universal_with_tunnel_tools.sif`) | LigandMPNN, pyKVFinder, RDKit, MDAnalysis, prody, fpocket binary, freesasa, biopython, pandas, the protein_chisel package | Stage 3 (the iterative driver) | GPU preferred; CPU validated |
 
-Bind-mount pattern: `--bind /home/woodbuse/codebase_projects/protein_chisel:/code --env PYTHONPATH=/code/src` lets every container import the package without a host-side `pip install`. See `scripts/run_iterative_design_v2.sbatch` for the canonical bind set.
+Bind-mount pattern: `--bind <REPO>:/code --env PYTHONPATH=/code/src` (where `<REPO>` is the auto-detected git checkout) lets every container import the package without a host-side `pip install`. See `scripts/run_iterative_design_v2.sbatch` for the canonical bind set.
 
 ## Per-cycle data flow
 

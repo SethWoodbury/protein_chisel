@@ -13,14 +13,12 @@ cd ~/protein_chisel
 
 # 2. Confirm read access to the cluster-shared resources (all read-only,
 #    nothing here writes into anyone else's home).
-ls -lh /net/scratch/woodbuse/sif/universal_with_tunnel_tools.sif         # preferred (fast NFS)
-ls -lh /net/software/containers/users/woodbuse/universal_with_tunnel_tools.sif  # fallback
-ls -ld /net/software/lab/CAVER/caver_3.0.3                               # offline tunnel validation
-ls -ld /net/software/containers/pyrosetta.sif                            # stage 1 + stage 4
-ls -ld /net/software/containers/users/woodbuse/esmc.sif                  # stage 2
+ls -lh /net/software/containers/users/woodbuse/protein_chisel_plm.sif     # stage 2 (symlink -> esmc.sif)
+ls -lh /net/software/containers/users/woodbuse/protein_chisel_design.sif  # stage 3 (symlink -> universal_with_tunnel_tools.sif)
+ls -ld /net/software/containers/pyrosetta.sif                             # stages 1 + 4 (system)
+ls -ld /net/software/lab/CAVER/caver_3.0.3                                # offline tunnel validation (optional)
 
-# 3. Submit a run. SEED_PDB is REQUIRED; LIG_PARAMS defaults to PTE_i1's
-#    YYE.params but should be set for any other ligand.
+# 3. Submit a run. SEED_PDB and LIG_PARAMS are REQUIRED.
 SEED_PDB=/path/to/your_seed.pdb \
 LIG_PARAMS=/path/to/your_lig.params \
     sbatch scripts/run_iterative_design_v2.sbatch
@@ -146,16 +144,16 @@ The pipeline default `--throat_feedback ON` is set inside the driver; pass `EXTR
 flowchart LR
     seed[(seed PDB<br/>REMARK 666<br/>+ ligand params)]
     seed --> S1[Stage 1: classify_positions<br/>pyrosetta.sif<br/>directional 6-class taxonomy]
-    seed --> S2[Stage 2: precompute_plm_artifacts<br/>esmc.sif - GPU<br/>ESM-C + SaProt logits + fusion]
+    seed --> S2[Stage 2: precompute_plm_artifacts<br/>protein_chisel_plm.sif - GPU<br/>ESM-C + SaProt logits + fusion]
     S1 --> S3
-    S2 --> S3[Stage 3: iterative_design_v2<br/>universal_with_tunnel_tools.sif - GPU/CPU<br/>sample / filter / score / rank<br/>3 cycles + final top-K]
+    S2 --> S3[Stage 3: iterative_design_v2<br/>protein_chisel_design.sif - GPU/CPU<br/>sample / filter / score / rank<br/>3 cycles + final top-K]
     S3 --> S4[Stage 4: protonate_final_topk<br/>pyrosetta.sif<br/>protonate + reorganize_for_shipping]
     S4 --> out[(run_dir/<br/>designs/ + chiseled_design_metrics.tsv<br/>+ manifest + telemetry)]
 ```
 
 1. **classify_positions** (`pyrosetta.sif`) — directional 6-class taxonomy: `primary_sphere / secondary_sphere / nearby_surface / distal_buried / distal_surface / ligand`, with sidechain-orientation gates (Tawfik / Markin preorganization framing).
-2. **precompute_plm_artifacts** (`esmc.sif`, GPU) — runs ESM-C (default 600m) + SaProt (default 1.3b) on the seed sequence; computes log-odds, entropy-match, and the fused per-position bias matrix used by stage 3.
-3. **iterative_design_v2** (`universal_with_tunnel_tools.sif`, GPU or CPU) — the main driver. Per cycle: sample LigandMPNN with the running bias, filter (charge/pI/clash/length), score (~145 metrics), rank by multi-objective TOPSIS, accumulate consensus + throat-blocker bias for the next cycle. After N_CYCLES, picks top-K with Hamming-diversity constraint.
+2. **precompute_plm_artifacts** (`protein_chisel_plm.sif`, GPU) — runs ESM-C (default 600m) + SaProt (default 1.3b) on the seed sequence; computes log-odds, entropy-match, and the fused per-position bias matrix used by stage 3.
+3. **iterative_design_v2** (`protein_chisel_design.sif`, GPU or CPU) — the main driver. Per cycle: sample LigandMPNN with the running bias, filter (charge/pI/clash/length), score (~145 metrics), rank by multi-objective TOPSIS, accumulate consensus + throat-blocker bias for the next cycle. After N_CYCLES, picks top-K with Hamming-diversity constraint.
 4. **protonate_final_topk** (`pyrosetta.sif`) — protonates the top-K (PROPKA + PyRosetta, with PTM annotations preserved in REMARK 668), then `reorganize_for_shipping(minimal=...)` produces the standard or minimal output layout.
 
 See [`docs/architecture.md`](docs/architecture.md) for the full per-cycle data flow, PLM fusion math, consensus + class-balance, TOPSIS internals, and the container split.
@@ -172,9 +170,23 @@ Full mechanism, A/B sweep results, decay sensitivity, and cross-scaffold validat
 
 ---
 
-## Stage-3 sif build
+## Apptainer images (three-sif suite)
 
-The stage-3 sif (`universal_with_tunnel_tools.sif`) is just the lab `universal.sif` with `pyKVFinder` and `rdkit` pip-installed on top — a ~5-minute apptainer build (commit `9196bc2` and predecessors). The fast `/net/scratch` copy is preferred over the canonical `/net/software/containers/users/woodbuse/` location because newly built sifs can take >1 hr to propagate over NFS to gpu-train compute nodes; the sbatch tries scratch first, then canonical, then falls back to the system `universal.sif` (which loses pyKVFinder; the homegrown ray-cast still runs).
+The pipeline composes three apptainer/singularity containers via the shared filesystem (`run_iterative_design_v2.sbatch` runs each stage in the appropriate sif and they exchange artifacts on disk — apptainer can only `exec` one image at a time, so multi-sif is the standard pattern in HPC bioinformatics):
+
+| stage(s) | sif | source | GPU? | what's inside |
+|---|---|---|---|---|
+| 1, 4 | `/net/software/containers/pyrosetta.sif` | system | no | PyRosetta, PROPKA, BCL — for position classification + final protonation |
+| 2 | `/net/software/containers/users/woodbuse/protein_chisel_plm.sif` | user (symlink → `esmc.sif`) | yes | Python 3.12, ESM 3.2.3 (ESM-C), SaProt, foldseek built-in, cu130 |
+| 3 | `/net/software/containers/users/woodbuse/protein_chisel_design.sif` | user (symlink → `universal_with_tunnel_tools.sif`) | yes (or CPU) | Python 3.11, LigandMPNN, ESM 2.0.1, pyKVFinder, RDKit, MDAnalysis, prody, cu128 |
+
+The user-suite sifs are aliased via symlink for friendly naming; the canonical filenames remain readable so any older path references keep working. The sbatch prefers the suite names and falls back to the legacy names.
+
+**Why the design + plm sifs aren't merged into one big sif:** they're on incompatible Python/CUDA/ESM stacks — Python 3.11 vs 3.12, ESM 2.0.1 vs 3.2.3, cu128 vs cu130, plus different downstream ecosystem pinning. Trying to resolve them into one image would either downgrade ESM-C (regressing logits quality) or upgrade LigandMPNN's environment (breaking its tested pinning). Multi-sif is correct here.
+
+**Optional override env vars** (set in the calling environment to point at custom-built sifs):
+- `PLM_SIF=/path/to/your_plm.sif` — overrides stage 2.
+- `TUNNEL_SIF=/path/to/your_design.sif` — overrides stage 3.
 
 ---
 

@@ -145,7 +145,18 @@ apptainer exec \
         --ligand_params "$LIG_PARAMS" \
         --out_dir "$CLASSIFY_DIR"
 
-echo "=== STAGE 2: PLM logits + fusion (esmc.sif) ==="
+# Stage 2 sif: ESM-C + SaProt + foldseek stack. Canonical name is
+# protein_chisel_plm.sif (symlink to esmc.sif at the same path).
+PLM_SIF_NEW=/net/software/containers/users/woodbuse/protein_chisel_plm.sif
+PLM_SIF_OLD=/net/software/containers/users/woodbuse/esmc.sif
+if [[ -n "${PLM_SIF:-}" && -e "$PLM_SIF" ]]; then
+    STAGE2_SIF="$PLM_SIF"
+elif [[ -e "$PLM_SIF_NEW" ]]; then
+    STAGE2_SIF="$PLM_SIF_NEW"
+else
+    STAGE2_SIF="$PLM_SIF_OLD"
+fi
+echo "=== STAGE 2: PLM logits + fusion ($STAGE2_SIF) ==="
 apptainer exec --nv \
     --bind "$REPO:/code" \
     --bind /net/software \
@@ -158,7 +169,7 @@ apptainer exec --nv \
     --env "HF_HOME=/net/databases/huggingface/esmc" \
     --env "HF_HUB_CACHE=/net/databases/huggingface/esmc/hub" \
     --env "SAPROT_HF_CACHE=/net/databases/huggingface/saprot/hub" \
-    /net/software/containers/users/woodbuse/esmc.sif \
+    "$STAGE2_SIF" \
     python "$REPO/scripts/precompute_plm_artifacts.py" \
         --seed_pdb "$SEED_PDB" \
         --position_table "$CLASSIFY_DIR/positions.tsv" \
@@ -166,25 +177,26 @@ apptainer exec --nv \
         --esmc_model "$ESMC_MODEL" \
         --saprot_model "$SAPROT_MODEL"
 
-# Stage 3 sif selection: prefer the user-built derivative that adds
-# pyKVFinder + RDKit on top of universal.sif (used by --tunnel_metrics).
-# Canonical location is /net/software/containers/users/woodbuse/ —
-# world-readable on this cluster. Override via TUNNEL_SIF=... env var
-# if you have a custom build. Falls back to system universal.sif if
-# the tools sif isn't available (means pyKVFinder skipped — homegrown
-# ray-cast still runs).
-SIF_CANON=/net/software/containers/users/woodbuse/universal_with_tunnel_tools.sif
-SIF_SCRATCH=/net/scratch/woodbuse/sif/universal_with_tunnel_tools.sif
-if [[ -n "${TUNNEL_SIF:-}" && -f "$TUNNEL_SIF" ]]; then
+# Stage 3 sif selection. The protein_chisel suite at the canonical
+# user-shared dir uses friendly names:
+#   protein_chisel_plm.sif    -> esmc.sif                       (stage 2)
+#   protein_chisel_design.sif -> universal_with_tunnel_tools.sif (stage 3)
+# Both are symlinks at /net/software/containers/users/woodbuse/, so
+# either name works. Override via TUNNEL_SIF=... env var if you have a
+# custom build. Final fallback is the system universal.sif (loses
+# pyKVFinder; homegrown ray-cast in tunnel_metrics still runs).
+SIF_CANON_NEW=/net/software/containers/users/woodbuse/protein_chisel_design.sif
+SIF_CANON_OLD=/net/software/containers/users/woodbuse/universal_with_tunnel_tools.sif
+if [[ -n "${TUNNEL_SIF:-}" && -e "$TUNNEL_SIF" ]]; then
     STAGE3_SIF="$TUNNEL_SIF"
-elif [[ -f "$SIF_CANON" ]]; then
-    STAGE3_SIF="$SIF_CANON"
-elif [[ -f "$SIF_SCRATCH" ]]; then
-    STAGE3_SIF="$SIF_SCRATCH"   # legacy NFS-propagation workaround
+elif [[ -e "$SIF_CANON_NEW" ]]; then
+    STAGE3_SIF="$SIF_CANON_NEW"
+elif [[ -e "$SIF_CANON_OLD" ]]; then
+    STAGE3_SIF="$SIF_CANON_OLD"
 else
     STAGE3_SIF=/net/software/containers/universal.sif
-    echo "WARN: tunnel-tools sif not found at canonical or fallback paths;"
-    echo "      using system universal.sif (--tunnel_metrics will skip pyKVFinder)"
+    echo "WARN: protein_chisel_design.sif not found; using system"
+    echo "      universal.sif (--tunnel_metrics will skip pyKVFinder)"
 fi
 echo "=== STAGE 3: iterative driver ($STAGE3_SIF) ==="
 apptainer exec --nv \
