@@ -123,7 +123,10 @@ def main() -> int:
         for name, err in summary["failures"]:
             print(f"  {name}: {err}")
 
-    if args.summary_json:
+    if args.summary_json and not args.minimal_layout:
+        # In minimal mode the summary is captured inside the embedded
+        # RUN_META block in chiseled_design_metrics.tsv, so the separate
+        # JSON file would just be noise in the otherwise-flat run_dir.
         args.summary_json.write_text(json.dumps(summary, indent=2, default=str))
 
     return 0 if summary["pdbs_failed"] == 0 else 1
