@@ -87,7 +87,7 @@ def main() -> int:
 
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s",
     )
 
     # protein_chisel must be importable

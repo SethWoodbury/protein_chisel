@@ -62,20 +62,41 @@ def detect_n_cpus() -> tuple[int, str]:
     return 1, "fallback"
 
 
-def detect_n_gpus() -> tuple[int, bool, str]:
+def detect_n_gpus(*, allow_torch_init: bool = False) -> tuple[int, bool, str]:
     """Return (n_gpus, has_torch_cuda, source).
 
-    First tries torch.cuda.device_count() if torch is importable; that
-    respects CUDA_VISIBLE_DEVICES. Falls back to `nvidia-smi -L` count.
+    Resolution order (fork-safe by default):
+      1. ``CUDA_VISIBLE_DEVICES`` env var — counts comma-separated entries.
+         Set by both Slurm (when --gres=gpu:N) and manual launches.
+      2. Slurm GPU env vars (``SLURM_GPUS_ON_NODE``, ``SLURM_JOB_GPUS``).
+      3. ``nvidia-smi -L`` subprocess — does NOT initialize CUDA in the
+         parent process.
+      4. ``torch.cuda.device_count()`` — LAST RESORT, only when
+         ``allow_torch_init=True``. Calling ``torch.cuda.is_available()``
+         in a long-lived parent that later forks (e.g. for
+         multiprocessing.Pool) is fork-unsafe and is the leading
+         hypothesis behind the catastrophic fpocket-collapse-en-masse
+         mode observed on GPU nodes (codex deep-dive 2026-05-06).
+
+    ``has_torch_cuda`` is only True when path 4 actually ran and
+    succeeded; the env-var paths cannot tell whether torch will work.
+    Callers that care about the torch-cuda flag (e.g. the LigandMPNN
+    sampler) should set ``allow_torch_init=True`` explicitly, AND only
+    do so AFTER all parallel CPU stages are done.
     """
-    try:
-        import torch
-        if torch.cuda.is_available():
-            return int(torch.cuda.device_count()), True, "torch"
-    except ImportError:
-        pass
-    except Exception:    # cuda init can throw; treat as no GPU
-        pass
+    # 1. CUDA_VISIBLE_DEVICES (most authoritative when set)
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cvd is not None and cvd.strip() and cvd.strip() != "-1":
+        # comma-separated; empty entries skipped
+        ids = [s for s in cvd.split(",") if s.strip()]
+        if ids:
+            return len(ids), False, "CUDA_VISIBLE_DEVICES"
+    # 2. Slurm-set GPU env (fallback when CUDA_VISIBLE_DEVICES isn't set)
+    for v in ("SLURM_GPUS_ON_NODE", "SLURM_GPUS_PER_TASK", "SLURM_JOB_GPUS"):
+        s = os.environ.get(v, "").strip()
+        if s and s.isdigit() and int(s) > 0:
+            return int(s), False, v
+    # 3. nvidia-smi -L (subprocess; does not init CUDA in this process)
     if shutil.which("nvidia-smi"):
         try:
             out = subprocess.check_output(
@@ -86,13 +107,34 @@ def detect_n_gpus() -> tuple[int, bool, str]:
                 return count, False, "nvidia-smi"
         except Exception:
             pass
+    # 4. torch (opt-in only; risks fork-after-CUDA-init landmine)
+    if allow_torch_init:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return int(torch.cuda.device_count()), True, "torch"
+        except ImportError:
+            pass
+        except Exception:
+            pass
     return 0, False, "none"
 
 
-def detect_resources(*, log: bool = True) -> ResourceInfo:
-    """One-shot detection of CPU + GPU resources."""
+def detect_resources(
+    *, log: bool = True, allow_torch_init: bool = False,
+) -> ResourceInfo:
+    """One-shot detection of CPU + GPU resources.
+
+    ``allow_torch_init`` defaults to False: GPU count is resolved from
+    env vars / nvidia-smi instead of torch.cuda.is_available(). This
+    keeps the parent process fork-safe when later stages use
+    multiprocessing.Pool. Pass ``allow_torch_init=True`` ONLY when
+    every parallel-CPU stage that uses fork() is already done.
+    """
     n_cpus, src_cpu = detect_n_cpus()
-    n_gpus, has_torch_cuda, src_gpu = detect_n_gpus()
+    n_gpus, has_torch_cuda, src_gpu = detect_n_gpus(
+        allow_torch_init=allow_torch_init,
+    )
     info = ResourceInfo(
         n_cpus=n_cpus, n_gpus=n_gpus, has_torch_cuda=has_torch_cuda,
         source_cpu=src_cpu, source_gpu=src_gpu,

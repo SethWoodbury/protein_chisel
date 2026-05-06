@@ -225,7 +225,13 @@ def _load_atoms(
             for line in fh:
                 if not line.startswith("HETATM"):
                     continue
-                rn = line[17:20].strip()
+                # 5-char-safe slice: standard PDB resname is line[17:20]
+                # (3 chars), but Rosetta writes 4-char names like HIS_D
+                # (neutral histidine D-protomer) into the same column,
+                # bleeding into line[20]. Use line[16:21].strip() to
+                # capture the full token. (HETATM ligands are normally
+                # 3-char so this slice doesn't change behavior there.)
+                rn = line[16:21].strip()
                 if rn in {"HOH", "WAT", "DOD", "TIP", "TIP3"}:
                     continue
                 ch = line[21:22]
@@ -253,7 +259,8 @@ def _load_atoms(
             except ValueError:
                 continue
             atom_name = line[12:16].strip()
-            resname = line[17:20].strip()
+            # 5-char-safe (Rosetta 'HIS_D' etc.) — see comment above.
+            resname = line[16:21].strip()
             ch = line[21:22]
             try:
                 rno = int(line[22:26])
@@ -776,6 +783,57 @@ def score_tunnels(
 # ---------------------------------------------------------------------------
 
 
+def _write_sanitized_pdb_for_pykvfinder(pdb_path: str | Path) -> Path:
+    """Write a temporary PDB with Rosetta-extended residue names truncated
+    to standard 3-char so pyKVFinder's hardcoded `line[17:20]` parser
+    sees the correct identity.
+
+    Rosetta packs 4-5 char names (HIS_D, HIS_E, HIS_P, CYS_C, ...) into
+    cols 16-20, eating the altloc + post-resname blank. pyKVFinder reads
+    only cols 17-19, so 'HIS_D' becomes 'IS_' (no leading H) and looks
+    like an unknown residue.
+
+    Sanitization rewrites cols 16-20 to standard layout:
+        col 16     = ' ' (altloc)
+        col 17-19  = 3-char resname (truncated at first underscore)
+        col 20     = ' '
+    Chain at col 21 is preserved unchanged.
+
+    Returns the original path if no sanitization needed; else a temp
+    file path. Caller is responsible for cleanup of the temp file.
+    """
+    pdb_path = Path(pdb_path)
+    with open(pdb_path) as fh:
+        text = fh.read()
+    # Quick scan: any ATOM/HETATM line whose cols 16-20 contain '_'?
+    # This is the Rosetta-extended-name marker we care about.
+    needs = False
+    for line in text.splitlines():
+        if (line.startswith("ATOM") or line.startswith("HETATM")) and len(line) >= 21:
+            if "_" in line[16:21]:
+                needs = True
+                break
+    if not needs:
+        return pdb_path
+
+    out_lines: list[str] = []
+    for line in text.split("\n"):
+        if (line.startswith("ATOM") or line.startswith("HETATM")) and len(line) >= 21:
+            full = line[16:21].strip()
+            three = full.split("_", 1)[0][:3].ljust(3)
+            line = line[:16] + " " + three + " " + line[21:]
+        out_lines.append(line)
+
+    import tempfile, os as _os
+    fd, tmp_path = tempfile.mkstemp(
+        suffix="_pkvf.pdb", prefix=pdb_path.stem + "_"
+    )
+    _os.close(fd)
+    with open(tmp_path, "w") as fh:
+        fh.write("\n".join(out_lines))
+    return Path(tmp_path)
+
+
 def pyKVFinder_score(
     pdb_path: str | Path,
     catalytic_resnos: Iterable[int],
@@ -846,8 +904,24 @@ def pyKVFinder_score(
          float(cat_centroid[2] + box_padding)),
     )
 
-    # pyKVFinder 0.9 requires `vertices` (an explicit grid box) for detect()
-    atomic = pyKVFinder.read_pdb(str(pdb_path))
+    # pyKVFinder 0.9 requires `vertices` (an explicit grid box) for detect().
+    # Sanitize Rosetta-extended residue names (HIS_D, HIS_E, HIS_P, etc.)
+    # before pyKVFinder reads the file: pyKVFinder hardcodes line[17:20]
+    # (3-char) for resname, so Rosetta 'HIS_D' becomes 'IS_' there,
+    # producing "Atom CA of residue IS_ not found in dictionary" warnings
+    # and using generic vdw radii for histidines instead of their actual
+    # vdw set. Sanitization writes a temp PDB with HIS_D->HIS etc.
+    # The file is only needed for read_pdb(); after that, pyKVFinder
+    # operates on the in-memory `atomic` table.
+    sanitized_pdb = _write_sanitized_pdb_for_pykvfinder(pdb_path)
+    try:
+        atomic = pyKVFinder.read_pdb(str(sanitized_pdb))
+    finally:
+        if str(sanitized_pdb) != str(pdb_path):
+            try:
+                Path(sanitized_pdb).unlink()
+            except FileNotFoundError:
+                pass
     vertices = pyKVFinder.get_vertices(atomic, probe_out=probe_out, step=0.6)
     ncav, cavities = pyKVFinder.detect(
         atomic, vertices,

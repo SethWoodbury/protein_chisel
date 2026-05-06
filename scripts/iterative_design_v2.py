@@ -2142,9 +2142,42 @@ def stage_fpocket_rank(
         # Small pool / serial path — avoids Pool startup overhead.
         infos = dict(_fpocket_worker(a) for a in work_args)
     else:
-        from multiprocessing import Pool
-        with Pool(n_workers) as pool:
-            infos = dict(pool.map(_fpocket_worker, work_args, chunksize=1))
+        # ThreadPoolExecutor (NOT multiprocessing.Pool): fpocket is an
+        # external subprocess so workers are I/O-bound launchers; threads
+        # are sufficient. Critically, threads avoid fork-after-CUDA-init
+        # — the leading hypothesis for the catastrophic fpocket-collapse
+        # mode where fpocket binaries exit -6 (SIGABRT) en masse on GPU
+        # nodes after stage 2/3 has touched torch.cuda. (Codex deep-dive
+        # 2026-05-06 verified that isolated stage_fpocket_rank() succeeds
+        # on the same inputs that failed during the long-lived run.)
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            infos = dict(pool.map(_fpocket_worker, work_args))
+
+    # Retry any failed designs once serially. Transient subprocess flakes
+    # are common (rc=-6 often goes away on a clean retry); a single
+    # serial pass before declaring failure prevents a flake-induced
+    # whole-batch zero-druggability collapse.
+    failed_cids = [cid for cid, inf in infos.items() if inf is None]
+    if failed_cids:
+        LOGGER.warning(
+            "stage_fpocket_rank: %d/%d designs failed in parallel pass; "
+            "retrying serially", len(failed_cids), len(infos),
+        )
+        retry_recovered = 0
+        for arg in work_args:
+            cid_, pdb_, out_, cat_, chain_ = arg
+            if cid_ not in failed_cids:
+                continue
+            _, info2 = _fpocket_worker(arg)
+            if info2 is not None:
+                infos[cid_] = info2
+                retry_recovered += 1
+        n_still_failed = len(failed_cids) - retry_recovered
+        LOGGER.info(
+            "stage_fpocket_rank: retry recovered %d/%d (still failed: %d)",
+            retry_recovered, len(failed_cids), n_still_failed,
+        )
 
     rows = []
     for _, row in df.iterrows():
@@ -2164,17 +2197,33 @@ def stage_fpocket_rank(
         )
         rows.append({
             **row.to_dict(),
-            # ---- existing core metrics (unchanged) -----------------
-            "fpocket__druggability": _g("druggability_score", 0.0),
-            "fpocket__volume": _g("volume", 0.0),
+            # ---- run status (NEW: distinguishes "tool failed" from
+            #      "real low-druggability pocket") --------------------
+            #
+            # When fpocket subprocess fails, biological metrics are NaN
+            # (NOT 0.0 — that would silently encode tool failures as
+            # rejected designs and let a transient flake delete the
+            # whole batch via the final druggability >= cutoff filter).
+            # Inspect fpocket__status / fpocket__returncode to tell
+            # tool-failure apart from genuine low-druggability designs.
+            "fpocket__status": "ok" if info else "failed",
+            # ---- existing core metrics (NaN on tool failure) -------
+            "fpocket__druggability": _g("druggability_score"),
+            "fpocket__volume": _g("volume"),
             "fpocket__mean_alpha_sphere_radius":
-                _g("mean_alpha_sphere_radius", 0.0),
-            "fpocket__alpha_sphere_density": _g("alpha_sphere_density", 0.0),
+                _g("mean_alpha_sphere_radius"),
+            "fpocket__alpha_sphere_density": _g("alpha_sphere_density"),
             "fpocket__n_alpha_spheres_near_catalytic":
-                _g("n_alpha_spheres_near_catalytic", 0),
+                _g("n_alpha_spheres_near_catalytic"),
             "fpocket__mean_alpha_sphere_dist_to_catalytic":
                 _g("mean_alpha_sphere_dist_to_catalytic"),
-            "fpocket__n_pockets_found": 1 if info else 0,
+            # Legacy presence flag (1 = a pocket was successfully selected,
+            # NaN = fpocket itself failed). Despite the name it is not the
+            # raw fpocket pocket count; downstream code already treats it
+            # as a presence indicator. fpocket__status now does the same
+            # job with clearer semantics — keeping the column for back-
+            # compat with existing notebooks.
+            "fpocket__n_pockets_found": 1 if info else float("nan"),
             # ---- pocket character (info.txt) -----------------------
             "fpocket__score": _g("score"),
             "fpocket__n_alpha_spheres": _g("number_of_alpha_spheres"),
@@ -2695,6 +2744,10 @@ def run_cycle(
     cycle_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- 0. Build cycle-k bias --------------------------------------
+    LOGGER.info("")
+    LOGGER.info("================================================================")
+    LOGGER.info("===  CYCLE %d  ==================================================", cycle_idx)
+    LOGGER.info("================================================================")
     bias_dir = cycle_dir / "00_bias"
     bias_dir.mkdir(exist_ok=True)
     if survivors_prev is None or len(survivors_prev) == 0:
@@ -2838,7 +2891,7 @@ def run_cycle(
             seed=cycle_seed,
         )
     LOGGER.info(
-        "cycle %d: diversity-omit at first-shell = %s",
+        "cycle %d: diversity-omit at primary+secondary shell = %s",
         cycle_cfg.cycle_idx, diversity_omit,
     )
     merged_omit = merge_omit_dicts(omit_AA_per_residue or {}, diversity_omit)
@@ -3337,7 +3390,7 @@ def main() -> None:
     )
     logging.basicConfig(
         level=log_level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s",
     )
 
     # Auto-derive catalytic resnos from the seed's REMARK 666 block. This
@@ -3917,6 +3970,35 @@ def main() -> None:
                 "fpocket-druggability filter: %d -> %d (cutoff=%.2f)",
                 n_before, len(pool), druggability_min,
             )
+            if len(pool) == 0:
+                # Empty-pool exit: write a stub manifest + empty TSV so
+                # downstream stages can detect the no-results state
+                # without crashing in TOPSIS min/max. Common cause: every
+                # design fell below druggability cutoff (often a sign
+                # that fpocket failed for the whole batch — see
+                # fpocket__status / fpocket__returncode columns to
+                # distinguish "tool failed" from "real low druggability").
+                LOGGER.error(
+                    "All %d designs filtered out by fpocket-druggability >= %.2f. "
+                    "Writing empty final artifacts and exiting cleanly. "
+                    "Inspect cycle_NN/05_fpocket/ranked.tsv and "
+                    "fpocket__status/fpocket__returncode columns to "
+                    "diagnose whether fpocket failed or designs are "
+                    "genuinely low-druggability.",
+                    n_before, druggability_min,
+                )
+                pool.to_csv(final_dir / "all_survivors.tsv", sep="\t", index=False)
+                (final_dir / "topk_pdbs").mkdir(exist_ok=True)
+                manifest_stub = run_dir / "manifest.json"
+                if not manifest_stub.exists():
+                    import json as _json
+                    manifest_stub.write_text(_json.dumps(
+                        {"status": "EMPTY_POOL_AFTER_FPOCKET_FILTER",
+                         "n_before_filter": n_before,
+                         "druggability_cutoff": float(druggability_min)},
+                        indent=2,
+                    ))
+                return
         # ---- Multi-objective ranking over the full pool ---------------
         # TOPSIS over a configurable basket of metrics with CLI-tunable
         # weights / targets. Replaces the legacy 2-key (fitness,

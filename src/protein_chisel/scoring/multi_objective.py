@@ -221,6 +221,11 @@ def compute_topsis_scores_v2(
     Returns (scores, used_specs, debug_df). Specs whose column is missing
     from ``df`` are silently dropped with a warning.
     """
+    # Empty-pool guard: with zero rows there's nothing to rank, and
+    # _normalize_axis() does v.min()/v.max() which raises on empty
+    # arrays. Return empty results so callers can detect + skip cleanly.
+    if len(df) == 0:
+        return np.array([], dtype=float), [], pd.DataFrame()
     used: list[MetricSpec] = []
     cols_norm: list[np.ndarray] = []
     weights: list[float] = []

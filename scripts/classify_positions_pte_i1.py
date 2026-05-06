@@ -24,7 +24,7 @@ def main() -> None:
 
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s",
     )
     args.out_dir.mkdir(parents=True, exist_ok=True)
     out_tsv = args.out_dir / "positions.tsv"

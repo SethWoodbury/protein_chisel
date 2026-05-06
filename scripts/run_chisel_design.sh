@@ -46,15 +46,45 @@
 set -euo pipefail
 
 # === Portability ====================================================
-# REPO is auto-detected from this script's location, so any user can
-# `git clone` into their own home and the sbatch just works. Override
-# REPO=... only if you're calling this script from a different checkout.
-# Other site-specific paths (apptainer images, model weights at
-# /net/software, /net/databases) are CLUSTER-SHARED resources that any
-# user with read access can hit; nothing here writes into another
-# user's home.
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-REPO="${REPO:-$(dirname "$SCRIPT_DIR")}"
+# REPO is auto-detected from this script's location so any user can
+# `git clone` into their own home and the sbatch just works. Detection
+# is two-pronged because direct `sbatch <script>` copies the script to
+# /var/slurm/spool/, breaking BASH_SOURCE-based detection — but the
+# bash <script> pattern (used inside outer slurm array jobs, the
+# lab-standard) preserves it.
+#
+# Order of resolution:
+#   1. REPO=... if explicitly set by caller (always wins).
+#   2. BASH_SOURCE[0] dirname (works for `bash <full-path-to-script>`).
+#   3. SLURM_SUBMIT_DIR (works for `sbatch <script>` if user submitted
+#      from inside the repo checkout).
+#   4. Hard error with actionable hint.
+# A canary file (scripts/run_chisel_design.sh itself) is checked at
+# each candidate location to confirm it really is a protein_chisel
+# checkout before accepting it.
+_CANARY="scripts/run_chisel_design.sh"
+_validate_repo() { [[ -f "$1/$_CANARY" ]]; }
+
+if [[ -n "${REPO:-}" ]]; then
+    _validate_repo "$REPO" || { echo "ERROR: REPO=$REPO is not a protein_chisel checkout (no $_CANARY)" >&2; exit 1; }
+else
+    SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+    REPO_GUESS="$(dirname "$SCRIPT_DIR")"
+    if _validate_repo "$REPO_GUESS"; then
+        REPO="$REPO_GUESS"
+    elif [[ -n "${SLURM_SUBMIT_DIR:-}" ]] && _validate_repo "$SLURM_SUBMIT_DIR"; then
+        REPO="$SLURM_SUBMIT_DIR"
+    else
+        echo "ERROR: cannot auto-detect protein_chisel checkout." >&2
+        echo "  BASH_SOURCE -> $REPO_GUESS  (canary missing)" >&2
+        echo "  SLURM_SUBMIT_DIR -> ${SLURM_SUBMIT_DIR:-(unset)}" >&2
+        echo "  Fix: either run 'bash /full/path/to/run_chisel_design.sh', or" >&2
+        echo "       'sbatch run_chisel_design.sh' from inside the repo, or" >&2
+        echo "       set REPO=/path/to/protein_chisel explicitly." >&2
+        exit 1
+    fi
+fi
+echo "REPO=$REPO"
 
 # === Required inputs (per-design caller MUST set these) ============
 # Both names accepted at the sbatch surface (caller picks what reads
@@ -184,7 +214,10 @@ if [[ "$GPU_MODE" == CPU* ]]; then
 fi
 echo "================================================================"
 
-echo "=== STAGE 1: classify_positions (pyrosetta.sif) ==="
+echo
+echo "################################################################"
+echo "###  STAGE 1: classify_positions (pyrosetta.sif)             ###"
+echo "################################################################"
 apptainer exec \
     --bind "$REPO:/code" \
     --bind /net/software \
@@ -208,7 +241,11 @@ elif [[ -e "$PLM_SIF_NEW" ]]; then
 else
     STAGE2_SIF="$PLM_SIF_OLD"
 fi
-echo "=== STAGE 2: PLM logits + fusion ($STAGE2_SIF) ==="
+echo
+echo "################################################################"
+echo "###  STAGE 2: PLM logits + fusion                            ###"
+echo "###  sif: $STAGE2_SIF"
+echo "################################################################"
 apptainer exec "${NV_FLAGS[@]}" \
     --bind "$REPO:/code" \
     --bind /net/software \
@@ -250,7 +287,11 @@ else
     echo "WARN: protein_chisel_design.sif not found; using system"
     echo "      universal.sif (--tunnel_metrics will skip pyKVFinder)"
 fi
-echo "=== STAGE 3: iterative driver ($STAGE3_SIF) ==="
+echo
+echo "################################################################"
+echo "###  STAGE 3: iterative driver (sample / filter / score)     ###"
+echo "###  sif: $STAGE3_SIF"
+echo "################################################################"
 apptainer exec "${NV_FLAGS[@]}" \
     --bind "$REPO:/code" \
     --bind /net/software \
@@ -288,7 +329,11 @@ if [[ -z "$RUN_DIR" || ! -d "$RUN_DIR/final_topk/topk_pdbs" ]]; then
     echo "         skipping stage 4 (protonate). Run protonate_final_topk.py"
     echo "         manually if needed."
 else
-    echo "=== STAGE 4: protonate final top-K + shipping layout (pyrosetta.sif) ==="
+    echo
+    echo "################################################################"
+    echo "###  STAGE 4: protonate final top-K + shipping layout         ###"
+    echo "###  sif: pyrosetta.sif                                       ###"
+    echo "################################################################"
     echo "    run_dir = $RUN_DIR"
     # SAVE_INTERMEDIATES=1 to keep cycle_NN/ subtrees for diagnostics.
     # Default (unset): clean shipping layout — run_dir/designs/*.pdb +
