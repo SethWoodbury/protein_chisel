@@ -2757,7 +2757,7 @@ def run_cycle(
     # ---- 0. Build cycle-k bias --------------------------------------
     LOGGER.info("")
     LOGGER.info("================================================================")
-    LOGGER.info("===  CYCLE %d  ==================================================", cycle_idx)
+    LOGGER.info("===  CYCLE %d  ==================================================", cycle_cfg.cycle_idx)
     LOGGER.info("================================================================")
     bias_dir = cycle_dir / "00_bias"
     bias_dir.mkdir(exist_ok=True)
