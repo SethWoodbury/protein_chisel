@@ -61,14 +61,14 @@ LOGGER = logging.getLogger("iterative_design_v2")
 # Hard-coded constants for the PTE_i1 scaffold
 # ----------------------------------------------------------------------
 
-DEFAULT_INPUT_PDB = Path(
-    "/net/scratch/aruder2/projects/PTE_i1/af3_out/filtered_i1/ref_pdbs/"
-    "ZAPP_p1D1_rotP_1_ORI_11_C7_i_20_model_1__eV2_T0_20__8_1_FS269.pdb"
-)
-DEFAULT_LIG_PARAMS = Path(
-    "/home/woodbuse/testing_space/scaffold_optimization/"
-    "ZZZ_MERGED_PRELIM_FILTER_DIR_ZZZ/params/YYE.params"
-)
+# CLI defaults are intentionally None so the user must pass --seed_pdb /
+# --ligand_params explicitly (or set them via env vars in the sbatch
+# wrapper). The previous values pointed at woodbuse-private paths and
+# weren't portable. The sbatch wrapper enforces these as REQUIRED env
+# vars, so anyone using run_iterative_design_v2.sbatch already provides
+# them; this just removes the silent footgun for direct CLI users.
+DEFAULT_INPUT_PDB: Optional[Path] = None
+DEFAULT_LIG_PARAMS: Optional[Path] = None
 
 # REMARK 666 catalytic resnos (1-indexed PDB resseq) on chain A.
 # These default values match the PTE_i1 SEED1 (FS269) scaffold. They are
@@ -3045,8 +3045,11 @@ def run_cycle(
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--seed_pdb", type=Path, default=DEFAULT_INPUT_PDB)
-    p.add_argument("--ligand_params", type=Path, default=DEFAULT_LIG_PARAMS)
+    p.add_argument("--seed_pdb", type=Path, required=True,
+                   help="Path to the input PDB (with REMARK 666 catalytic "
+                        "motif lines; catres auto-derived).")
+    p.add_argument("--ligand_params", type=Path, required=True,
+                   help="Path to the Rosetta .params file for the ligand.")
     p.add_argument("--plm_artifacts_dir", type=Path, required=True)
     p.add_argument("--position_table", type=Path, required=True)
     p.add_argument("--out_root", type=Path, default=DEFAULT_OUT_ROOT)

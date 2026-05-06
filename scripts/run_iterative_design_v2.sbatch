@@ -54,13 +54,14 @@ REPO="${REPO:-$(dirname "$SCRIPT_DIR")}"
 #   default for the PTE_i1 substrate (YYE), but for any other ligand
 #   the caller MUST set LIG_PARAMS=...
 SEED_PDB="${SEED_PDB:?Set SEED_PDB to your input PDB (with REMARK 666)}"
-LIG_PARAMS="${LIG_PARAMS:-/home/woodbuse/testing_space/scaffold_optimization/ZZZ_MERGED_PRELIM_FILTER_DIR_ZZZ/params/YYE.params}"
+LIG_PARAMS="${LIG_PARAMS:?Set LIG_PARAMS to your ligand .params file}"
 TARGET_K="${TARGET_K:-50}"
 MIN_HAMMING="${MIN_HAMMING:-3}"
 N_CYCLES="${N_CYCLES:-3}"
-# AAs MPNN should never sample. PTE_i1 has no catalytic Cys, so we
-# exclude C as well as X (UNK) by default. Override per-scaffold.
-OMIT_AA="${OMIT_AA:-CX}"
+# AAs MPNN should never sample. Default 'X' = exclude UnknownX only.
+# Scaffolds with no catalytic Cys (e.g. PTE_i1) typically set 'CX' to
+# avoid spurious disulfides. Set per-scaffold.
+OMIT_AA="${OMIT_AA:-X}"
 
 # LigandMPNN side-chain-context flag. 0 (default) = MPNN sees only
 # backbone + ligand atoms. The clash failure mode (Y/F/W at clash-prone
@@ -76,13 +77,12 @@ USE_SIDE_CHAIN_CONTEXT="${USE_SIDE_CHAIN_CONTEXT:-0}"
 # ANNOTATION ONLY — residues are kept as their unmodified form for
 # Rosetta / sequence / protonation. PTM is metadata.
 #
-# Use the motif-index form so the spec stays stable across the design
-# campaign even when the catalytic-residue sequence position varies
-# between scaffolds. Format: 'CHAIN/EXPECTED_RESNAME/MOTIF_INDEX:PTM'.
-# PTE_i1: REMARK 666 motif index 3 is the catalytic Lys, which is
-# carbamylated (KCX) in the active form. Override per-scaffold by
-# setting PTM='' or PTM='A/LYS/3:KCX,A/HIS/1:MSE' etc.
-PTM="${PTM:-A/LYS/3:KCX}"
+# Default: empty (no PTM annotation). Set per-scaffold using motif-
+# index form 'CHAIN/EXPECTED_RESNAME/MOTIF_INDEX:CODE'. Example for
+# PTE_i1 (catalytic Lys at REMARK 666 motif index 3 is carbamylated):
+#   PTM='A/LYS/3:KCX'
+# Multiple: 'A/LYS/3:KCX,A/HIS/1:MSE'
+PTM="${PTM:-}"
 
 # Optional pLDDT-enhanced LigandMPNN checkpoint (--enhance flag).
 # Empty string = use the standard ligand_mpnn checkpoint. Available
@@ -168,22 +168,22 @@ apptainer exec --nv \
 
 # Stage 3 sif selection: prefer the user-built derivative that adds
 # pyKVFinder + RDKit on top of universal.sif (used by --tunnel_metrics).
-# Empirically /net/software/containers/users/woodbuse/ has slow NFS
-# metadata propagation to gpu-train compute nodes (newly built sifs
-# can take >1 hr to be visible there), so we prefer the /net/scratch
-# copy first — that filesystem is hot and propagates immediately.
-# Falls back to the canonical user-tools location, then to the system
-# universal.sif (which means pyKVFinder will be unavailable; the
-# homegrown ray-cast still runs in tunnel_metrics).
-SIF_SCRATCH=/net/scratch/woodbuse/sif/universal_with_tunnel_tools.sif
+# Canonical location is /net/software/containers/users/woodbuse/ —
+# world-readable on this cluster. Override via TUNNEL_SIF=... env var
+# if you have a custom build. Falls back to system universal.sif if
+# the tools sif isn't available (means pyKVFinder skipped — homegrown
+# ray-cast still runs).
 SIF_CANON=/net/software/containers/users/woodbuse/universal_with_tunnel_tools.sif
-if [[ -f "$SIF_SCRATCH" ]]; then
-    STAGE3_SIF="$SIF_SCRATCH"
+SIF_SCRATCH=/net/scratch/woodbuse/sif/universal_with_tunnel_tools.sif
+if [[ -n "${TUNNEL_SIF:-}" && -f "$TUNNEL_SIF" ]]; then
+    STAGE3_SIF="$TUNNEL_SIF"
 elif [[ -f "$SIF_CANON" ]]; then
     STAGE3_SIF="$SIF_CANON"
+elif [[ -f "$SIF_SCRATCH" ]]; then
+    STAGE3_SIF="$SIF_SCRATCH"   # legacy NFS-propagation workaround
 else
     STAGE3_SIF=/net/software/containers/universal.sif
-    echo "WARN: tunnel-tools sif not found at scratch or canonical paths;"
+    echo "WARN: tunnel-tools sif not found at canonical or fallback paths;"
     echo "      using system universal.sif (--tunnel_metrics will skip pyKVFinder)"
 fi
 echo "=== STAGE 3: iterative driver ($STAGE3_SIF) ==="

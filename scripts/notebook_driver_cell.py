@@ -37,13 +37,19 @@ REPO        = "/home/aruder2/codebase_projects/protein_chisel"   # YOUR git clon
 INPUT_DIR   = "/net/scratch/aruder2/projects/PTE_i1/af3_out/filtered_i1/ref_pdbs"
 OUTPUT_BASE = "/net/scratch/aruder2/projects/PTE_i1/chisel_out/i1__ref_pdbs"
 
-# Ligand .params file — REQUIRED. For PTE_i1 (YYE substrate):
+# Ligand .params file — REQUIRED. Update this path to wherever YOUR
+# ligand .params file lives. For PTE_i1 the substrate is YYE; for
+# other scaffolds use whatever ligand you docked into the seed.
 LIG_PARAMS = "/net/scratch/aruder2/projects/PTE_i1/refs/YYE.params"
 
 # ─── 2. Pipeline knobs (defaults are production-tested) ───────────────
-PTM_SPEC           = "A/LYS/3:KCX"   # motif-index PTM; '' to disable
-                                     # PTE_i1: motif idx 3 = catalytic Lys (KCX in active form)
-                                     # Format: 'CHAIN/EXPECTED_RESN/MOTIF_IDX:CODE'
+# Default: empty (no PTM annotation). Set per-scaffold:
+#   PTE_i1 example: "A/LYS/3:KCX"  (catalytic Lys at motif idx 3 is carbamylated)
+#   Format:         "CHAIN/EXPECTED_RESN/MOTIF_IDX:CODE"
+#   Multiple:       "A/LYS/3:KCX,A/HIS/1:MSE"
+# ANNOTATION ONLY: residue is kept as its unmodified form for Rosetta /
+# sequence / protonation; PTM is metadata in the output PDB's REMARK 668.
+PTM_SPEC           = ""              # set to e.g. "A/LYS/3:KCX" for PTE_i1
 TARGET_K           = 50              # final designs per PDB
 N_CYCLES           = 3               # iterative-design cycles
 MIN_HAMMING        = 3               # diversity floor in final top-K
