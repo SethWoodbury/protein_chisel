@@ -1733,41 +1733,86 @@ def reorganize_for_shipping(
                         proto_dir)
         return stats
 
-    # 1. Move/rename protonated PDBs to run_dir/designs/<id>.pdb
-    designs_dir = run_dir / pdb_subdir_name
-    designs_dir.mkdir(exist_ok=True)
-    pdb_id_to_path: dict[str, Path] = {}
+    # 1. Move/rename protonated PDBs.
+    # In MINIMAL mode, PDBs go directly under run_dir/ (flat layout).
+    # In standard mode, they go under run_dir/<pdb_subdir_name>/.
+    # ALSO: rename the LigandMPNN-internal "_lmpnn_<NNN>" suffix to
+    # "_chisel_<NNN>" so the brand reflects this codebase (protein_chisel)
+    # rather than the underlying sampler.
+    if minimal:
+        designs_dir = run_dir
+    else:
+        designs_dir = run_dir / pdb_subdir_name
+        designs_dir.mkdir(exist_ok=True)
+
+    def _rename_id(s: str) -> str:
+        """Rename '_lmpnn_NNN' -> '_chisel_NNN' in a string. Idempotent."""
+        return s.replace("_lmpnn_", "_chisel_")
+
+    pdb_id_to_path: dict[str, Path] = {}      # NEW (chisel) id -> path
+    pdb_id_old_to_new: dict[str, str] = {}    # OLD lmpnn id -> NEW chisel id
     for src in proto_dir.iterdir():
         if not (src.is_file() and src.name.endswith(".protonated.pdb")):
             continue
         # strip .protonated suffix; e.g. "FOO_lmpnn_004.protonated.pdb"
-        # -> "FOO_lmpnn_004.pdb"
+        # -> "FOO_lmpnn_004.pdb" -> rename to "FOO_chisel_004.pdb"
         new_name = src.name[: -len(".protonated.pdb")] + ".pdb"
-        dst = designs_dir / new_name
+        new_name_renamed = _rename_id(new_name)
+        dst = designs_dir / new_name_renamed
         _shutil.move(str(src), str(dst))
-        pdb_id_to_path[dst.stem] = dst
+        old_stem = new_name[: -len(".pdb")]   # FOO_lmpnn_004
+        new_stem = dst.stem                    # FOO_chisel_004
+        pdb_id_to_path[new_stem] = dst
+        pdb_id_old_to_new[old_stem] = new_stem
         stats["designs_moved"] += 1
 
-    # 2. Build designs.tsv from topk.tsv + a pdb_path column
+    # 2. Build the metrics TSV.
+    # Filename is 'chiseled_design_metrics.tsv' (verbose-but-clear) — easy
+    # to glob across many runs in jupyterhub. The legacy 'designs.tsv' name
+    # is no longer written.
+    metrics_filename = "chiseled_design_metrics.tsv"
     if topk_tsv.is_file():
         try:
             import pandas as _pd
             df = _pd.read_csv(topk_tsv, sep="\t")
+            # Rename the id column from "_lmpnn_NNN" to "_chisel_NNN" so it
+            # matches the on-disk PDB names.
             if "id" in df.columns:
+                df["id"] = df["id"].astype(str).map(_rename_id)
                 df["pdb_path"] = df["id"].map(
                     lambda i: str(pdb_id_to_path[i]) if i in pdb_id_to_path else ""
                 )
-            df.to_csv(run_dir / "designs.tsv", sep="\t", index=False)
+            # Add a couple of run-identifier columns that make multi-run
+            # concat in a notebook trivial: filter / groupby on these.
+            try:
+                with open(run_dir / "manifest.json") as _f:
+                    _m = _json.load(_f)
+                seed = _m.get("seed_pdb", "")
+                df["seed_pdb"] = seed
+                df["seed_basename"] = Path(seed).stem if seed else ""
+                df["run_dir"] = str(run_dir)
+            except Exception:
+                pass
+            df.to_csv(run_dir / metrics_filename, sep="\t", index=False)
             stats["designs_tsv_rows"] = len(df)
         except Exception as exc:
             LOGGER.warning("reorganize_for_shipping: could not write "
-                            "designs.tsv (%s); falling back to copying topk.tsv",
-                            exc)
-            _shutil.copy2(topk_tsv, run_dir / "designs.tsv")
+                            "%s (%s); falling back to copying topk.tsv",
+                            metrics_filename, exc)
+            _shutil.copy2(topk_tsv, run_dir / metrics_filename)
 
-    # 3. Promote topk.fasta -> designs.fasta
-    if topk_fasta.is_file():
-        _shutil.copy2(topk_fasta, run_dir / "designs.fasta")
+    # 3. Promote topk.fasta — but RENAME ids inside it too, and only in
+    # standard layout (minimal layout drops fasta entirely below).
+    if topk_fasta.is_file() and not minimal:
+        try:
+            with open(topk_fasta) as _src, open(run_dir / "designs.fasta", "w") as _dst:
+                for ln in _src:
+                    if ln.startswith(">"):
+                        _dst.write(_rename_id(ln))
+                    else:
+                        _dst.write(ln)
+        except Exception:
+            _shutil.copy2(topk_fasta, run_dir / "designs.fasta")
 
     # 4. Remove heavy intermediates (default for shipping layout)
     if strip_intermediates:
@@ -1803,7 +1848,7 @@ def reorganize_for_shipping(
                 m = _json.load(f)
             m.setdefault("outputs", {})
             m["outputs"]["designs_dir"] = str(designs_dir)
-            m["outputs"]["designs_tsv"] = str(run_dir / "designs.tsv")
+            m["outputs"]["designs_tsv"] = str(run_dir / "chiseled_design_metrics.tsv")
             m["outputs"]["designs_fasta"] = str(run_dir / "designs.fasta")
             m["shipping_layout"] = True
             m["intermediates_stripped"] = bool(strip_intermediates)
@@ -1813,11 +1858,11 @@ def reorganize_for_shipping(
             LOGGER.warning("reorganize_for_shipping: manifest update failed: %s",
                             exc)
 
-    # 6. Minimal layout: collapse to JUST {designs/, designs.tsv}.
-    # Embed manifest + cycle_metrics + throat telemetry as a commented
-    # JSON header at the top of designs.tsv (lines starting with "#" are
-    # standard pandas read_csv comment syntax — pass `comment="#"` to
-    # pd.read_csv to skip them transparently). Drops the auxiliary files.
+    # 6. Minimal layout: collapse to a SINGLE FLAT directory containing
+    # ONLY the PDBs and chiseled_design_metrics.tsv (with embedded
+    # RUN_META JSON header on the first line). Drops every aux file.
+    # PDBs are already in run_dir/ at this point because we used
+    # designs_dir = run_dir for minimal mode (step 1).
     if minimal:
         # Collect all meta JSON contents into a single dict
         meta_payload: dict = {}
@@ -1834,28 +1879,29 @@ def reorganize_for_shipping(
                                     p.name, exc)
 
         # Prepend meta as a `# RUN_META: <single-line-json>` comment at
-        # top of designs.tsv. One line keeps it pandas-friendly.
-        designs_tsv = run_dir / "designs.tsv"
-        if designs_tsv.is_file() and meta_payload:
+        # the top of chiseled_design_metrics.tsv (pandas-friendly with
+        # comment='#'). One line keeps it grep- and column-tool-friendly.
+        metrics_tsv = run_dir / metrics_filename
+        if metrics_tsv.is_file() and meta_payload:
             try:
                 meta_blob = _json.dumps(meta_payload, default=str,
                                          separators=(",", ":"))
-                body = designs_tsv.read_text()
-                with open(designs_tsv, "w") as f:
+                body = metrics_tsv.read_text()
+                with open(metrics_tsv, "w") as f:
                     f.write(f"# RUN_META: {meta_blob}\n")
                     f.write(body)
                 LOGGER.info(
                     "minimal_layout: prepended %d-byte RUN_META JSON "
-                    "header to designs.tsv (read with "
+                    "header to %s (read with "
                     "pd.read_csv(path, sep='\\t', comment='#'))",
-                    len(meta_blob),
+                    len(meta_blob), metrics_filename,
                 )
             except Exception as exc:
                 LOGGER.warning("minimal_layout: could not write meta header: %s",
                                 exc)
 
-        # Strip every aux file — designs/ + designs.tsv is the ONLY
-        # output. Reproducibility is preserved via the embedded RUN_META.
+        # Strip every aux file. Reproducibility is preserved via the
+        # embedded RUN_META.
         for fname in (
             "manifest.json", "cycle_metrics.tsv", "cycle_metrics.json",
             "throat_blocker_telemetry.json", "protonation_summary.json",
@@ -1869,7 +1915,9 @@ def reorganize_for_shipping(
                 except Exception:
                     pass
         LOGGER.info(
-            "minimal_layout: final tree = run_dir/{designs/, designs.tsv} only"
+            "minimal_layout: final tree = flat run_dir/ with N PDBs + "
+            "chiseled_design_metrics.tsv (RUN_META embedded as "
+            "first-line comment); no subdirectories, no aux JSON files"
         )
 
     LOGGER.info(
