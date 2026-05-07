@@ -45,6 +45,148 @@
 
 set -euo pipefail
 
+_parse_bool_cli_value() {
+    case "${1,,}" in
+        1|true|t|yes|y|on)  echo 1 ;;
+        0|false|f|no|n|off) echo 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+_detect_node_scratch_base() {
+    local candidate=""
+    if [[ -n "${SLURM_TMPDIR:-}" ]]; then
+        candidate="${SLURM_TMPDIR%/}"
+        mkdir -p "$candidate" 2>/dev/null || true
+        [[ -d "$candidate" && -w "$candidate" ]] && { echo "SLURM_TMPDIR|$candidate"; return 0; }
+    fi
+    if [[ -n "${TMPDIR:-}" ]]; then
+        candidate="${TMPDIR%/}"
+        mkdir -p "$candidate" 2>/dev/null || true
+        [[ -d "$candidate" && -w "$candidate" ]] && { echo "TMPDIR|$candidate"; return 0; }
+    fi
+    candidate="/tmp/${USER}"
+    mkdir -p "$candidate" 2>/dev/null || true
+    [[ -d "$candidate" && -w "$candidate" ]] && { echo "/tmp/user|$candidate"; return 0; }
+    candidate="/tmp"
+    [[ -d "$candidate" && -w "$candidate" ]] && { echo "/tmp|$candidate"; return 0; }
+    return 1
+}
+
+_rewrite_published_paths() {
+    local metrics_path="$1"
+    local manifest_path="$2"
+    local old_run_dir="$3"
+    local new_run_dir="$4"
+    python3 - "$metrics_path" "$manifest_path" "$old_run_dir" "$new_run_dir" <<'PY'
+import csv
+import json
+import sys
+from pathlib import Path
+
+metrics_path = Path(sys.argv[1])
+manifest_path = Path(sys.argv[2])
+old = sys.argv[3]
+new = sys.argv[4]
+
+def replace_obj(obj):
+    if isinstance(obj, str):
+        return obj.replace(old, new) if old in obj else obj
+    if isinstance(obj, list):
+        return [replace_obj(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: replace_obj(v) for k, v in obj.items()}
+    return obj
+
+if metrics_path.is_file():
+    lines = metrics_path.read_text().splitlines()
+    meta_line = None
+    data_lines = lines
+    if lines and lines[0].startswith("# RUN_META: "):
+        payload = json.loads(lines[0][len("# RUN_META: "):])
+        payload = replace_obj(payload)
+        meta_line = "# RUN_META: " + json.dumps(payload, default=str, separators=(",", ":"))
+        data_lines = lines[1:]
+    if data_lines:
+        reader = csv.DictReader(data_lines, delimiter="\t")
+        fieldnames = reader.fieldnames or []
+        rows = []
+        for row in reader:
+            rows.append({
+                key: (value.replace(old, new) if isinstance(value, str) and old in value else value)
+                for key, value in row.items()
+            })
+        with open(metrics_path, "w", newline="") as fh:
+            if meta_line is not None:
+                fh.write(meta_line + "\n")
+            writer = csv.DictWriter(fh, fieldnames=fieldnames, delimiter="\t")
+            writer.writeheader()
+            writer.writerows(rows)
+
+if manifest_path.is_file():
+    payload = json.loads(manifest_path.read_text())
+    payload = replace_obj(payload)
+    manifest_path.write_text(json.dumps(payload, indent=2))
+PY
+}
+
+USE_NODE_LOCAL_SCRATCH_RAW="${USE_NODE_LOCAL_SCRATCH:-true}"
+USE_NODE_LOCAL_SCRATCH_CLI=""
+CLOBBER_EXISTING_OUTPUTS_RAW="${CLOBBER_EXISTING_OUTPUTS:-false}"
+CLOBBER_EXISTING_OUTPUTS_CLI=""
+COPY_INPUT_STRUCTURE_INTO_OUT_DIR_RAW="${COPY_INPUT_STRUCTURE_INTO_OUT_DIR:-true}"
+COPY_INPUT_STRUCTURE_INTO_OUT_DIR_CLI=""
+DRIVER_CLI_ARGS=()
+while (($#)); do
+    case "$1" in
+        --use-node-local-scratch|--use_node_local_scratch)
+            (($# >= 2)) || _die "$1 requires {true,false}"
+            USE_NODE_LOCAL_SCRATCH_CLI="$(_parse_bool_cli_value "$2")" \
+                || _die "invalid boolean for $1: $2"
+            shift 2
+            ;;
+        --clobber-existing-outputs|--clobber_existing_outputs)
+            (($# >= 2)) || _die "$1 requires {true,false}"
+            CLOBBER_EXISTING_OUTPUTS_CLI="$(_parse_bool_cli_value "$2")" \
+                || _die "invalid boolean for $1: $2"
+            shift 2
+            ;;
+        --copy-input-structure-into-out-dir|--copy_input_structure_into_out_dir)
+            (($# >= 2)) || _die "$1 requires {true,false}"
+            COPY_INPUT_STRUCTURE_INTO_OUT_DIR_CLI="$(_parse_bool_cli_value "$2")" \
+                || _die "invalid boolean for $1: $2"
+            shift 2
+            ;;
+        *)
+            DRIVER_CLI_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+if [[ -n "$USE_NODE_LOCAL_SCRATCH_CLI" ]]; then
+    USE_NODE_LOCAL_SCRATCH_BOOL="$USE_NODE_LOCAL_SCRATCH_CLI"
+else
+    USE_NODE_LOCAL_SCRATCH_BOOL="$(_parse_bool_cli_value "$USE_NODE_LOCAL_SCRATCH_RAW")" \
+        || _die "invalid USE_NODE_LOCAL_SCRATCH value: $USE_NODE_LOCAL_SCRATCH_RAW"
+fi
+if [[ -n "$CLOBBER_EXISTING_OUTPUTS_CLI" ]]; then
+    CLOBBER_EXISTING_OUTPUTS_BOOL="$CLOBBER_EXISTING_OUTPUTS_CLI"
+else
+    CLOBBER_EXISTING_OUTPUTS_BOOL="$(_parse_bool_cli_value "$CLOBBER_EXISTING_OUTPUTS_RAW")" \
+        || _die "invalid CLOBBER_EXISTING_OUTPUTS value: $CLOBBER_EXISTING_OUTPUTS_RAW"
+fi
+if [[ -n "$COPY_INPUT_STRUCTURE_INTO_OUT_DIR_CLI" ]]; then
+    COPY_INPUT_STRUCTURE_INTO_OUT_DIR_BOOL="$COPY_INPUT_STRUCTURE_INTO_OUT_DIR_CLI"
+else
+    COPY_INPUT_STRUCTURE_INTO_OUT_DIR_BOOL="$(_parse_bool_cli_value "$COPY_INPUT_STRUCTURE_INTO_OUT_DIR_RAW")" \
+        || _die "invalid COPY_INPUT_STRUCTURE_INTO_OUT_DIR value: $COPY_INPUT_STRUCTURE_INTO_OUT_DIR_RAW"
+fi
+
 # === Portability ====================================================
 # REPO is auto-detected from this script's location so any user can
 # `git clone` into their own home and the sbatch just works. Detection
@@ -64,6 +206,60 @@ set -euo pipefail
 # checkout before accepting it.
 _CANARY="scripts/run_chisel_design.sh"
 _validate_repo() { [[ -f "$1/$_CANARY" ]]; }
+
+_remove_path_if_clobbering() {
+    local target="$1"
+    if [[ "$CLOBBER_EXISTING_OUTPUTS_BOOL" == "1" ]]; then
+        rm -rf "$target"
+        echo "WARN: clobber-existing-outputs removed $target"
+        return 0
+    fi
+    return 1
+}
+
+_purge_flat_output_root_if_clobbering() {
+    local target_root="$1"
+    if [[ "$CLOBBER_EXISTING_OUTPUTS_BOOL" != "1" ]]; then
+        return 0
+    fi
+    # Flat publish roots are expected to be per-input output directories.
+    # Purge only wrapper-owned top-level artifacts so reruns cannot leave
+    # stale PDBs/TSVs behind when a newer minimal-layout run intentionally
+    # omits files that an older run may have published.
+    if [[ ! -d "$target_root" ]]; then
+        return 0
+    fi
+    shopt -s nullglob
+    local owned_paths=(
+        "$target_root"/*.pdb
+        "$target_root"/chiseled_design_metrics.tsv
+        "$target_root"/designs.fasta
+        "$target_root"/manifest.json
+        "$target_root"/cycle_metrics.tsv
+        "$target_root"/cycle_metrics.json
+        "$target_root"/seed_tunnel_residues.tsv
+        "$target_root"/throat_blocker_telemetry.json
+        "$target_root"/protonation_summary.json
+        "$target_root"/cycle_*
+        "$target_root"/final_topk
+        "$target_root"/fusion_runtime
+        "$target_root"/_seed_fpocket_workspace
+        "$target_root"/run_*
+        "$target_root"/wrk_*
+    )
+    local removed_any=0
+    local path=""
+    for path in "${owned_paths[@]}"; do
+        if [[ -e "$path" ]]; then
+            rm -rf "$path"
+            removed_any=1
+        fi
+    done
+    shopt -u nullglob
+    if (( removed_any )); then
+        echo "INFO: clobber-existing-outputs purged prior flat outputs under $target_root"
+    fi
+}
 
 if [[ -n "${REPO:-}" ]]; then
     _validate_repo "$REPO" || { echo "ERROR: REPO=$REPO is not a protein_chisel checkout (no $_CANARY)" >&2; exit 1; }
@@ -164,17 +360,85 @@ SAPROT_MODEL="${SAPROT_MODEL:-saprot_1.3b}"
 #   OUTPUT_DIR=/net/scratch/aruder2/.../chisel_out/<pdb_stem> \
 #       bash scripts/run_chisel_design.sh
 WORK_ROOT="${WORK_ROOT:-${OUTPUT_DIR:-/net/scratch/$USER}}"
-mkdir -p "$WORK_ROOT"
+FINAL_ROOT="$WORK_ROOT"
+mkdir -p "$FINAL_ROOT"
 
-# Working dir for this job (ms + PID for collision safety with concurrent jobs)
+# Working/token names keep ms + PID for collision safety, but the visible
+# prefixes are shorter to reduce path length in nested tool workspaces.
 TS=$(python3 -c 'import datetime,os; t=datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]; print(f"{t}-pid{os.getpid()}")' 2>/dev/null || date +%Y%m%d-%H%M%S)
-WORK_DIR="$WORK_ROOT/chisel_design_${TS}"
+PIPELINE_ROOT="$FINAL_ROOT"
+NODE_SCRATCH_ACTIVE=0
+NODE_SCRATCH_SOURCE="disabled"
+NODE_SCRATCH_BASE=""
+if [[ "$USE_NODE_LOCAL_SCRATCH_BOOL" == "1" ]]; then
+    if SCRATCH_INFO="$(_detect_node_scratch_base)"; then
+        NODE_SCRATCH_SOURCE="${SCRATCH_INFO%%|*}"
+        NODE_SCRATCH_BASE="${SCRATCH_INFO#*|}"
+        PIPELINE_ROOT="$(mktemp -d "${NODE_SCRATCH_BASE%/}/protein_chisel_${USER}_XXXXXX")"
+        NODE_SCRATCH_ACTIVE=1
+    else
+        NODE_SCRATCH_SOURCE="unavailable-fallback"
+    fi
+fi
+WORK_DIR="$PIPELINE_ROOT/wrk_${TS}"
+PIPELINE_OUT_ROOT="$PIPELINE_ROOT"
 mkdir -p "$WORK_DIR"
 echo "=== work dir: $WORK_DIR ==="
 
 CLASSIFY_DIR="$WORK_DIR/classify"
 PLM_DIR="$WORK_DIR/plm_artifacts"
 mkdir -p "$CLASSIFY_DIR" "$PLM_DIR"
+
+_detect_alloc_cpus() {
+    if [[ "${SLURM_CPUS_PER_TASK:-}" =~ ^[0-9]+$ ]] && (( SLURM_CPUS_PER_TASK > 0 )); then
+        echo "$SLURM_CPUS_PER_TASK"
+        return
+    fi
+    if command -v python3 &>/dev/null; then
+        python3 - <<'PY'
+import os
+try:
+    print(len(os.sched_getaffinity(0)))
+except Exception:
+    print(os.cpu_count() or 1)
+PY
+        return
+    fi
+    if command -v nproc &>/dev/null; then
+        nproc
+        return
+    fi
+    echo 1
+}
+
+ALLOC_CPUS="$(_detect_alloc_cpus)"
+if [[ ! "$ALLOC_CPUS" =~ ^[0-9]+$ ]] || (( ALLOC_CPUS < 1 )); then
+    ALLOC_CPUS=1
+fi
+export SLURM_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-$ALLOC_CPUS}"
+
+THREAD_BUDGET="$ALLOC_CPUS"
+for v in \
+    OMP_NUM_THREADS \
+    OPENBLAS_NUM_THREADS \
+    MKL_NUM_THREADS \
+    BLIS_NUM_THREADS \
+    VECLIB_MAXIMUM_THREADS \
+    NUMEXPR_MAX_THREADS \
+    NUMEXPR_NUM_THREADS
+do
+    export "$v=$THREAD_BUDGET"
+    export "APPTAINERENV_${v}=$THREAD_BUDGET"
+done
+export APPTAINERENV_SLURM_CPUS_PER_TASK="$SLURM_CPUS_PER_TASK"
+
+ALLOC_MEM_MSG="unknown"
+if [[ "${SLURM_MEM_PER_NODE:-}" =~ ^[0-9]+$ ]]; then
+    ALLOC_MEM_MSG="${SLURM_MEM_PER_NODE}M"
+elif [[ "${SLURM_MEM_PER_CPU:-}" =~ ^[0-9]+$ ]]; then
+    ALLOC_MEM_MSG="$(( SLURM_MEM_PER_CPU * ALLOC_CPUS ))M"
+fi
+VISIBLE_GPUS="${CUDA_VISIBLE_DEVICES:-${SLURM_JOB_GPUS:-${SLURM_GPUS_ON_NODE:-0}}}"
 
 # Some pyrosetta.sif images export PYTHONNOUSERSITE — so PYTHONPATH alone
 # lets us put protein_chisel on the import path. The default container
@@ -204,8 +468,23 @@ elif command -v nvidia-smi &>/dev/null && nvidia-smi -L 2>/dev/null | grep -q "G
 else
     GPU_MODE="CPU (no GPU detected)"
 fi
+if [[ "$VISIBLE_GPUS" == "0" && "$GPU_MODE" == GPU* ]] && command -v nvidia-smi &>/dev/null; then
+    GPU_COUNT=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ' || true)
+    if [[ "$GPU_COUNT" =~ ^[0-9]+$ ]] && (( GPU_COUNT > 0 )); then
+        VISIBLE_GPUS="${GPU_COUNT} (nvidia-smi)"
+    fi
+fi
 echo "================================================================"
 echo "  protein_chisel mode: $GPU_MODE"
+echo "  resource allocation: cpus=$ALLOC_CPUS mem=$ALLOC_MEM_MSG gpus=$VISIBLE_GPUS"
+echo "  thread budget: OMP/BLAS/NumExpr pinned to $THREAD_BUDGET"
+echo "  final output root: $FINAL_ROOT"
+if [[ "$NODE_SCRATCH_ACTIVE" == "1" ]]; then
+    echo "  node-local scratch: enabled ($NODE_SCRATCH_SOURCE -> $PIPELINE_ROOT)"
+else
+    echo "  node-local scratch: disabled/fallback ($NODE_SCRATCH_SOURCE)"
+fi
+echo "  clobber existing outputs: $([[ "$CLOBBER_EXISTING_OUTPUTS_BOOL" == "1" ]] && echo true || echo false)"
 if [[ "$GPU_MODE" == CPU* ]]; then
     echo "  CPU NOTE: stage 2 (ESM-C $ESMC_MODEL + SaProt $SAPROT_MODEL)"
     echo "  is ~10-14x slower than GPU. Benchmark 2026-05-04 (L=202,"
@@ -220,6 +499,7 @@ echo "###  STAGE 1: classify_positions (pyrosetta.sif)             ###"
 echo "################################################################"
 apptainer exec \
     --bind "$REPO:/code" \
+    --bind "$PIPELINE_ROOT" \
     --bind /net/software \
     --bind /net/scratch \
     --bind "$HOME" \
@@ -248,6 +528,7 @@ echo "###  sif: $STAGE2_SIF"
 echo "################################################################"
 apptainer exec "${NV_FLAGS[@]}" \
     --bind "$REPO:/code" \
+    --bind "$PIPELINE_ROOT" \
     --bind /net/software \
     --bind /net/databases \
     --bind /net/scratch \
@@ -294,6 +575,7 @@ echo "###  sif: $STAGE3_SIF"
 echo "################################################################"
 apptainer exec "${NV_FLAGS[@]}" \
     --bind "$REPO:/code" \
+    --bind "$PIPELINE_ROOT" \
     --bind /net/software \
     --bind /net/databases \
     --bind /net/scratch \
@@ -305,13 +587,15 @@ apptainer exec "${NV_FLAGS[@]}" \
         --ligand_params "$LIG_PARAMS" \
         --plm_artifacts_dir "$PLM_DIR" \
         --position_table "$CLASSIFY_DIR/positions.tsv" \
-        --out_root "$WORK_ROOT" \
+        --out_root "$PIPELINE_OUT_ROOT" \
         --target_k "$TARGET_K" \
         --min_hamming "$MIN_HAMMING" \
         --cycles "$N_CYCLES" \
         --omit_AA "$OMIT_AA" \
         --use_side_chain_context "$USE_SIDE_CHAIN_CONTEXT" \
+        --copy_input_structure_into_out_dir "$COPY_INPUT_STRUCTURE_INTO_OUT_DIR_BOOL" \
         --run_dir_marker "$WORK_DIR/run_dir.txt" \
+        "${DRIVER_CLI_ARGS[@]}" \
         ${PTM:+--ptm "$PTM"} \
         ${ENHANCE:+--enhance "$ENHANCE"} \
         ${EXTRA_DRIVER_FLAGS:-}
@@ -324,10 +608,14 @@ RUN_DIR=""
 if [[ -f "$WORK_DIR/run_dir.txt" ]]; then
     RUN_DIR=$(< "$WORK_DIR/run_dir.txt")
 fi
-if [[ -z "$RUN_DIR" || ! -d "$RUN_DIR/final_topk/topk_pdbs" ]]; then
+if [[ -z "$RUN_DIR" || ! -d "$RUN_DIR" ]]; then
     echo "WARNING: could not locate stage 3 run dir from $WORK_DIR/run_dir.txt;"
     echo "         skipping stage 4 (protonate). Run protonate_final_topk.py"
     echo "         manually if needed."
+elif [[ ! -d "$RUN_DIR/final_topk/topk_pdbs" ]]; then
+    echo "WARNING: stage 3 completed but $RUN_DIR/final_topk/topk_pdbs is missing;"
+    echo "         skipping stage 4 (protonate). This usually means stage 3"
+    echo "         produced no materialized final top-K PDBs."
 else
     echo
     echo "################################################################"
@@ -350,6 +638,7 @@ else
     fi
     apptainer exec \
         --bind "$REPO:/code" \
+        --bind "$PIPELINE_ROOT" \
         --bind /net/software \
         --bind /net/scratch \
         --bind "$HOME" \
@@ -361,49 +650,138 @@ else
             --ligand_params "$LIG_PARAMS" \
             --out_dir "$RUN_DIR/final_topk/topk_pdbs_protonated" \
             --summary_json "$RUN_DIR/protonation_summary.json" \
+            --copy_input_structure_into_out_dir "$COPY_INPUT_STRUCTURE_INTO_OUT_DIR_BOOL" \
             $SHIPPING_FLAGS \
             ${PTM:+--ptm "$PTM"}
 fi
 
-# === Per-PDB-sweep consolidation ====================================
-# When the user pre-set WORK_ROOT to a PER-PDB output dir AND requested
-# MINIMAL mode, flatten the output one more level: move RUN_DIR's
-# contents up into WORK_ROOT and remove the (now empty) RUN_DIR +
-# WORK_DIR, so the final layout is exactly:
-#     WORK_ROOT/<pdb>_chisel_NNN.pdb         (N PDBs, flat)
-#     WORK_ROOT/chiseled_design_metrics.tsv  (1 TSV with embedded RUN_META)
-#
-# Triggered when CONSOLIDATE_TO_WORK_ROOT=1 (default ON when MINIMAL=1
-# AND WORK_ROOT was explicitly set by the caller — i.e. you're running
-# a sweep). Safe-guards:
-#   - skipped if WORK_ROOT was the default /net/scratch/$USER (since
-#     then collisions between concurrent runs are a real risk)
-#   - skipped if RUN_DIR doesn't exist (pipeline failed earlier)
-#   - skipped if the merge would clobber existing files
+# === Publish / consolidate ==========================================
+# The heavy pipeline can run on node-local scratch, but the final
+# published layout must remain stable and truthful from the caller's
+# OUTPUT_DIR perspective. After any publish/consolidation step we rewrite
+# embedded path fields inside chiseled_design_metrics.tsv (and its
+# # RUN_META header when present) from the staging run_dir to the final
+# destination so downstream notebooks don't point at deleted scratch.
 USER_DEFAULT_WORK_ROOT="/net/scratch/$USER"
+FLAT_FINAL_LAYOUT=0
 if [[ "${MINIMAL:-}" == "1" \
       && "${CONSOLIDATE_TO_WORK_ROOT:-1}" == "1" \
-      && "$WORK_ROOT" != "$USER_DEFAULT_WORK_ROOT" \
-      && -d "${RUN_DIR:-/nonexistent}" ]]; then
-    echo "=== CONSOLIDATE: $RUN_DIR/* -> $WORK_ROOT/ ==="
-    # Use a temp-then-rename to avoid mid-move racing
+      && "$FINAL_ROOT" != "$USER_DEFAULT_WORK_ROOT" ]]; then
+    FLAT_FINAL_LAYOUT=1
+fi
+PUBLISH_WORK_DIR=0
+if [[ "${MINIMAL:-}" != "1" || "${SAVE_INTERMEDIATES:-}" == "1" ]]; then
+    PUBLISH_WORK_DIR=1
+fi
+
+if [[ "$NODE_SCRATCH_ACTIVE" == "1" ]]; then
+    if [[ ! -d "${RUN_DIR:-/nonexistent}" ]]; then
+        echo "WARN: node-local publish skipped; RUN_DIR missing: ${RUN_DIR:-unset}"
+        echo "=== DONE -- scratch retained at $PIPELINE_ROOT ==="
+        exit 0
+    fi
+    if (( FLAT_FINAL_LAYOUT )); then
+        _purge_flat_output_root_if_clobbering "$FINAL_ROOT"
+        echo "=== PUBLISH: $RUN_DIR/* -> $FINAL_ROOT/ ==="
+        shopt -s dotglob nullglob
+        collision_count=0
+        for f in "$RUN_DIR"/*; do
+            bn=$(basename "$f")
+            if [[ -e "$FINAL_ROOT/$bn" ]]; then
+                if ! _remove_path_if_clobbering "$FINAL_ROOT/$bn"; then
+                    echo "WARN: publish collision at $FINAL_ROOT/$bn"
+                    collision_count=$((collision_count + 1))
+                fi
+            fi
+        done
+        if (( collision_count > 0 )); then
+            shopt -u dotglob nullglob
+            echo "WARN: refusing to publish over existing files; scratch kept at $PIPELINE_ROOT"
+            exit 0
+        fi
+        for f in "$RUN_DIR"/*; do
+            cp -a "$f" "$FINAL_ROOT/"
+        done
+        shopt -u dotglob nullglob
+        _rewrite_published_paths \
+            "$FINAL_ROOT/chiseled_design_metrics.tsv" \
+            "$FINAL_ROOT/manifest.json" \
+            "$RUN_DIR" \
+            "$FINAL_ROOT"
+        if (( PUBLISH_WORK_DIR )); then
+            FINAL_WORK_DIR="$FINAL_ROOT/$(basename "$WORK_DIR")"
+            if [[ -e "$FINAL_WORK_DIR" ]] && ! _remove_path_if_clobbering "$FINAL_WORK_DIR"; then
+                echo "WARN: publish collision at $FINAL_WORK_DIR; scratch kept at $PIPELINE_ROOT"
+                exit 0
+            fi
+            cp -a "$WORK_DIR" "$FINAL_WORK_DIR"
+            if [[ -f "$FINAL_WORK_DIR/run_dir.txt" ]]; then
+                printf '%s\n' "$FINAL_ROOT" > "$FINAL_WORK_DIR/run_dir.txt"
+            fi
+        fi
+        rm -rf "$PIPELINE_ROOT" 2>/dev/null || true
+        echo "=== DONE -- published flat outputs to $FINAL_ROOT ==="
+    else
+        FINAL_RUN_DIR="$FINAL_ROOT/$(basename "$RUN_DIR")"
+        if [[ -e "$FINAL_RUN_DIR" ]] && ! _remove_path_if_clobbering "$FINAL_RUN_DIR"; then
+            echo "WARN: publish collision at $FINAL_RUN_DIR; scratch kept at $PIPELINE_ROOT"
+            exit 0
+        fi
+        echo "=== PUBLISH: $RUN_DIR -> $FINAL_RUN_DIR ==="
+        cp -a "$RUN_DIR" "$FINAL_RUN_DIR"
+        _rewrite_published_paths \
+            "$FINAL_RUN_DIR/chiseled_design_metrics.tsv" \
+            "$FINAL_RUN_DIR/manifest.json" \
+            "$RUN_DIR" \
+            "$FINAL_RUN_DIR"
+        if (( PUBLISH_WORK_DIR )); then
+            FINAL_WORK_DIR="$FINAL_ROOT/$(basename "$WORK_DIR")"
+            if [[ -e "$FINAL_WORK_DIR" ]] && ! _remove_path_if_clobbering "$FINAL_WORK_DIR"; then
+                echo "WARN: publish collision at $FINAL_WORK_DIR; scratch kept at $PIPELINE_ROOT"
+                exit 0
+            fi
+            cp -a "$WORK_DIR" "$FINAL_WORK_DIR"
+            if [[ -f "$FINAL_WORK_DIR/run_dir.txt" ]]; then
+                printf '%s\n' "$FINAL_RUN_DIR" > "$FINAL_WORK_DIR/run_dir.txt"
+            fi
+        fi
+        rm -rf "$PIPELINE_ROOT" 2>/dev/null || true
+        echo "=== DONE -- published run dir to $FINAL_RUN_DIR ==="
+    fi
+elif (( FLAT_FINAL_LAYOUT )) && [[ -d "${RUN_DIR:-/nonexistent}" ]]; then
+    _purge_flat_output_root_if_clobbering "$FINAL_ROOT"
+    echo "=== CONSOLIDATE: $RUN_DIR/* -> $FINAL_ROOT/ ==="
     shopt -s dotglob nullglob
-    moved_any=0
+    collision_count=0
     for f in "$RUN_DIR"/*; do
         bn=$(basename "$f")
-        if [[ -e "$WORK_ROOT/$bn" ]]; then
-            echo "WARN: refusing to overwrite $WORK_ROOT/$bn — skipping"
-            continue
+        if [[ -e "$FINAL_ROOT/$bn" ]]; then
+            if ! _remove_path_if_clobbering "$FINAL_ROOT/$bn"; then
+                echo "WARN: consolidation collision at $FINAL_ROOT/$bn"
+                collision_count=$((collision_count + 1))
+            fi
         fi
-        mv "$f" "$WORK_ROOT/$bn"
+    done
+    if (( collision_count > 0 )); then
+        shopt -u dotglob nullglob
+        echo "WARN: refusing to consolidate over existing files; leaving $RUN_DIR intact"
+        exit 0
+    fi
+    moved_any=0
+    for f in "$RUN_DIR"/*; do
+        mv "$f" "$FINAL_ROOT/"
         moved_any=1
     done
     shopt -u dotglob nullglob
-    # Clean up empty timestamped dirs
     rmdir "$RUN_DIR" 2>/dev/null || true
     rm -rf "$WORK_DIR" 2>/dev/null || true
     if (( moved_any )); then
-        echo "=== DONE -- consolidated to $WORK_ROOT ==="
+        _rewrite_published_paths \
+            "$FINAL_ROOT/chiseled_design_metrics.tsv" \
+            "$FINAL_ROOT/manifest.json" \
+            "$RUN_DIR" \
+            "$FINAL_ROOT"
+        echo "=== DONE -- consolidated to $FINAL_ROOT ==="
     else
         echo "WARN: consolidation moved no files; check $RUN_DIR / $WORK_DIR"
     fi

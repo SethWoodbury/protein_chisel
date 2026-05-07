@@ -82,6 +82,20 @@ CATALYTIC_HIS_RESNOS = (60, 64, 128, 132)
 CHAIN = "A"
 
 
+def _parse_bool_arg(value: str | bool) -> bool:
+    """Parse a CLI boolean from common true/false spellings."""
+    if isinstance(value, bool):
+        return value
+    s = str(value).strip().lower()
+    if s in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(
+        f"expected boolean true/false for this flag, got {value!r}",
+    )
+
+
 def _derive_catres_from_remark_666(seed_pdb: Path | str) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """Read REMARK 666 from ``seed_pdb`` and return:
 
@@ -312,6 +326,38 @@ def default_cycles(
             **common,
         ),
     ]
+
+
+def debug_short_test_cycles(
+    omit_AA: str = "X",
+    use_side_chain_context: int = 0,
+    enhance: Optional[str] = None,
+    pi_min: float = 5.0,
+    pi_max: float = 7.5,
+    fpocket_druggability_min: float = 0.30,
+    clash_filter: bool = True,
+    strategy: str = "constant",
+    consensus_threshold: float = 0.85,
+    consensus_strength: float = 2.0,
+    consensus_max_fraction: float = 0.30,
+) -> list[CycleConfig]:
+    """Hardcoded fast smoke-test preset: 20/10/10 samples across 3 cycles."""
+    cycles = default_cycles(
+        omit_AA=omit_AA,
+        use_side_chain_context=use_side_chain_context,
+        enhance=enhance,
+        pi_min=pi_min,
+        pi_max=pi_max,
+        fpocket_druggability_min=fpocket_druggability_min,
+        clash_filter=clash_filter,
+        strategy=strategy,
+        consensus_threshold=consensus_threshold,
+        consensus_strength=consensus_strength,
+        consensus_max_fraction=consensus_max_fraction,
+    )
+    for cyc, n_samples in zip(cycles, (20, 10, 10)):
+        cyc.n_samples = n_samples
+    return cycles[:3]
 
 
 # ----------------------------------------------------------------------
@@ -935,6 +981,36 @@ def stage_seq_filter(
         n_warnings = len(eng_res.warnings)
         n_soft_bias = len(eng_res.soft_bias_hits)
         n_hard_omit = len(eng_res.hard_omit_hits)
+        # Preserve the discrete fail count, but also record how far the
+        # sequence sits beyond each numeric threshold. This lets final
+        # seq-stage backfill prefer near-misses over sequences that fail
+        # by a wide margin, without changing the production hard filters.
+        length_gap = abs(len(seq) - wt_length) / max(1, wt_length)
+        charge_high_gap = _normalized_upper_bound_gap(
+            pp.charge_at_pH_full_HH, net_charge_max,
+        )
+        charge_low_gap = _normalized_lower_bound_gap(
+            pp.charge_at_pH_full_HH, net_charge_min,
+        )
+        pi_gap = _normalized_interval_gap(pp.pi, pi_min, pi_max)
+        instability_gap = _normalized_upper_bound_gap(
+            pp.instability_index, instability_max,
+        )
+        gravy_gap = _normalized_interval_gap(pp.gravy, gravy_min, gravy_max)
+        aliphatic_gap = _normalized_lower_bound_gap(
+            pp.aliphatic_index, aliphatic_min,
+        )
+        boman_gap = _normalized_upper_bound_gap(pp.boman_index, boman_max)
+        seq_filter_numeric_gap = float(
+            length_gap
+            + charge_high_gap
+            + charge_low_gap
+            + pi_gap
+            + instability_gap
+            + gravy_gap
+            + aliphatic_gap
+            + boman_gap
+        )
 
         rows.append({
             **row.to_dict(),
@@ -966,6 +1042,15 @@ def stage_seq_filter(
             "n_expression_soft_bias_hits": n_soft_bias,
             "n_expression_hard_omit_hits": n_hard_omit,
             "n_expression_hard_filter_hits": len(eng_res.hard_filter_hits),
+            "selection__seq_filter_numeric_gap": seq_filter_numeric_gap,
+            "selection__seq_filter_gap_length": length_gap,
+            "selection__seq_filter_gap_charge_high": charge_high_gap,
+            "selection__seq_filter_gap_charge_low": charge_low_gap,
+            "selection__seq_filter_gap_pi": pi_gap,
+            "selection__seq_filter_gap_instability": instability_gap,
+            "selection__seq_filter_gap_gravy": gravy_gap,
+            "selection__seq_filter_gap_aliphatic": aliphatic_gap,
+            "selection__seq_filter_gap_boman": boman_gap,
             "expression_rule_summary": ";".join(
                 f"{h.rule_name}={h.severity.name}" for h in eng_res.hits
             ),
@@ -1585,8 +1670,15 @@ def _run_fpocket(
 ) -> Optional[dict]:
     """Run fpocket and pick the pocket containing the active site.
 
-    fpocket has a buffer overflow on long filenames so we copy to
-    ``design.pdb`` inside work_dir before invoking.
+    fpocket has a buffer overflow on long input-path strings, not just
+    long basenames. So we must do BOTH:
+      1. copy to a short local filename (``design.pdb``), and
+      2. invoke fpocket with that short RELATIVE name from ``cwd=work_dir``.
+
+    Passing an absolute path like ``/very/long/.../design.pdb`` can still
+    SIGABRT with ``*** buffer overflow detected ***`` even though the
+    basename itself is short. This was reproduced directly on the shared
+    cluster fpocket binary on 2026-05-06.
 
     When ``catalytic_resnos`` is provided, we DON'T pick the most
     druggable pocket — we pick the pocket whose bounding alpha-spheres
@@ -1598,9 +1690,10 @@ def _run_fpocket(
     work_dir.mkdir(parents=True, exist_ok=True)
     local = work_dir / "design.pdb"
     local.write_bytes(pdb_path.read_bytes())
+    cmd = [str(FPOCKET_BIN), "-f", local.name]
     try:
         proc = subprocess.run(
-            [str(FPOCKET_BIN), "-f", str(local)],
+            cmd,
             cwd=str(work_dir),
             capture_output=True, text=True, timeout=300, check=False,
         )
@@ -1608,7 +1701,15 @@ def _run_fpocket(
         pdb_out = work_dir / "design_out" / "design_out.pdb"
         pockets_subdir = work_dir / "design_out" / "pockets"
         if proc.returncode != 0 or not info_txt.is_file():
-            LOGGER.warning("fpocket failed for %s: rc=%d", pdb_path.name, proc.returncode)
+            stderr_tail = (proc.stderr or "")[-500:].strip()
+            stdout_tail = (proc.stdout or "")[-200:].strip()
+            LOGGER.warning(
+                "fpocket failed for %s: rc=%d info_exists=%s cmd=%s "
+                "cwd_len=%d input_path_len=%d stderr_tail=%r stdout_tail=%r",
+                pdb_path.name, proc.returncode, info_txt.is_file(),
+                " ".join(cmd), len(str(work_dir)), len(str(local)),
+                stderr_tail, stdout_tail,
+            )
             return None
         if catalytic_resnos is None:
             return _parse_fpocket_largest(info_txt)
@@ -2133,12 +2234,24 @@ def stage_fpocket_rank(
     # writing to its own temp dir.
     from protein_chisel.utils.resources import pool_workers, detect_n_cpus
     cpus_available, _src = detect_n_cpus()
-    n_workers = pool_workers(len(df), cpu_budget=cpus_available, cap=8)
+    # Default high enough to use the full slurm CPU allocation; the
+    # actual worker count is still bounded by detect_n_cpus().
+    fpocket_cap = 20
+    fpocket_cap_env = os.environ.get("PROTEIN_CHISEL_FPOCKET_MAX_WORKERS", "").strip()
+    if fpocket_cap_env:
+        try:
+            fpocket_cap = max(1, int(fpocket_cap_env))
+        except ValueError:
+            LOGGER.warning(
+                "ignoring invalid PROTEIN_CHISEL_FPOCKET_MAX_WORKERS=%r",
+                fpocket_cap_env,
+            )
+    n_workers = pool_workers(len(df), cpu_budget=cpus_available, cap=fpocket_cap)
     LOGGER.info(
         "stage_fpocket_rank: input n=%d (active-site constraint=%s, "
-        "n_workers=%d/%d cpus)",
+        "n_workers=%d/%d cpus, cap=%d)",
         len(df), "yes" if catalytic_resnos else "no",
-        n_workers, cpus_available,
+        n_workers, cpus_available, fpocket_cap,
     )
 
     # Build worker arg tuples (only picklable types)
@@ -2194,75 +2307,9 @@ def stage_fpocket_rank(
     for _, row in df.iterrows():
         cid = row["id"]
         info = infos.get(cid)
-        # Helper to read keys safely with NaN fallback
-        def _g(key, default=float("nan")):
-            return info.get(key, default) if info else default
-        # Polar / apolar atom percentages. info.txt gives only
-        # ``proportion_of_polar_atoms`` (a percent already, not a
-        # fraction). Apolar pct is the complement.
-        polar_pct = _g("proportion_of_polar_atoms", float("nan"))
-        apolar_pct = (
-            (100.0 - polar_pct)
-            if isinstance(polar_pct, (int, float)) and polar_pct == polar_pct
-            else float("nan")
-        )
         rows.append({
             **row.to_dict(),
-            # ---- run status (NEW: distinguishes "tool failed" from
-            #      "real low-druggability pocket") --------------------
-            #
-            # When fpocket subprocess fails, biological metrics are NaN
-            # (NOT 0.0 — that would silently encode tool failures as
-            # rejected designs and let a transient flake delete the
-            # whole batch via the final druggability >= cutoff filter).
-            # Inspect fpocket__status / fpocket__returncode to tell
-            # tool-failure apart from genuine low-druggability designs.
-            "fpocket__status": "ok" if info else "failed",
-            # ---- existing core metrics (NaN on tool failure) -------
-            "fpocket__druggability": _g("druggability_score"),
-            "fpocket__volume": _g("volume"),
-            "fpocket__mean_alpha_sphere_radius":
-                _g("mean_alpha_sphere_radius"),
-            "fpocket__alpha_sphere_density": _g("alpha_sphere_density"),
-            "fpocket__n_alpha_spheres_near_catalytic":
-                _g("n_alpha_spheres_near_catalytic"),
-            "fpocket__mean_alpha_sphere_dist_to_catalytic":
-                _g("mean_alpha_sphere_dist_to_catalytic"),
-            # Legacy presence flag (1 = a pocket was successfully selected,
-            # NaN = fpocket itself failed). Despite the name it is not the
-            # raw fpocket pocket count; downstream code already treats it
-            # as a presence indicator. fpocket__status now does the same
-            # job with clearer semantics — keeping the column for back-
-            # compat with existing notebooks.
-            "fpocket__n_pockets_found": 1 if info else float("nan"),
-            # ---- pocket character (info.txt) -----------------------
-            "fpocket__score": _g("score"),
-            "fpocket__n_alpha_spheres": _g("number_of_alpha_spheres"),
-            "fpocket__total_sasa": _g("total_sasa"),
-            "fpocket__polar_sasa": _g("polar_sasa"),
-            "fpocket__apolar_sasa": _g("apolar_sasa"),
-            "fpocket__hydrophobicity_score": _g("hydrophobicity_score"),
-            "fpocket__polarity_score": _g("polarity_score"),
-            "fpocket__charge_score": _g("charge_score"),
-            "fpocket__volume_score": _g("volume_score"),
-            "fpocket__polar_atoms_pct": polar_pct,
-            "fpocket__apolar_atoms_pct": apolar_pct,
-            "fpocket__apolar_alpha_sphere_proportion":
-                _g("apolar_alpha_sphere_proportion"),
-            "fpocket__mean_local_hydrophobic_density":
-                _g("mean_local_hydrophobic_density"),
-            "fpocket__mean_alpha_sphere_solvent_acc":
-                _g("mean_alp_sph_solvent_access"),
-            "fpocket__cent_of_mass_alpha_sphere_max_dist":
-                _g("cent_of_mass_alpha_sphere_max_dist"),
-            # ---- bottleneck / channel stats (from PQR) -------------
-            "fpocket__bottleneck_radius": _g("bottleneck_radius"),
-            "fpocket__min_alpha_sphere_radius": _g("min_alpha_sphere_radius"),
-            "fpocket__alpha_sphere_radius_p10":
-                _g("alpha_sphere_radius_p10"),
-            "fpocket__polar_alpha_sphere_proportion":
-                _g("polar_alpha_sphere_proportion"),
-            "fpocket__n_rim_spheres": _g("n_rim_spheres", 0),
+            **_fpocket_metrics_from_info(info),
         })
     ranked = pd.DataFrame(rows).sort_values(
         # primary: fitness desc; secondary: tighter pocket
@@ -2390,6 +2437,1063 @@ def stage_arpeggio_final(
 
 def _hamming(a: str, b: str) -> int:
     return sum(1 for x, y in zip(a, b) if x != y)
+
+
+def _hamming_at_positions(a: str, b: str, positions: list[int]) -> int:
+    return sum(
+        a[p] != b[p]
+        for p in positions
+        if p < len(a) and p < len(b)
+    )
+
+
+def _normalized_upper_bound_gap(value: float, upper: float) -> float:
+    """Return a scale-free nonnegative gap for an upper-bound violation."""
+    return max(0.0, float(value) - float(upper)) / max(1.0, abs(float(upper)))
+
+
+def _normalized_lower_bound_gap(value: float, lower: float) -> float:
+    """Return a scale-free nonnegative gap for a lower-bound violation."""
+    return max(0.0, float(lower) - float(value)) / max(1.0, abs(float(lower)))
+
+
+def _normalized_interval_gap(value: float, lower: float, upper: float) -> float:
+    """Return distance outside a closed interval, normalized by interval width."""
+    width = max(1e-6, float(upper) - float(lower))
+    if value < lower:
+        return (float(lower) - float(value)) / width
+    if value > upper:
+        return (float(value) - float(upper)) / width
+    return 0.0
+
+
+def _select_diverse_topk_progressive(
+    df: pd.DataFrame,
+    *,
+    target_k: int,
+    min_hamming_full: int,
+    primary_sphere_positions: Optional[list[int]] = None,
+    min_hamming_active: int = 0,
+    sequence_col: str = "sequence",
+    seed_sequences: Optional[list[str]] = None,
+) -> tuple[pd.DataFrame, dict]:
+    """Greedy diverse top-K with progressive relaxation of Hamming gates.
+
+    Selection respects the incoming row order, so callers should pre-sort
+    ``df`` by the desired priority (e.g. pass-first, then near-miss, then
+    hard tool failures). We first enforce the requested full-sequence and
+    active-site Hamming thresholds; if that yields fewer than ``target_k``,
+    we relax both thresholds stepwise down to zero. As a final resort, we
+    fill any remaining slots in pure rank order so callers who request 50
+    designs get 50 whenever at least 50 unique candidates exist.
+    """
+    if len(df) == 0 or target_k <= 0:
+        return df.head(0).copy(), {"relaxation_steps": [], "filled_without_hamming": 0}
+
+    selected_idx: list[int] = []
+    selected_set: set[int] = set()
+    selected_seqs: list[str] = list(seed_sequences or [])
+    relaxation_steps: list[dict] = []
+    seen_thresholds: set[tuple[int, int]] = set()
+
+    max_delta = max(int(min_hamming_full), int(min_hamming_active))
+    for delta in range(max_delta + 1):
+        h_full = max(0, int(min_hamming_full) - delta)
+        h_active = max(0, int(min_hamming_active) - delta)
+        threshold_pair = (h_full, h_active)
+        if threshold_pair in seen_thresholds:
+            continue
+        seen_thresholds.add(threshold_pair)
+
+        added = 0
+        for i, row in df.iterrows():
+            if i in selected_set:
+                continue
+            seq = str(row[sequence_col])
+            if not all(_hamming(seq, s) >= h_full for s in selected_seqs):
+                continue
+            if primary_sphere_positions and h_active > 0:
+                if not all(
+                    _hamming_at_positions(seq, s, primary_sphere_positions) >= h_active
+                    for s in selected_seqs
+                ):
+                    continue
+            selected_idx.append(i)
+            selected_set.add(i)
+            selected_seqs.append(seq)
+            added += 1
+            if len(selected_idx) >= target_k:
+                break
+
+        relaxation_steps.append({
+            "min_hamming_full": h_full,
+            "min_hamming_active": h_active,
+            "added": added,
+            "selected_total": len(selected_idx),
+        })
+        if len(selected_idx) >= target_k:
+            break
+
+    filled_without_hamming = 0
+    if len(selected_idx) < target_k:
+        for i, row in df.iterrows():
+            if i in selected_set:
+                continue
+            selected_idx.append(i)
+            selected_set.add(i)
+            selected_seqs.append(str(row[sequence_col]))
+            filled_without_hamming += 1
+            if len(selected_idx) >= target_k:
+                break
+
+    telemetry = {
+        "relaxation_steps": relaxation_steps,
+        "filled_without_hamming": filled_without_hamming,
+        "n_selected": len(selected_idx),
+        "n_seed_sequences": len(seed_sequences or []),
+    }
+    return df.loc[selected_idx].copy(), telemetry
+
+
+def _assign_unique_topk_ids(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Return a copy with collision-safe final output ids.
+
+    LigandMPNN numbering restarts every cycle (e.g. ``..._lmpnn_004`` can
+    appear in cycle 0 and again in cycle 2), so final top-K rows selected
+    across multiple cycles can share the same ``id`` even when their
+    sequences differ. If we export those rows verbatim, later PDB copies
+    collide on filename and one design silently overwrites another.
+
+    We preserve the original sampler id in ``source_id`` and only rewrite
+    the published ``id`` when a collision exists, appending the source
+    cycle plus a repeat index. Example:
+
+        FOO_lmpnn_004  ->  FOO_lmpnn_004_c01_r1
+        FOO_lmpnn_004  ->  FOO_lmpnn_004_c02_r2
+    """
+    if len(df) == 0 or "id" not in df.columns:
+        return df.copy(), 0
+
+    out = df.copy()
+    out["source_id"] = out["id"].astype(str)
+    counts = out["source_id"].value_counts()
+    if int((counts > 1).sum()) == 0:
+        return out, 0
+
+    seen: dict[str, int] = {}
+    new_ids: list[str] = []
+    renamed = 0
+    for _, row in out.iterrows():
+        source_id = str(row["source_id"])
+        if counts[source_id] == 1:
+            new_ids.append(source_id)
+            continue
+        seen[source_id] = seen.get(source_id, 0) + 1
+        cycle_val = row.get("cycle", None)
+        suffix_parts: list[str] = []
+        if cycle_val == cycle_val:
+            try:
+                suffix_parts.append(f"c{int(cycle_val):02d}")
+            except Exception:
+                suffix_parts.append(f"c{cycle_val}")
+        suffix_parts.append(f"r{seen[source_id]}")
+        new_ids.append(f"{source_id}_{'_'.join(suffix_parts)}")
+        renamed += 1
+    out["id"] = new_ids
+    return out, renamed
+
+
+def _fpocket_metrics_from_info(info: Optional[dict]) -> dict[str, object]:
+    """Map a parsed fpocket info dict to the published fpocket__* schema."""
+    def _g(key: str, default: object = float("nan")) -> object:
+        return info.get(key, default) if info else default
+
+    polar_pct = _g("proportion_of_polar_atoms", float("nan"))
+    apolar_pct = (
+        (100.0 - polar_pct)
+        if isinstance(polar_pct, (int, float)) and polar_pct == polar_pct
+        else float("nan")
+    )
+    return {
+        "fpocket__status": "ok" if info else "failed",
+        "fpocket__druggability": _g("druggability_score"),
+        "fpocket__volume": _g("volume"),
+        "fpocket__mean_alpha_sphere_radius": _g("mean_alpha_sphere_radius"),
+        "fpocket__alpha_sphere_density": _g("alpha_sphere_density"),
+        "fpocket__n_alpha_spheres_near_catalytic":
+            _g("n_alpha_spheres_near_catalytic"),
+        "fpocket__mean_alpha_sphere_dist_to_catalytic":
+            _g("mean_alpha_sphere_dist_to_catalytic"),
+        "fpocket__n_pockets_found": 1 if info else float("nan"),
+        "fpocket__score": _g("score"),
+        "fpocket__n_alpha_spheres": _g("number_of_alpha_spheres"),
+        "fpocket__total_sasa": _g("total_sasa"),
+        "fpocket__polar_sasa": _g("polar_sasa"),
+        "fpocket__apolar_sasa": _g("apolar_sasa"),
+        "fpocket__hydrophobicity_score": _g("hydrophobicity_score"),
+        "fpocket__polarity_score": _g("polarity_score"),
+        "fpocket__charge_score": _g("charge_score"),
+        "fpocket__volume_score": _g("volume_score"),
+        "fpocket__polar_atoms_pct": polar_pct,
+        "fpocket__apolar_atoms_pct": apolar_pct,
+        "fpocket__apolar_alpha_sphere_proportion":
+            _g("apolar_alpha_sphere_proportion"),
+        "fpocket__mean_local_hydrophobic_density":
+            _g("mean_local_hydrophobic_density"),
+        "fpocket__mean_alpha_sphere_solvent_acc":
+            _g("mean_alp_sph_solvent_access"),
+        "fpocket__cent_of_mass_alpha_sphere_max_dist":
+            _g("cent_of_mass_alpha_sphere_max_dist"),
+        "fpocket__bottleneck_radius": _g("bottleneck_radius"),
+        "fpocket__min_alpha_sphere_radius": _g("min_alpha_sphere_radius"),
+        "fpocket__alpha_sphere_radius_p10":
+            _g("alpha_sphere_radius_p10"),
+        "fpocket__polar_alpha_sphere_proportion":
+            _g("polar_alpha_sphere_proportion"),
+        "fpocket__n_rim_spheres": _g("n_rim_spheres", 0),
+    }
+
+
+def _row_source_id(row: pd.Series) -> str:
+    """Return the pre-export source id for a selected row."""
+    source_id = row.get("source_id", row.get("id", ""))
+    return str(row.get("id", "")) if pd.isna(source_id) else str(source_id)
+
+
+def _candidate_source_id_series(df: pd.DataFrame) -> pd.Series:
+    """Vectorized source-id view used by final export / refill logic."""
+    if len(df) == 0:
+        return pd.Series(dtype=object)
+    if "source_id" in df.columns:
+        return df["source_id"].astype(str)
+    return df["id"].astype(str)
+
+
+def _select_materializable_topk(
+    *,
+    selected_df: pd.DataFrame,
+    candidate_pool: pd.DataFrame,
+    pdb_map: dict[str, Path],
+    target_k: int,
+    min_hamming_full: int,
+    primary_sphere_positions: Optional[list[int]],
+    min_hamming_active: int,
+    allow_backfill: bool,
+) -> tuple[pd.DataFrame, dict]:
+    """Ensure the final top-K can be materialized to real unique PDB files.
+
+    The in-memory selector can pick rows whose source PDB later turns out to
+    be missing (e.g. a partially-failed restore / publish step). Before we
+    write final artifacts, drop any non-materializable rows and, when
+    backfill is enabled, refill from the remaining ranked pool until we hit
+    ``target_k`` or truly run out of usable candidates.
+    """
+    selected = selected_df.copy().reset_index(drop=True)
+    source_ids_all = _candidate_source_id_series(candidate_pool)
+    source_ids_selected = _candidate_source_id_series(selected)
+    available_mask = source_ids_selected.map(
+        lambda sid: bool((src := pdb_map.get(sid)) and src.is_file()),
+    )
+    dropped_missing = selected.loc[~available_mask].copy()
+    if len(dropped_missing):
+        LOGGER.warning(
+            "stage_diverse_topk: dropped %d selected rows whose source PDBs "
+            "were missing before final export",
+            len(dropped_missing),
+        )
+    selected = selected.loc[available_mask].reset_index(drop=True)
+
+    refill_rounds: list[dict[str, int]] = []
+    while allow_backfill and len(selected) < target_k:
+        used_source_ids = set(_candidate_source_id_series(selected).tolist())
+        remainder = candidate_pool.loc[
+            ~source_ids_all.isin(used_source_ids)
+        ].copy().reset_index(drop=True)
+        if len(remainder) == 0:
+            break
+        remainder_source_ids = _candidate_source_id_series(remainder)
+        remainder = remainder.loc[
+            remainder_source_ids.map(
+                lambda sid: bool((src := pdb_map.get(sid)) and src.is_file()),
+            )
+        ].reset_index(drop=True)
+        if len(remainder) == 0:
+            break
+        need = target_k - len(selected)
+        extra, extra_telem = _select_diverse_topk_progressive(
+            remainder,
+            target_k=need,
+            min_hamming_full=min_hamming_full,
+            primary_sphere_positions=primary_sphere_positions,
+            min_hamming_active=min_hamming_active,
+            seed_sequences=selected["sequence"].astype(str).tolist(),
+        )
+        if len(extra) == 0:
+            break
+        refill_rounds.append({
+            "requested": int(need),
+            "selected": int(len(extra)),
+            "filled_without_hamming": int(
+                extra_telem.get("filled_without_hamming", 0),
+            ),
+        })
+        selected = pd.concat([selected, extra], ignore_index=True)
+
+    if len(selected) > target_k:
+        selected = selected.head(target_k).copy()
+
+    selected, n_ids_renamed = _assign_unique_topk_ids(selected)
+    telemetry = {
+        "dropped_missing_source_pdbs": int(len(dropped_missing)),
+        "refill_rounds": refill_rounds,
+        "n_ids_renamed": int(n_ids_renamed),
+        "n_selected_materializable": int(len(selected)),
+    }
+    return selected, telemetry
+
+
+def _write_final_topk_artifacts(
+    *,
+    top: pd.DataFrame,
+    final_dir: Path,
+    pdb_map: dict[str, Path],
+) -> tuple[Path, pd.DataFrame]:
+    """Write a self-consistent top-K artifact set and return the realized rows."""
+    pdb_out = final_dir / "topk_pdbs"
+    if pdb_out.exists():
+        shutil.rmtree(pdb_out)
+    pdb_out.mkdir(exist_ok=True)
+
+    copied_rows: list[dict[str, object]] = []
+    for _, row in top.iterrows():
+        source_id = _row_source_id(row)
+        src = pdb_map.get(source_id)
+        if not src or not src.is_file():
+            LOGGER.error(
+                "stage_diverse_topk: selected row %s had no materializable "
+                "source PDB at export time (source_id=%s)",
+                row["id"], source_id,
+            )
+            continue
+        try:
+            shutil.copy2(src, pdb_out / f"{row['id']}.pdb")
+            copied_rows.append(row.to_dict())
+        except Exception as exc:
+            LOGGER.error(
+                "stage_diverse_topk: failed copying %s -> %s (%s)",
+                src, pdb_out / f"{row['id']}.pdb", exc,
+            )
+    materialized_top = (
+        pd.DataFrame(copied_rows)
+        if copied_rows else top.head(0).copy()
+    )
+    topk_tsv = final_dir / "topk.tsv"
+    materialized_top.to_csv(topk_tsv, sep="\t", index=False)
+    with open(final_dir / "topk.fasta", "w") as fh:
+        for _, row in materialized_top.iterrows():
+            fh.write(f">{row['id']}\n{row['sequence']}\n")
+    return topk_tsv, materialized_top
+
+
+def _build_input_reference_row(
+    *,
+    template_df: pd.DataFrame,
+    seed_pdb: Path,
+    wt_seq: str,
+    wt_fitness: Optional[float],
+    expression_result,
+    seed_ss_reduced: Optional[str],
+    seed_sasa: Optional[np.ndarray],
+    position_classes: list[str],
+    protein_resnos: list[int],
+    catalytic_resnos: Iterable[int],
+    fixed_resnos: Iterable[int],
+    design_ph: float,
+    n_term_pad: str,
+    c_term_pad: str,
+    net_charge_max: float,
+    net_charge_min: float,
+    instability_max: float,
+    gravy_min: float,
+    gravy_max: float,
+    aliphatic_min: float,
+    boman_max: float,
+    pi_min: float,
+    pi_max: float,
+    clash_filter: bool,
+    clash_severe_distance: float,
+    sap_max_threshold: float,
+    seed_dfi_metrics: Optional[dict],
+    tunnel_metrics_enabled: bool,
+    ligand_min_radius: Optional[float],
+    ligand_resname: Optional[str],
+    log_probs_esmc: np.ndarray,
+    log_probs_saprot: np.ndarray,
+    weights_per_position: np.ndarray,
+    final_dir: Path,
+    fpocket_druggability_min: float,
+) -> pd.DataFrame:
+    """Build a one-row metrics DataFrame for the original input reference PDB."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from protein_chisel.filters.protparam import protparam_metrics
+    from protein_chisel.sampling.fitness_score import (
+        fitness_from_seed_marginals, seq_hash,
+    )
+
+    row: dict[str, object] = {col: pd.NA for col in template_df.columns}
+    seed_id = seed_pdb.stem
+    pp = protparam_metrics(
+        wt_seq, ph=design_ph, n_term_pad=n_term_pad, c_term_pad=c_term_pad,
+    )
+    seq_reasons: list[str] = []
+    if pp.charge_at_pH_full_HH >= net_charge_max:
+        seq_reasons.append(
+            f"net_charge_full_HH={pp.charge_at_pH_full_HH:.2f} >= {net_charge_max}",
+        )
+    if pp.charge_at_pH_full_HH <= net_charge_min:
+        seq_reasons.append(
+            f"net_charge_full_HH={pp.charge_at_pH_full_HH:.2f} <= {net_charge_min}",
+        )
+    if not (pi_min <= pp.pi <= pi_max):
+        seq_reasons.append(f"pI={pp.pi:.2f} outside [{pi_min}, {pi_max}]")
+    if pp.instability_index >= instability_max:
+        seq_reasons.append(
+            f"instability_index={pp.instability_index:.1f} >= {instability_max}",
+        )
+    if not (gravy_min <= pp.gravy <= gravy_max):
+        seq_reasons.append(
+            f"GRAVY={pp.gravy:+.3f} outside [{gravy_min}, {gravy_max}]",
+        )
+    if pp.aliphatic_index < aliphatic_min:
+        seq_reasons.append(
+            f"aliphatic_index={pp.aliphatic_index:.1f} < {aliphatic_min}",
+        )
+    if pp.boman_index >= boman_max:
+        seq_reasons.append(
+            f"boman_index={pp.boman_index:.2f} >= {boman_max}",
+        )
+    for hit in getattr(expression_result, "hard_filter_hits", []):
+        seq_reasons.append(f"{hit.rule_name}: {hit.reason}")
+
+    row.update({
+        "id": seed_id,
+        "source_id": seed_id,
+        "sequence": wt_seq,
+        "parent_design_id": "input_reference",
+        "sampler": "input_reference",
+        "sampler_params_hash": "",
+        "is_input": True,
+        "header": seed_id,
+        "seq_hash": seq_hash(wt_seq),
+        "n_dupes": 1,
+        "length": len(wt_seq),
+        "net_charge_full_HH": pp.charge_at_pH_full_HH,
+        "net_charge_no_HIS": pp.charge_at_pH7_no_HIS,
+        "net_charge_with_HIS_HH": pp.charge_at_pH7,
+        "net_charge_HIS_half": pp.charge_at_pH7_HIS_half,
+        "net_charge_DE_KR_only": pp.charge_at_pH_DE_KR_only,
+        "design_ph": design_ph,
+        "instability_index": pp.instability_index,
+        "gravy": pp.gravy,
+        "pi": pp.pi,
+        "aliphatic_index": pp.aliphatic_index,
+        "boman_index": pp.boman_index,
+        "aromaticity": pp.aromaticity,
+        "flexibility_mean_seq": (
+            pp.flexibility_mean if pp.flexibility_mean is not None else float("nan")
+        ),
+        "helix_frac_seq": pp.helix_frac_seq,
+        "turn_frac_seq": pp.turn_frac_seq,
+        "sheet_frac_seq": pp.sheet_frac_seq,
+        "molecular_weight": pp.molecular_weight,
+        "extinction_280nm_no_disulfide": pp.extinction_280nm_no_disulfide,
+        "extinction_280nm_disulfide": pp.extinction_280nm_disulfide,
+        "n_expression_warnings": len(getattr(expression_result, "warnings", [])),
+        "n_expression_soft_bias_hits": len(getattr(expression_result, "soft_bias_hits", [])),
+        "n_expression_hard_omit_hits": len(getattr(expression_result, "hard_omit_hits", [])),
+        "n_expression_hard_filter_hits": len(getattr(expression_result, "hard_filter_hits", [])),
+        "expression_rule_summary": expression_result.summary(),
+        "passed_seq_filter": not seq_reasons,
+        "fail_reasons": "; ".join(seq_reasons),
+        "cycle": -1,
+        "selection__bucket": "input_reference",
+        "selection__bucket_priority": -1,
+        "seed_pdb": str(seed_pdb),
+        "seed_basename": seed_id,
+        "pdb_path": "",
+    })
+
+    _, struct_row, _, struct_reasons = _struct_filter_worker((
+        seed_id, seed_pdb, list(catalytic_resnos), list(fixed_resnos),
+        clash_severe_distance, sap_max_threshold, seed_dfi_metrics,
+    ))
+    struct_reasons = list(struct_reasons)
+    if clash_filter and struct_row.get("clash__has_severe"):
+        struct_reasons.append(
+            "severe clash "
+            f"(n_cat={struct_row.get('clash__n_to_catalytic', 0)}, "
+            f"n_lig={struct_row.get('clash__n_to_ligand', 0)}, "
+            f"detail={struct_row.get('clash__detail', '')})",
+        )
+    row.update(struct_row)
+    row["passed_struct_filter"] = not struct_reasons
+    row["struct_fail"] = "; ".join(struct_reasons)
+
+    if tunnel_metrics_enabled:
+        try:
+            from protein_chisel.tools.tunnel_metrics import (
+                TunnelConfig, pyKVFinder_score, score_tunnels,
+            )
+            t_scores = score_tunnels(
+                pdb_path=seed_pdb,
+                catalytic_resnos=list(catalytic_resnos),
+                chain=CHAIN,
+                ligand_resname=ligand_resname,
+                ligand_min_radius=ligand_min_radius,
+                config=TunnelConfig(),
+            )
+            row.update(t_scores.to_dict())
+        except Exception as exc:
+            LOGGER.warning("input reference tunnel scoring failed: %s", exc)
+        try:
+            import pyKVFinder  # noqa: F401
+            row.update(pyKVFinder_score(
+                pdb_path=seed_pdb,
+                catalytic_resnos=list(catalytic_resnos),
+                chain=CHAIN,
+            ))
+        except ImportError:
+            pass
+        except Exception as exc:
+            LOGGER.warning("input reference pyKVFinder failed: %s", exc)
+
+    try:
+        wt_res = fitness_from_seed_marginals(
+            wt_seq, log_probs_esmc, log_probs_saprot, weights_per_position,
+        )
+        row.update({
+            "fitness__logp_esmc_mean": float(wt_res.logp_esmc_mean),
+            "fitness__logp_saprot_mean": float(wt_res.logp_saprot_mean),
+            "fitness__logp_fused_mean": float(wt_res.logp_fused_mean),
+            "fitness__method": "seed_marginals",
+            "fitness__delta_vs_wt": 0.0 if wt_fitness is not None else float("nan"),
+            "fitness__wt_logp_fused": (
+                float(wt_fitness) if wt_fitness is not None else float("nan")
+            ),
+        })
+    except Exception as exc:
+        LOGGER.warning("input reference fitness scoring failed: %s", exc)
+
+    fpocket_info = _run_fpocket(
+        seed_pdb,
+        final_dir / "_input_reference_fpocket",
+        catalytic_resnos=list(catalytic_resnos),
+        chain=CHAIN,
+    )
+    row.update(_fpocket_metrics_from_info(fpocket_info))
+    if fpocket_druggability_min > 0:
+        druggability = row.get("fpocket__druggability", float("nan"))
+        if isinstance(druggability, (int, float)) and druggability == druggability:
+            row["selection__hard_final_filter_passed"] = (
+                float(druggability) >= float(fpocket_druggability_min)
+            )
+            row["selection__fpocket_gap"] = max(
+                0.0, float(fpocket_druggability_min) - float(druggability),
+            )
+        else:
+            row["selection__hard_final_filter_passed"] = pd.NA
+            row["selection__fpocket_gap"] = pd.NA
+
+    out = pd.DataFrame([row])
+    for col in template_df.columns:
+        if col not in out.columns:
+            out[col] = pd.NA
+    out = out[template_df.columns]
+    return out
+
+
+def _load_cycle_seq_stage_pool(cycle_dir: Path, cycle_idx: int) -> pd.DataFrame:
+    """Load the union of per-cycle seq-filter survivors and rejects.
+
+    These rows represent designs that were successfully sampled and restored to
+    real PDB files, even if later structural / pocket filters eliminated them.
+    They are the last safe backfill tier when the ranked structural pool is too
+    small or completely empty.
+    """
+    frames: list[pd.DataFrame] = []
+    for fname in ("survivors_seq.tsv", "rejects_seq.tsv"):
+        p = cycle_dir / "02_seq_filter" / fname
+        if not p.is_file():
+            continue
+        try:
+            df = pd.read_csv(p, sep="\t")
+        except Exception as exc:
+            LOGGER.warning("could not read %s for seq-stage backfill: %s", p, exc)
+            continue
+        if len(df) == 0:
+            continue
+        df = df.copy()
+        df["cycle"] = cycle_idx
+        frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    merged = pd.concat(frames, ignore_index=True)
+    if "id" in merged.columns and "source_id" not in merged.columns:
+        merged["source_id"] = merged["id"].astype(str)
+    return merged
+
+
+def _build_seq_stage_backfill_pool(
+    *,
+    seq_stage_rows: list[pd.DataFrame],
+    existing_pool: Optional[pd.DataFrame],
+    log_probs_esmc: np.ndarray,
+    log_probs_saprot: np.ndarray,
+    weights_per_position: np.ndarray,
+    fitness_cache: dict,
+    rank_weights: dict[str, float],
+    rank_targets: dict[str, float],
+) -> tuple[pd.DataFrame, list]:
+    """Prepare a ranked backfill pool from seq-filter stage rows only.
+
+    This pool is used when later structural / pocket stages collapse. We
+    keep the original discrete fail-count signal, but also prefer
+    near-threshold numeric misses over rows that violate the same filters
+    by a much larger margin.
+    """
+    if not seq_stage_rows:
+        return pd.DataFrame(), []
+
+    from protein_chisel.sampling.fitness_score import (
+        deduplicate_by_sequence, score_dataframe_fitness,
+    )
+    from protein_chisel.scoring.multi_objective import (
+        DEFAULT_METRIC_SPECS, apply_cli_overrides, compute_topsis_scores_v2,
+    )
+
+    pool = pd.concat(seq_stage_rows, ignore_index=True)
+    if len(pool) == 0:
+        return pd.DataFrame(), []
+    pool = deduplicate_by_sequence(pool)
+
+    if existing_pool is not None and len(existing_pool) > 0:
+        if "seq_hash" in pool.columns and "seq_hash" in existing_pool.columns:
+            existing_hashes = set(existing_pool["seq_hash"].astype(str).tolist())
+            pool = pool.loc[~pool["seq_hash"].astype(str).isin(existing_hashes)].copy()
+        elif "sequence" in pool.columns and "sequence" in existing_pool.columns:
+            existing_sequences = set(existing_pool["sequence"].astype(str).tolist())
+            pool = pool.loc[
+                ~pool["sequence"].astype(str).isin(existing_sequences)
+            ].copy()
+    if len(pool) == 0:
+        return pd.DataFrame(), []
+
+    pool = score_dataframe_fitness(
+        pool,
+        log_probs_esmc,
+        log_probs_saprot,
+        weights_per_position,
+        fitness_cache=fitness_cache,
+    )
+    if "source_id" not in pool.columns and "id" in pool.columns:
+        pool["source_id"] = pool["id"].astype(str)
+
+    fail_reason_count = (
+        pool.get("fail_reasons", pd.Series([""] * len(pool), index=pool.index))
+        .fillna("")
+        .astype(str)
+        .map(lambda s: 0 if not s.strip() else len([x for x in s.split(";") if x.strip()]))
+    )
+    pool["selection__seq_backfill_reason_count"] = fail_reason_count.astype(int)
+    seq_numeric_gap = pd.to_numeric(
+        pool.get(
+            "selection__seq_filter_numeric_gap",
+            pd.Series([0.0] * len(pool), index=pool.index),
+        ),
+        errors="coerce",
+    ).fillna(0.0)
+    pool["selection__seq_backfill_numeric_gap"] = seq_numeric_gap.astype(float)
+    pool["selection__bucket"] = np.where(
+        pool.get("passed_seq_filter", pd.Series([False] * len(pool), index=pool.index))
+            .fillna(False)
+            .astype(bool),
+        "seq_stage_passed_seq_filter",
+        "seq_stage_failed_seq_filter",
+    )
+    pool["selection__bucket_priority"] = np.where(
+        pool["selection__bucket"].eq("seq_stage_passed_seq_filter"),
+        3, 4,
+    ).astype(int)
+    pool["selection__hard_final_filter_passed"] = False
+    pool["selection__fpocket_gap"] = np.inf
+    pool["fpocket__status"] = "not_run"
+    if "passed_struct_filter" not in pool.columns:
+        pool["passed_struct_filter"] = pd.NA
+    if "struct_fail" not in pool.columns:
+        pool["struct_fail"] = "not_evaluated_for_struct_filter"
+
+    active_specs = apply_cli_overrides(
+        DEFAULT_METRIC_SPECS, rank_weights, rank_targets,
+    )
+    scores, used_specs, _debug = compute_topsis_scores_v2(pool, active_specs)
+    pool["mo_topsis"] = scores
+    pool["legacy_rank_score"] = pool["fitness__logp_fused_mean"].rank(
+        ascending=False,
+    )
+    pool = pool.sort_values(
+        [
+            "selection__bucket_priority",
+            "selection__seq_backfill_reason_count",
+            "selection__seq_backfill_numeric_gap",
+            "mo_topsis",
+            "fitness__logp_fused_mean",
+        ],
+        ascending=[True, True, True, False, False],
+        na_position="last",
+    ).reset_index(drop=True)
+    if len(pool) > 0:
+        LOGGER.info(
+            "seq-stage backfill ranking: passed_seq=%d failed_seq=%d "
+            "numeric_gap[min/median/max]=%.3f/%.3f/%.3f",
+            int(pool["selection__bucket"].eq("seq_stage_passed_seq_filter").sum()),
+            int(pool["selection__bucket"].eq("seq_stage_failed_seq_filter").sum()),
+            float(pool["selection__seq_backfill_numeric_gap"].min()),
+            float(pool["selection__seq_backfill_numeric_gap"].median()),
+            float(pool["selection__seq_backfill_numeric_gap"].max()),
+        )
+    return pool, used_specs
+
+
+def _deferred_rescue_shortlist_size(*, deficit: int, target_k: int, cap: int = 200) -> int:
+    """Size the shortlist that gets deferred downstream rescue scoring.
+
+    We only pay this extra cost when seq-stage backfill is actually needed.
+    The shortlist is intentionally larger than the exact deficit so the rescue
+    pass has enough candidates to improve ranking quality, but it is capped to
+    keep worst-case runtime bounded on large production sweeps.
+    """
+    need = max(1, int(deficit))
+    return min(int(cap), max(int(target_k), need * 4, need + 10))
+
+
+def _overlay_rows_by_id(base_df: pd.DataFrame, updates_df: pd.DataFrame) -> pd.DataFrame:
+    """Overlay per-design updates onto ``base_df`` while preserving row order."""
+    if len(base_df) == 0 or len(updates_df) == 0:
+        return base_df.copy()
+    if "id" not in base_df.columns or "id" not in updates_df.columns:
+        return base_df.copy()
+
+    out = base_df.copy()
+    upd = updates_df.drop_duplicates(subset=["id"], keep="last").copy()
+    for col in upd.columns:
+        if col not in out.columns:
+            out[col] = pd.NA
+    out_idx = out.set_index("id", drop=False)
+    upd_idx = upd.set_index("id", drop=False)
+    common = out_idx.index.intersection(upd_idx.index)
+    for col in upd.columns:
+        out_idx.loc[common, col] = upd_idx.loc[common, col]
+    return out_idx.reset_index(drop=True)
+
+
+def _deferred_rescue_score_candidates(
+    *,
+    candidates_df: pd.DataFrame,
+    pdb_map: dict[str, Path],
+    out_dir: Path,
+    catalytic_his_resnos: Iterable[int],
+    catalytic_resnos: Iterable[int],
+    fixed_resnos: Iterable[int],
+    sap_max_threshold: float,
+    clash_filter: bool,
+    clash_severe_distance: float,
+    seed_dfi_metrics: Optional[dict],
+    tunnel_metrics_enabled: bool,
+    ligand_min_radius: Optional[float],
+    ligand_resname: Optional[str],
+    log_probs_esmc: np.ndarray,
+    log_probs_saprot: np.ndarray,
+    weights_per_position: np.ndarray,
+    fitness_cache: dict,
+    wt_fitness: Optional[float],
+    rank_weights: dict[str, float],
+    rank_targets: dict[str, float],
+    fpocket_druggability_min: float,
+    chain: str = CHAIN,
+) -> pd.DataFrame:
+    """Run a deferred downstream rescue pass on fallback candidates.
+
+    This path is used when seq-stage backfill rows are under serious
+    consideration for the final output. We try to give those rows the same
+    structural / tunnel / fpocket annotations as normal pipeline survivors so:
+
+      1. final selection can prefer rows that truly pass more downstream gates
+      2. shipped TSVs are internally consistent and rarely carry ``not_run``
+
+    The rescue pass is crash-tolerant by construction:
+      - struct filter emits explicit fail rows instead of crashing
+      - tunnel scoring catches per-design exceptions and writes partial metrics
+      - fpocket failures become ``fpocket__status=failed`` + NaNs
+    """
+    if len(candidates_df) == 0:
+        return candidates_df.head(0).copy()
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rescue_df = candidates_df.copy().reset_index(drop=True)
+    if "source_id" not in rescue_df.columns and "id" in rescue_df.columns:
+        rescue_df["source_id"] = rescue_df["id"].astype(str)
+    rescue_df["selection__origin_bucket"] = rescue_df.get(
+        "selection__bucket", pd.Series([pd.NA] * len(rescue_df), index=rescue_df.index),
+    )
+    rescue_df["selection__deferred_rescue_requested"] = True
+    # Drop any previously-computed downstream metrics before replaying the
+    # rescue stages. The seq-stage backfill pool already carries fitness
+    # columns; keeping them would duplicate headers after the rescue
+    # stage_fitness_score() pass and can break downstream pandas writes.
+    downstream_prefixes = (
+        "fitness__", "fpocket__", "tunnel__", "pkvf__", "clash__",
+        "ligand_int__", "preorg__", "dfi__",
+    )
+    downstream_exact = {
+        "n_hbonds_to_cat_his",
+        "sap_max", "sap_mean", "sap_p95",
+        "passed_struct_filter", "struct_fail",
+        "legacy_rank_score", "mo_topsis",
+        "selection__hard_final_filter_passed",
+        "selection__fpocket_gap",
+        "selection__deferred_rescue_attempted",
+        "selection__deferred_rescue_struct_failed",
+        "selection__deferred_rescue_tunnel_failed",
+    }
+    keep_cols = [
+        c for c in rescue_df.columns
+        if c not in downstream_exact
+        and not any(c.startswith(prefix) for prefix in downstream_prefixes)
+    ]
+    rescue_df = rescue_df[keep_cols].copy()
+
+    source_ids = _candidate_source_id_series(rescue_df)
+    materializable_mask = source_ids.map(
+        lambda sid: bool((src := pdb_map.get(sid)) and src.is_file()),
+    )
+    if int((~materializable_mask).sum()) > 0:
+        LOGGER.warning(
+            "deferred_rescue: dropping %d/%d candidates with missing source PDBs",
+            int((~materializable_mask).sum()), len(rescue_df),
+        )
+    rescue_df = rescue_df.loc[materializable_mask].reset_index(drop=True)
+    if len(rescue_df) == 0:
+        return rescue_df
+
+    rescue_pdb_map = {
+        str(row["id"]): pdb_map.get(str(row.get("source_id", row["id"])))
+        for _, row in rescue_df.iterrows()
+    }
+    input_tsv = out_dir / "rescue_candidates.tsv"
+    rescue_df.to_csv(input_tsv, sep="\t", index=False)
+
+    struct_dir = out_dir / "03_struct_filter"
+    survivors_struct_tsv = stage_struct_filter(
+        survivors_seq_tsv=input_tsv,
+        pdb_map=rescue_pdb_map,
+        out_dir=struct_dir,
+        sap_max_threshold=sap_max_threshold,
+        catalytic_his_resnos=catalytic_his_resnos,
+        fixed_resnos=fixed_resnos,
+        clash_filter=clash_filter,
+        clash_severe_distance=clash_severe_distance,
+        seed_dfi_metrics=seed_dfi_metrics,
+    )
+
+    struct_frames: list[pd.DataFrame] = []
+    for fname in ("survivors_struct.tsv", "rejects_struct.tsv"):
+        p = struct_dir / fname
+        if p.is_file():
+            try:
+                struct_frames.append(pd.read_csv(p, sep="\t"))
+            except Exception as exc:
+                LOGGER.warning("deferred_rescue: could not read %s: %s", p, exc)
+    if struct_frames:
+        struct_all = pd.concat(struct_frames, ignore_index=True)
+        struct_all = struct_all.drop_duplicates(subset=["id"], keep="first")
+    else:
+        LOGGER.warning(
+            "deferred_rescue: struct filter produced no readable outputs; "
+            "falling back to unannotated candidate rows",
+        )
+        struct_all = rescue_df.copy()
+    struct_all_tsv = struct_dir / "all_struct_scored.tsv"
+    struct_all.to_csv(struct_all_tsv, sep="\t", index=False)
+
+    current_tsv = struct_all_tsv
+    if tunnel_metrics_enabled:
+        tunnel_dir = out_dir / "035_tunnel"
+        current_tsv = stage_tunnel_metrics(
+            survivors_struct_tsv=current_tsv,
+            pdb_map=rescue_pdb_map,
+            out_dir=tunnel_dir,
+            catalytic_resnos=catalytic_resnos,
+            ligand_min_radius=ligand_min_radius,
+            ligand_resname=ligand_resname,
+            chain=chain,
+            hard_gate=False,
+        )
+
+    fitness_dir = out_dir / "04_fitness"
+    scored_tsv = stage_fitness_score(
+        survivors_struct_tsv=current_tsv,
+        out_dir=fitness_dir,
+        log_probs_esmc=log_probs_esmc,
+        log_probs_saprot=log_probs_saprot,
+        weights_per_position=weights_per_position,
+        fitness_cache=fitness_cache,
+        wt_fitness=wt_fitness,
+    )
+
+    fpocket_dir = out_dir / "05_fpocket"
+    ranked_tsv = stage_fpocket_rank(
+        scored_tsv=scored_tsv,
+        pdb_map=rescue_pdb_map,
+        out_dir=fpocket_dir,
+        catalytic_resnos=catalytic_resnos,
+        chain=chain,
+    )
+    rescued = pd.read_csv(ranked_tsv, sep="\t")
+    if "source_id" not in rescued.columns and "id" in rescued.columns:
+        rescued["source_id"] = rescued["id"].astype(str)
+
+    from protein_chisel.scoring.multi_objective import (
+        DEFAULT_METRIC_SPECS, apply_cli_overrides, compute_topsis_scores_v2,
+    )
+    active_specs = apply_cli_overrides(
+        DEFAULT_METRIC_SPECS, rank_weights, rank_targets,
+    )
+    rescue_scores, _used_specs, _debug = compute_topsis_scores_v2(
+        rescued, active_specs,
+    )
+    rescued["mo_topsis"] = rescue_scores
+    rescued["selection__deferred_rescue_attempted"] = True
+
+    struct_failed = ~rescued.get(
+        "passed_struct_filter",
+        pd.Series([False] * len(rescued), index=rescued.index),
+    ).fillna(False).astype(bool)
+    if tunnel_metrics_enabled:
+        tunnel_failed = rescued.get(
+            "tunnel__verdict",
+            pd.Series(["not_run"] * len(rescued), index=rescued.index),
+        ).fillna("not_run").astype(str).isin(["buried", "ligand_too_big", "error", "missing_pdb"])
+    else:
+        tunnel_failed = pd.Series([False] * len(rescued), index=rescued.index)
+
+    fpocket_status = rescued.get(
+        "fpocket__status",
+        pd.Series(["failed"] * len(rescued), index=rescued.index),
+    ).fillna("failed").astype(str)
+    fpocket_druggability = pd.to_numeric(
+        rescued.get(
+            "fpocket__druggability",
+            pd.Series([float("nan")] * len(rescued), index=rescued.index),
+        ),
+        errors="coerce",
+    )
+    if fpocket_druggability_min > 0:
+        fpocket_pass = fpocket_status.eq("ok") & (fpocket_druggability >= fpocket_druggability_min)
+        fpocket_near = fpocket_status.eq("ok") & fpocket_druggability.notna() & ~fpocket_pass
+        rescued["selection__fpocket_gap"] = np.where(
+            fpocket_druggability.notna(),
+            np.maximum(0.0, float(fpocket_druggability_min) - fpocket_druggability),
+            np.inf,
+        )
+    else:
+        fpocket_pass = fpocket_status.eq("ok")
+        fpocket_near = pd.Series([False] * len(rescued), index=rescued.index)
+        rescued["selection__fpocket_gap"] = 0.0
+    fpocket_failed = ~fpocket_pass & ~fpocket_near
+
+    rescued["selection__hard_final_filter_passed"] = fpocket_pass
+    rescued["selection__deferred_rescue_struct_failed"] = struct_failed
+    rescued["selection__deferred_rescue_tunnel_failed"] = tunnel_failed
+    rescued["selection__bucket"] = np.select(
+        [
+            fpocket_pass & ~tunnel_failed & ~struct_failed,
+            fpocket_near & ~tunnel_failed & ~struct_failed,
+            fpocket_failed & ~tunnel_failed & ~struct_failed,
+            tunnel_failed & ~struct_failed,
+            struct_failed,
+        ],
+        [
+            "rescued_final_filters",
+            "rescued_fpocket_near_miss",
+            "rescued_fpocket_failed",
+            "rescued_tunnel_hard_gate",
+            "rescued_struct_failed",
+        ],
+        default="rescued_unclassified",
+    )
+    rescued["selection__bucket_priority"] = np.select(
+        [
+            rescued["selection__bucket"].eq("rescued_final_filters"),
+            rescued["selection__bucket"].eq("rescued_fpocket_near_miss"),
+            rescued["selection__bucket"].eq("rescued_fpocket_failed"),
+            rescued["selection__bucket"].eq("rescued_tunnel_hard_gate"),
+            rescued["selection__bucket"].eq("rescued_struct_failed"),
+        ],
+        [2, 3, 4, 5, 6],
+        default=7,
+    ).astype(int)
+    rescued = rescued.sort_values(
+        [
+            "selection__bucket_priority",
+            "selection__seq_backfill_reason_count",
+            "selection__seq_backfill_numeric_gap",
+            "selection__fpocket_gap",
+            "mo_topsis",
+            "fitness__logp_fused_mean",
+        ],
+        ascending=[True, True, True, True, False, False],
+        na_position="last",
+    ).reset_index(drop=True)
+    LOGGER.info(
+        "deferred_rescue: scored %d fallback candidates -> buckets=%s",
+        len(rescued),
+        rescued["selection__bucket"].value_counts().to_dict(),
+    )
+    return rescued
+
+
+def _write_empty_final_artifacts(
+    *,
+    final_dir: Path,
+    run_dir: Path,
+    template_df: pd.DataFrame,
+    status: str,
+    reason: str,
+    extra_meta: Optional[dict] = None,
+) -> None:
+    """Write a schema-stable empty final_topk tree for downstream stages."""
+    final_dir.mkdir(parents=True, exist_ok=True)
+    empty = template_df.head(0).copy()
+    empty.to_csv(final_dir / "all_survivors.tsv", sep="\t", index=False)
+    empty.to_csv(final_dir / "topk.tsv", sep="\t", index=False)
+    (final_dir / "topk.fasta").write_text("")
+    (final_dir / "topk_pdbs").mkdir(exist_ok=True)
+
+    manifest_stub = run_dir / "manifest.json"
+    payload = {
+        "status": status,
+        "reason": reason,
+        "outputs": {
+            "final_topk_fasta": str(final_dir / "topk.fasta"),
+            "final_topk_pdbs": str(final_dir / "topk_pdbs"),
+            "final_topk_tsv": str(final_dir / "topk.tsv"),
+            "all_survivors": str(final_dir / "all_survivors.tsv"),
+        },
+    }
+    if extra_meta:
+        payload.update(extra_meta)
+    with open(manifest_stub, "w") as fh:
+        json.dump(payload, fh, indent=2)
 
 
 def stage_diverse_topk(
@@ -3130,6 +4234,12 @@ def main() -> None:
     p.add_argument("--cycles", type=int, default=3,
                    help="Use the default 3-cycle schedule when 3 (default), "
                         "or override with a single-cycle short test (1).")
+    p.add_argument("--debug-short-test", "--debug_short_test",
+                   dest="debug_short_test", action="store_true",
+                   help="Fast smoke-test preset. Hard overrides the normal "
+                        "production schedule to 3 cycles with 20/10/10 sampled "
+                        "designs and forces final target_k=5. Intended only to "
+                        "validate end-to-end execution quickly.")
     p.add_argument("--omit_AA", type=str, default="X",
                    help="AAs MPNN may never sample. Default 'X' (UNK only) -- "
                         "no canonical AAs are silently forbidden. Pass 'CX' "
@@ -3173,6 +4283,26 @@ def main() -> None:
                    help="Drop designs with fpocket-druggability below this "
                         "(no detectable active-site cavity = bad design). "
                         "Set to 0 to disable.")
+    p.add_argument("--final_filter_backfill", type=_parse_bool_arg, default=True,
+                   metavar="{true,false}",
+                   help="Default true. If the final hard fpocket-druggability "
+                        "cutoff leaves fewer than target_k designs, backfill "
+                        "from the closest near-miss candidates so the final "
+                        "top-K stays populated when possible. Pass designs "
+                        "are always prioritized ahead of backfilled ones; "
+                        "tool-failed fpocket rows are only used as a last "
+                        "resort after real near-misses. Set false for strict "
+                        "pass-only final outputs.")
+    p.add_argument("--copy-input-structure-into-out-dir",
+                   "--copy_input_structure_into_out_dir",
+                   dest="copy_input_structure_into_out_dir",
+                   type=_parse_bool_arg, default=True,
+                   metavar="{true,false}",
+                   help="Default true. After final selection, compute a "
+                        "metrics row for the original input structure and "
+                        "carry it into the shipped output directory alongside "
+                        "the final designs. The original input PDB filename is "
+                        "preserved exactly.")
     p.add_argument("--no_clash_filter", action="store_true",
                    help="Disable the heavy-atom clash check between catalytic+"
                         "ligand and designed sidechains. Off by default; only "
@@ -3393,6 +4523,15 @@ def main() -> None:
             "MPNN's structure-conditioned logits (collapse to PLM "
             "consensus). Typical range 0.5-2.0.", args.plm_strength,
         )
+    debug_short_test_override_msg = None
+    if args.debug_short_test:
+        if args.target_k != 5 or args.cycles != 3:
+            debug_short_test_override_msg = (
+                f"debug-short-test preset overriding target_k={args.target_k} -> 5 "
+                f"and cycles={args.cycles} -> 3"
+            )
+        args.target_k = 5
+        args.cycles = 3
 
     if args.verbose and args.quiet:
         raise SystemExit("--verbose and --quiet are mutually exclusive")
@@ -3403,6 +4542,8 @@ def main() -> None:
         level=log_level,
         format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s",
     )
+    if debug_short_test_override_msg:
+        LOGGER.info(debug_short_test_override_msg)
 
     # Auto-derive catalytic resnos from the seed's REMARK 666 block. This
     # makes the same driver/sbatch work on any scaffold in the design
@@ -3424,11 +4565,13 @@ def main() -> None:
     # Include microseconds + PID to prevent concurrent-job collisions on
     # second-precision timestamps (real bug observed during a 4-job
     # parallel sweep — two jobs that started in the same second wrote
-    # to the same run_dir and overwrote each other's outputs).
+    # to the same run_dir and overwrote each other's outputs). The
+    # visible prefix is intentionally short to reduce nested path length
+    # for downstream tool workspaces.
     import os as _os_pid
     ts_micro = _dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]  # ms precision
     timestamp = f"{ts_micro}-pid{_os_pid.getpid()}"
-    run_dir = args.out_root / f"chisel_design_{timestamp}"
+    run_dir = args.out_root / f"run_{timestamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
     LOGGER.info("=== run dir: %s ===", run_dir)
     if args.run_dir_marker:
@@ -3678,7 +4821,8 @@ def main() -> None:
     LOGGER.info("structural omit_AA (from rule engine only): %s", omit_AA_per_residue)
 
     # ---- Cycle schedule ---------------------------------------------
-    cycles = default_cycles(
+    cycle_builder = debug_short_test_cycles if args.debug_short_test else default_cycles
+    cycles = cycle_builder(
         omit_AA=args.omit_AA,
         use_side_chain_context=args.use_side_chain_context,
         enhance=args.enhance,
@@ -3690,6 +4834,11 @@ def main() -> None:
         consensus_strength=args.consensus_strength,
         consensus_max_fraction=args.consensus_max_fraction,
     )
+    if args.debug_short_test:
+        LOGGER.info(
+            "debug-short-test preset active: cycle_samples=%s, target_k=%d",
+            [c.n_samples for c in cycles], args.target_k,
+        )
     LOGGER.info("strategy: %s", args.strategy)
     if args.strategy == "annealing":
         for c in cycles:
@@ -3753,6 +4902,7 @@ def main() -> None:
 
     # ---- Loop cycles ------------------------------------------------
     all_ranked: list[pd.DataFrame] = []
+    all_seq_stage_rows: list[pd.DataFrame] = []
     all_pdb_maps: dict[str, Path] = {}
     fitness_cache: dict = {}
     survivors_prev: Optional[pd.DataFrame] = None
@@ -3824,6 +4974,9 @@ def main() -> None:
             if (args.throat_feedback and cyc_telem)
             else None
         )
+        seq_stage_df = _load_cycle_seq_stage_pool(cycle_dir, cyc.cycle_idx)
+        if len(seq_stage_df) > 0:
+            all_seq_stage_rows.append(seq_stage_df)
         if ranked_df is not None and len(ranked_df) > 0:
             ranked_df = ranked_df.copy()
             ranked_df["cycle"] = cyc.cycle_idx
@@ -3965,51 +5118,35 @@ def main() -> None:
     # ---- Final pool: concat + dedup --------------------------------
     final_dir = run_dir / "final_topk"
     final_dir.mkdir(parents=True, exist_ok=True)
+    from protein_chisel.scoring.multi_objective import parse_kv_string
+    rank_weights = parse_kv_string(args.rank_weights)
+    rank_targets = parse_kv_string(args.rank_targets)
+    final_cycle_cfg = cycles[-1]
+
     if all_ranked:
         from protein_chisel.sampling.fitness_score import deduplicate_by_sequence
 
-        pool = pd.concat(all_ranked, ignore_index=True)
-        pool = deduplicate_by_sequence(pool)
-        # Drop designs with no detectable active-site pocket. fpocket
-        # druggability < threshold means the constrained search at the
-        # catalytic site couldn't find a pocket -- bad design.
+        pool_prefilter = pd.concat(all_ranked, ignore_index=True)
+        pool_prefilter = deduplicate_by_sequence(pool_prefilter)
         druggability_min = cycles[0].fpocket_druggability_min
-        if "fpocket__druggability" in pool.columns and druggability_min > 0:
-            n_before = len(pool)
-            pool = pool[pool["fpocket__druggability"] >= druggability_min].copy()
+        n_before = len(pool_prefilter)
+        fpocket_status = (
+            pool_prefilter["fpocket__status"].astype(str)
+            if "fpocket__status" in pool_prefilter.columns
+            else pd.Series(["unknown"] * len(pool_prefilter), index=pool_prefilter.index)
+        )
+        fpocket_druggability = (
+            pd.to_numeric(pool_prefilter["fpocket__druggability"], errors="coerce")
+            if "fpocket__druggability" in pool_prefilter.columns
+            else pd.Series([float("nan")] * len(pool_prefilter), index=pool_prefilter.index)
+        )
+        pass_mask = pd.Series([True] * len(pool_prefilter), index=pool_prefilter.index)
+        if "fpocket__druggability" in pool_prefilter.columns and druggability_min > 0:
+            pass_mask = fpocket_druggability >= druggability_min
             LOGGER.info(
                 "fpocket-druggability filter: %d -> %d (cutoff=%.2f)",
-                n_before, len(pool), druggability_min,
+                n_before, int(pass_mask.sum()), druggability_min,
             )
-            if len(pool) == 0:
-                # Empty-pool exit: write a stub manifest + empty TSV so
-                # downstream stages can detect the no-results state
-                # without crashing in TOPSIS min/max. Common cause: every
-                # design fell below druggability cutoff (often a sign
-                # that fpocket failed for the whole batch — see
-                # fpocket__status / fpocket__returncode columns to
-                # distinguish "tool failed" from "real low druggability").
-                LOGGER.error(
-                    "All %d designs filtered out by fpocket-druggability >= %.2f. "
-                    "Writing empty final artifacts and exiting cleanly. "
-                    "Diagnose: (a) inspect cycle_NN/05_fpocket/ranked.tsv "
-                    "fpocket__status column for tool-failure counts, "
-                    "(b) grep slurm-stderr for 'fpocket failed for ... rc=' "
-                    "to see specific subprocess return codes.",
-                    n_before, druggability_min,
-                )
-                pool.to_csv(final_dir / "all_survivors.tsv", sep="\t", index=False)
-                (final_dir / "topk_pdbs").mkdir(exist_ok=True)
-                manifest_stub = run_dir / "manifest.json"
-                if not manifest_stub.exists():
-                    import json as _json
-                    manifest_stub.write_text(_json.dumps(
-                        {"status": "EMPTY_POOL_AFTER_FPOCKET_FILTER",
-                         "n_before_filter": n_before,
-                         "druggability_cutoff": float(druggability_min)},
-                        indent=2,
-                    ))
-                return
         # ---- Multi-objective ranking over the full pool ---------------
         # TOPSIS over a configurable basket of metrics with CLI-tunable
         # weights / targets. Replaces the legacy 2-key (fitness,
@@ -4019,25 +5156,192 @@ def main() -> None:
             DEFAULT_METRIC_SPECS, apply_cli_overrides, compute_topsis_scores_v2,
             parse_kv_string, select_diverse_topk_two_axis,
         )
-        rank_weights = parse_kv_string(args.rank_weights)
-        rank_targets = parse_kv_string(args.rank_targets)
         active_specs = apply_cli_overrides(
             DEFAULT_METRIC_SPECS, rank_weights, rank_targets,
         )
-        scores, used_specs, _debug = compute_topsis_scores_v2(pool, active_specs)
-        pool["mo_topsis"] = scores
-        # Legacy diagnostic — keep next to mo_topsis so we can compare.
-        pool["legacy_rank_score"] = (
-            pool["fitness__logp_fused_mean"].rank(ascending=False)
-            + pool["fpocket__mean_alpha_sphere_radius"].rank(ascending=True)
+        scores, used_specs, _debug = compute_topsis_scores_v2(
+            pool_prefilter, active_specs,
         )
-        pool = pool.sort_values(
+        pool_prefilter["mo_topsis"] = scores
+        # Legacy diagnostic — keep next to mo_topsis so we can compare.
+        pool_prefilter["legacy_rank_score"] = (
+            pool_prefilter["fitness__logp_fused_mean"].rank(ascending=False)
+            + pool_prefilter["fpocket__mean_alpha_sphere_radius"].rank(ascending=True)
+        )
+        pool_prefilter["selection__hard_final_filter_passed"] = pass_mask.astype(bool)
+        if druggability_min > 0 and "fpocket__druggability" in pool_prefilter.columns:
+            pool_prefilter["selection__fpocket_gap"] = np.where(
+                fpocket_druggability.notna(),
+                np.maximum(0.0, float(druggability_min) - fpocket_druggability),
+                np.inf,
+            )
+        else:
+            pool_prefilter["selection__fpocket_gap"] = 0.0
+
+        near_miss_mask = (~pass_mask) & fpocket_status.eq("ok") & fpocket_druggability.notna()
+        failed_mask = ~pass_mask & ~near_miss_mask
+        pool_prefilter["selection__bucket"] = np.select(
+            [pass_mask, near_miss_mask],
+            ["passed_final_filters", "fpocket_near_miss"],
+            default="fpocket_failed_or_missing",
+        )
+        pool_prefilter["selection__bucket_priority"] = np.select(
+            [pass_mask, near_miss_mask],
+            [0, 1],
+            default=2,
+        ).astype(int)
+
+        strict_pool = pool_prefilter[pass_mask].copy()
+        strict_pool = strict_pool.sort_values(
             ["mo_topsis", "fitness__logp_fused_mean"],
             ascending=[False, False], na_position="last",
         ).reset_index(drop=True)
+
+        if len(strict_pool) == 0 and not args.final_filter_backfill:
+            LOGGER.error(
+                "All %d designs filtered out by fpocket-druggability >= %.2f. "
+                "Writing empty final artifacts and exiting cleanly. "
+                "Diagnose: (a) inspect cycle_NN/05_fpocket/ranked.tsv "
+                "fpocket__status column for tool-failure counts, "
+                "(b) grep slurm-stderr for 'fpocket failed for ... rc=' "
+                "to see specific subprocess return codes.",
+                n_before, druggability_min,
+            )
+            _write_empty_final_artifacts(
+                final_dir=final_dir,
+                run_dir=run_dir,
+                template_df=pool_prefilter,
+                status="EMPTY_POOL_AFTER_FPOCKET_FILTER",
+                reason=(
+                    f"All {n_before} designs failed the final "
+                    f"fpocket-druggability >= {druggability_min:.2f} cutoff"
+                ),
+                extra_meta={
+                    "n_before_filter": n_before,
+                    "druggability_cutoff": float(druggability_min),
+                },
+            )
+            return
+
+        if args.final_filter_backfill and druggability_min > 0:
+            primary_pool = pool_prefilter[~failed_mask].copy()
+            primary_pool = primary_pool.sort_values(
+                [
+                    "selection__bucket_priority",
+                    "selection__fpocket_gap",
+                    "mo_topsis",
+                    "fitness__logp_fused_mean",
+                ],
+                ascending=[True, True, False, False],
+                na_position="last",
+            ).reset_index(drop=True)
+            failed_pool = pool_prefilter[failed_mask].copy()
+            failed_pool = failed_pool.sort_values(
+                ["mo_topsis", "fitness__logp_fused_mean"],
+                ascending=[False, False],
+                na_position="last",
+            ).reset_index(drop=True)
+            seq_backfill_pool, seq_backfill_specs = _build_seq_stage_backfill_pool(
+                seq_stage_rows=all_seq_stage_rows,
+                existing_pool=pool_prefilter,
+                log_probs_esmc=log_probs_esmc,
+                log_probs_saprot=log_probs_saprot,
+                weights_per_position=weights_per_position,
+                fitness_cache=fitness_cache,
+                rank_weights=rank_weights,
+                rank_targets=rank_targets,
+            )
+            rescue_deficit = max(0, args.target_k - len(primary_pool))
+            rescued_seq_backfill_pool = seq_backfill_pool.head(0).copy()
+            raw_seq_backfill_pool = seq_backfill_pool.copy()
+            if rescue_deficit > 0 and len(seq_backfill_pool) > 0:
+                shortlist_n = min(
+                    len(seq_backfill_pool),
+                    _deferred_rescue_shortlist_size(
+                        deficit=rescue_deficit,
+                        target_k=args.target_k,
+                    ),
+                )
+                rescue_shortlist = seq_backfill_pool.head(shortlist_n).copy()
+                rescued_seq_backfill_pool = _deferred_rescue_score_candidates(
+                    candidates_df=rescue_shortlist,
+                    pdb_map=all_pdb_maps,
+                    out_dir=final_dir / "_deferred_rescue_seq_backfill",
+                    catalytic_his_resnos=CATALYTIC_HIS_RESNOS,
+                    catalytic_resnos=fixed_resnos,
+                    fixed_resnos=fixed_resnos,
+                    sap_max_threshold=final_cycle_cfg.sap_max_threshold,
+                    clash_filter=final_cycle_cfg.clash_filter,
+                    clash_severe_distance=final_cycle_cfg.clash_severe_distance,
+                    seed_dfi_metrics=seed_dfi_metrics,
+                    tunnel_metrics_enabled=args.tunnel_metrics,
+                    ligand_min_radius=ligand_geometry_summary.get("min_projected_radius"),
+                    ligand_resname=ligand_geometry_summary.get("ligand_resname"),
+                    log_probs_esmc=log_probs_esmc,
+                    log_probs_saprot=log_probs_saprot,
+                    weights_per_position=weights_per_position,
+                    fitness_cache=fitness_cache,
+                    wt_fitness=wt_fitness,
+                    rank_weights=rank_weights,
+                    rank_targets=rank_targets,
+                    fpocket_druggability_min=druggability_min,
+                    chain=CHAIN,
+                )
+                rescued_source_ids = set(
+                    _candidate_source_id_series(rescued_seq_backfill_pool).tolist(),
+                )
+                raw_source_ids = _candidate_source_id_series(seq_backfill_pool)
+                raw_seq_backfill_pool = seq_backfill_pool.loc[
+                    ~raw_source_ids.isin(rescued_source_ids)
+                ].copy().reset_index(drop=True)
+                LOGGER.info(
+                    "deferred_rescue: shortlisted %d seq-stage backfill "
+                    "candidates (deficit=%d) -> rescued=%d raw_remaining=%d",
+                    shortlist_n, rescue_deficit,
+                    len(rescued_seq_backfill_pool), len(raw_seq_backfill_pool),
+                )
+            pool_parts = [primary_pool]
+            if len(rescued_seq_backfill_pool) > 0:
+                pool_parts.append(rescued_seq_backfill_pool)
+            if len(failed_pool) > 0:
+                pool_parts.append(failed_pool)
+            if len(raw_seq_backfill_pool) > 0:
+                pool_parts.append(raw_seq_backfill_pool)
+            pool = pd.concat(pool_parts, ignore_index=True)
+            sort_pairs = [
+                ("selection__bucket_priority", True),
+                ("selection__seq_backfill_reason_count", True),
+                ("selection__seq_backfill_numeric_gap", True),
+                ("selection__fpocket_gap", True),
+                ("mo_topsis", False),
+                ("fitness__logp_fused_mean", False),
+            ]
+            pool_sort_cols = [c for c, _asc in sort_pairs if c in pool.columns]
+            pool_sort_asc = [asc for c, asc in sort_pairs if c in pool.columns]
+            if pool_sort_cols:
+                pool = pool.sort_values(
+                    pool_sort_cols,
+                    ascending=pool_sort_asc,
+                    na_position="last",
+                ).reset_index(drop=True)
+            LOGGER.info(
+                "final filter backfill: strict_pass=%d near_miss=%d "
+                "fpocket_failed_or_missing=%d rescued_seq_stage=%d "
+                "raw_seq_stage=%d "
+                "target_k=%d",
+                int(pass_mask.sum()),
+                int(near_miss_mask.sum()),
+                int(failed_mask.sum()),
+                len(rescued_seq_backfill_pool),
+                len(raw_seq_backfill_pool),
+                args.target_k,
+            )
+        else:
+            pool = strict_pool
+
         pool.to_csv(final_dir / "all_survivors.tsv", sep="\t", index=False)
         LOGGER.info("final pool: %d unique survivors across %d cycles",
-                     len(pool), len(all_ranked))
+                     len(pool_prefilter), len(all_ranked))
         LOGGER.info("multi-objective ranking applied with %d active specs:",
                      len(used_specs))
         for s in used_specs:
@@ -4066,31 +5370,199 @@ def main() -> None:
             except Exception as exc:
                 LOGGER.warning("could not extract primary positions: %s", exc)
 
-        top = select_diverse_topk_two_axis(
-            pool, target_k=args.target_k,
+        top, topk_telemetry = _select_diverse_topk_progressive(
+            pool,
+            target_k=args.target_k,
             min_hamming_full=args.min_hamming,
             primary_sphere_positions=primary_positions,
             min_hamming_active=args.min_hamming_active,
-            score_col="mo_topsis",
         )
-        # Write the top-K artifact files (PDB copy, FASTA, TSV).
-        top.to_csv(final_dir / "topk.tsv", sep="\t", index=False)
-        with open(final_dir / "topk.fasta", "w") as fh:
-            for _, row in top.iterrows():
-                fh.write(f">{row['id']}\n{row['sequence']}\n")
-        pdb_out = final_dir / "topk_pdbs"
-        pdb_out.mkdir(exist_ok=True)
-        for _, row in top.iterrows():
-            src = all_pdb_maps.get(row["id"])
-            if src and src.is_file():
-                shutil.copy2(src, pdb_out / src.name)
-        topk_tsv = final_dir / "topk.tsv"
-        LOGGER.info(
-            "stage_diverse_topk: selected %d / %d "
-            "(target=%d, min_hamming=%d, min_hamming_active=%d)",
-            len(top), len(pool), args.target_k,
-            args.min_hamming, args.min_hamming_active,
+        materializable_candidates = int(
+            _candidate_source_id_series(pool).map(
+                lambda sid: bool((src := all_pdb_maps.get(sid)) and src.is_file()),
+            ).sum(),
         )
+        if (
+            args.final_filter_backfill
+            and materializable_candidates < args.target_k
+        ):
+            LOGGER.warning(
+                "final_filter_backfill requested %d outputs, but only %d "
+                "unique candidates had a materializable source PDB after "
+                "cycle union/dedup. Final output will be capped accordingly.",
+                args.target_k, materializable_candidates,
+            )
+
+        top, materialize_telemetry = _select_materializable_topk(
+            selected_df=top,
+            candidate_pool=pool,
+            pdb_map=all_pdb_maps,
+            target_k=args.target_k,
+            min_hamming_full=args.min_hamming,
+            primary_sphere_positions=primary_positions,
+            min_hamming_active=args.min_hamming_active,
+            allow_backfill=args.final_filter_backfill,
+        )
+        n_ids_renamed = int(materialize_telemetry.get("n_ids_renamed", 0))
+        if n_ids_renamed:
+            LOGGER.warning(
+                "stage_diverse_topk: renamed %d duplicate final ids across "
+                "cycles to keep exported PDBs collision-free",
+                n_ids_renamed,
+            )
+        if materialize_telemetry.get("dropped_missing_source_pdbs", 0):
+            LOGGER.warning(
+                "stage_diverse_topk: dropped %d selected rows with missing "
+                "source PDBs before writing final artifacts",
+                materialize_telemetry["dropped_missing_source_pdbs"],
+            )
+        if materialize_telemetry.get("refill_rounds"):
+            LOGGER.info(
+                "stage_diverse_topk: materialization refill rounds=%s",
+                materialize_telemetry["refill_rounds"],
+            )
+
+        deferred_rescue_mask = (
+            ~top.get(
+                "selection__deferred_rescue_attempted",
+                pd.Series([False] * len(top), index=top.index),
+            ).fillna(False).astype(bool)
+        ) & (
+            top.get(
+                "selection__bucket",
+                pd.Series([""] * len(top), index=top.index),
+            ).fillna("").astype(str).str.startswith("seq_stage_")
+            | top.get(
+                "fpocket__status",
+                pd.Series(["failed"] * len(top), index=top.index),
+            ).fillna("failed").astype(str).isin(["not_run", "failed", "missing"])
+        )
+        if deferred_rescue_mask.any():
+            deferred_top = top.loc[deferred_rescue_mask].copy()
+            LOGGER.info(
+                "deferred_rescue: final top-K still contains %d raw seq-stage "
+                "rows without full downstream scoring; rescuing before export",
+                len(deferred_top),
+            )
+            rescued_top = _deferred_rescue_score_candidates(
+                candidates_df=deferred_top,
+                pdb_map=all_pdb_maps,
+                out_dir=final_dir / "_deferred_rescue_selected_topk",
+                catalytic_his_resnos=CATALYTIC_HIS_RESNOS,
+                catalytic_resnos=fixed_resnos,
+                fixed_resnos=fixed_resnos,
+                sap_max_threshold=final_cycle_cfg.sap_max_threshold,
+                clash_filter=final_cycle_cfg.clash_filter,
+                clash_severe_distance=final_cycle_cfg.clash_severe_distance,
+                seed_dfi_metrics=seed_dfi_metrics,
+                tunnel_metrics_enabled=args.tunnel_metrics,
+                ligand_min_radius=ligand_geometry_summary.get("min_projected_radius"),
+                ligand_resname=ligand_geometry_summary.get("ligand_resname"),
+                log_probs_esmc=log_probs_esmc,
+                log_probs_saprot=log_probs_saprot,
+                weights_per_position=weights_per_position,
+                fitness_cache=fitness_cache,
+                wt_fitness=wt_fitness,
+                rank_weights=rank_weights,
+                rank_targets=rank_targets,
+                fpocket_druggability_min=druggability_min,
+                chain=CHAIN,
+            )
+            top = _overlay_rows_by_id(top, rescued_top)
+
+        requested_topk_rows = len(top)
+        topk_tsv, top = _write_final_topk_artifacts(
+            top=top,
+            final_dir=final_dir,
+            pdb_map=all_pdb_maps,
+        )
+        copied_pdbs = len(top)
+        if copied_pdbs != requested_topk_rows:
+            LOGGER.error(
+                "stage_diverse_topk: wrote %d rows to topk.tsv but only %d "
+                "PDBs were copied to final_topk/topk_pdbs",
+                requested_topk_rows, copied_pdbs,
+            )
+        if args.final_filter_backfill and copied_pdbs < args.target_k:
+            LOGGER.warning(
+                "stage_diverse_topk: final materialized top-K underfilled "
+                "(%d/%d requested). materializable_candidates=%d",
+                copied_pdbs, args.target_k, materializable_candidates,
+            )
+        if (
+            args.final_filter_backfill
+            and copied_pdbs < args.target_k
+            and materializable_candidates >= args.target_k
+        ):
+            LOGGER.error(
+                "stage_diverse_topk: backfill was enabled and at least %d "
+                "materializable candidates existed, but only %d final PDBs "
+                "were written. Inspect the preceding export errors.",
+                args.target_k, copied_pdbs,
+            )
+
+        if args.copy_input_structure_into_out_dir:
+            final_cycle_cfg = cycles[-1]
+            input_reference_df = _build_input_reference_row(
+                template_df=top,
+                seed_pdb=args.seed_pdb,
+                wt_seq=wt_seq,
+                wt_fitness=wt_fitness,
+                expression_result=wt_eng,
+                seed_ss_reduced=ss.ss_reduced,
+                seed_sasa=seed_sasa,
+                position_classes=position_classes,
+                protein_resnos=protein_resnos,
+                catalytic_resnos=DEFAULT_CATRES,
+                fixed_resnos=fixed_resnos,
+                design_ph=7.5,
+                n_term_pad="",
+                c_term_pad="",
+                net_charge_max=final_cycle_cfg.net_charge_max,
+                net_charge_min=final_cycle_cfg.net_charge_min,
+                instability_max=final_cycle_cfg.instability_max,
+                gravy_min=final_cycle_cfg.gravy_min,
+                gravy_max=final_cycle_cfg.gravy_max,
+                aliphatic_min=final_cycle_cfg.aliphatic_min,
+                boman_max=final_cycle_cfg.boman_max,
+                pi_min=final_cycle_cfg.pi_min,
+                pi_max=final_cycle_cfg.pi_max,
+                clash_filter=final_cycle_cfg.clash_filter,
+                clash_severe_distance=final_cycle_cfg.clash_severe_distance,
+                sap_max_threshold=final_cycle_cfg.sap_max_threshold,
+                seed_dfi_metrics=seed_dfi_metrics,
+                tunnel_metrics_enabled=args.tunnel_metrics,
+                ligand_min_radius=ligand_geometry_summary.get("min_projected_radius"),
+                ligand_resname=ligand_geometry_summary.get("ligand_resname"),
+                log_probs_esmc=log_probs_esmc,
+                log_probs_saprot=log_probs_saprot,
+                weights_per_position=weights_per_position,
+                final_dir=final_dir,
+                fpocket_druggability_min=druggability_min,
+            )
+            input_reference_path = final_dir / "input_reference.tsv"
+            input_reference_df.to_csv(input_reference_path, sep="\t", index=False)
+            LOGGER.info(
+                "input reference metrics: wrote %s (id=%s)",
+                input_reference_path, args.seed_pdb.stem,
+            )
+        if "selection__bucket" in top.columns:
+            bucket_counts = top["selection__bucket"].value_counts().to_dict()
+            LOGGER.info(
+                "stage_diverse_topk: selected %d / %d "
+                "(target=%d, min_hamming=%d, min_hamming_active=%d, "
+                "bucket_counts=%s, unconstrained_fill=%d)",
+                len(top), len(pool), args.target_k,
+                args.min_hamming, args.min_hamming_active,
+                bucket_counts, topk_telemetry.get("filled_without_hamming", 0),
+            )
+        else:
+            LOGGER.info(
+                "stage_diverse_topk: selected %d / %d "
+                "(target=%d, min_hamming=%d, min_hamming_active=%d)",
+                len(top), len(pool), args.target_k,
+                args.min_hamming, args.min_hamming_active,
+            )
         # ---- Optional final-stage enrichments on top-K only --------
         if args.cms_final:
             topk_tsv = stage_cms_final(
@@ -4113,7 +5585,263 @@ def main() -> None:
                 ptm=args.ptm,
             )
     else:
-        LOGGER.warning("final: zero survivors across all cycles!")
+        seq_backfill_pool, used_specs = _build_seq_stage_backfill_pool(
+            seq_stage_rows=all_seq_stage_rows,
+            existing_pool=None,
+            log_probs_esmc=log_probs_esmc,
+            log_probs_saprot=log_probs_saprot,
+            weights_per_position=weights_per_position,
+            fitness_cache=fitness_cache,
+            rank_weights=rank_weights,
+            rank_targets=rank_targets,
+        )
+        if args.final_filter_backfill and len(seq_backfill_pool) > 0:
+            LOGGER.warning(
+                "final: zero ranked survivors across all cycles; falling back "
+                "to seq-stage backfill pool (n=%d)",
+                len(seq_backfill_pool),
+            )
+            pool_prefilter = seq_backfill_pool.copy()
+            shortlist_n = min(
+                len(seq_backfill_pool),
+                _deferred_rescue_shortlist_size(
+                    deficit=args.target_k,
+                    target_k=args.target_k,
+                ),
+            )
+            rescue_shortlist = seq_backfill_pool.head(shortlist_n).copy()
+            rescued_seq_backfill_pool = _deferred_rescue_score_candidates(
+                candidates_df=rescue_shortlist,
+                pdb_map=all_pdb_maps,
+                out_dir=final_dir / "_deferred_rescue_seq_backfill",
+                catalytic_his_resnos=CATALYTIC_HIS_RESNOS,
+                catalytic_resnos=fixed_resnos,
+                fixed_resnos=fixed_resnos,
+                sap_max_threshold=final_cycle_cfg.sap_max_threshold,
+                clash_filter=final_cycle_cfg.clash_filter,
+                clash_severe_distance=final_cycle_cfg.clash_severe_distance,
+                seed_dfi_metrics=seed_dfi_metrics,
+                tunnel_metrics_enabled=args.tunnel_metrics,
+                ligand_min_radius=ligand_geometry_summary.get("min_projected_radius"),
+                ligand_resname=ligand_geometry_summary.get("ligand_resname"),
+                log_probs_esmc=log_probs_esmc,
+                log_probs_saprot=log_probs_saprot,
+                weights_per_position=weights_per_position,
+                fitness_cache=fitness_cache,
+                wt_fitness=wt_fitness,
+                rank_weights=rank_weights,
+                rank_targets=rank_targets,
+                fpocket_druggability_min=cycles[0].fpocket_druggability_min,
+                chain=CHAIN,
+            )
+            rescued_source_ids = set(
+                _candidate_source_id_series(rescued_seq_backfill_pool).tolist(),
+            )
+            raw_source_ids = _candidate_source_id_series(seq_backfill_pool)
+            raw_seq_backfill_pool = seq_backfill_pool.loc[
+                ~raw_source_ids.isin(rescued_source_ids)
+            ].copy().reset_index(drop=True)
+            LOGGER.info(
+                "deferred_rescue: shortlisted %d seq-stage backfill "
+                "candidates (deficit=%d) -> rescued=%d raw_remaining=%d",
+                shortlist_n, args.target_k,
+                len(rescued_seq_backfill_pool), len(raw_seq_backfill_pool),
+            )
+            pool_parts = []
+            if len(rescued_seq_backfill_pool) > 0:
+                pool_parts.append(rescued_seq_backfill_pool)
+            if len(raw_seq_backfill_pool) > 0:
+                pool_parts.append(raw_seq_backfill_pool)
+            pool = pd.concat(pool_parts, ignore_index=True)
+            sort_pairs = [
+                ("selection__bucket_priority", True),
+                ("selection__seq_backfill_reason_count", True),
+                ("selection__seq_backfill_numeric_gap", True),
+                ("selection__fpocket_gap", True),
+                ("mo_topsis", False),
+                ("fitness__logp_fused_mean", False),
+            ]
+            pool_sort_cols = [c for c, _asc in sort_pairs if c in pool.columns]
+            pool_sort_asc = [asc for c, asc in sort_pairs if c in pool.columns]
+            if pool_sort_cols:
+                pool = pool.sort_values(
+                    pool_sort_cols,
+                    ascending=pool_sort_asc,
+                    na_position="last",
+                ).reset_index(drop=True)
+            pool.to_csv(final_dir / "all_survivors.tsv", sep="\t", index=False)
+            LOGGER.info(
+                "final pool: %d seq-stage backfill candidates across %d cycles",
+                len(pool_prefilter), len(cycles),
+            )
+            LOGGER.info("multi-objective ranking applied with %d active specs:",
+                         len(used_specs))
+            for s in used_specs:
+                LOGGER.info("  %-25s direction=%-7s weight=%.2f target=%s",
+                             s.label, s.direction, s.weight, s.target)
+            LOGGER.info("top-5 mo_topsis scores: %s",
+                         pool["mo_topsis"].head(5).round(3).tolist())
+
+            primary_positions: Optional[list[int]] = None
+            if args.min_hamming_active > 0:
+                try:
+                    pt_protein = pt.df[pt.df["is_protein"]].sort_values("resno").reset_index(drop=True)
+                    primary_positions = [
+                        i for i, cls in enumerate(pt_protein["class"].astype(str).tolist())
+                        if cls == "primary_sphere"
+                    ]
+                    LOGGER.info(
+                        "active-site Hamming gate: %d primary_sphere positions, "
+                        "min_hamming_active=%d",
+                        len(primary_positions), args.min_hamming_active,
+                    )
+                except Exception as exc:
+                    LOGGER.warning("could not extract primary positions: %s", exc)
+
+            top, topk_telemetry = _select_diverse_topk_progressive(
+                pool,
+                target_k=args.target_k,
+                min_hamming_full=args.min_hamming,
+                primary_sphere_positions=primary_positions,
+                min_hamming_active=args.min_hamming_active,
+            )
+            materializable_candidates = int(
+                _candidate_source_id_series(pool).map(
+                    lambda sid: bool((src := all_pdb_maps.get(sid)) and src.is_file()),
+                ).sum(),
+            )
+            top, materialize_telemetry = _select_materializable_topk(
+                selected_df=top,
+                candidate_pool=pool,
+                pdb_map=all_pdb_maps,
+                target_k=args.target_k,
+                min_hamming_full=args.min_hamming,
+                primary_sphere_positions=primary_positions,
+                min_hamming_active=args.min_hamming_active,
+                allow_backfill=args.final_filter_backfill,
+            )
+            deferred_rescue_mask = (
+                ~top.get(
+                    "selection__deferred_rescue_attempted",
+                    pd.Series([False] * len(top), index=top.index),
+                ).fillna(False).astype(bool)
+            ) & (
+                top.get(
+                    "selection__bucket",
+                    pd.Series([""] * len(top), index=top.index),
+                ).fillna("").astype(str).str.startswith("seq_stage_")
+                | top.get(
+                    "fpocket__status",
+                    pd.Series(["failed"] * len(top), index=top.index),
+                ).fillna("failed").astype(str).isin(["not_run", "failed", "missing"])
+            )
+            if deferred_rescue_mask.any():
+                deferred_top = top.loc[deferred_rescue_mask].copy()
+                LOGGER.info(
+                    "deferred_rescue: final top-K still contains %d raw seq-stage "
+                    "rows without full downstream scoring; rescuing before export",
+                    len(deferred_top),
+                )
+                rescued_top = _deferred_rescue_score_candidates(
+                    candidates_df=deferred_top,
+                    pdb_map=all_pdb_maps,
+                    out_dir=final_dir / "_deferred_rescue_selected_topk",
+                    catalytic_his_resnos=CATALYTIC_HIS_RESNOS,
+                    catalytic_resnos=fixed_resnos,
+                    fixed_resnos=fixed_resnos,
+                    sap_max_threshold=final_cycle_cfg.sap_max_threshold,
+                    clash_filter=final_cycle_cfg.clash_filter,
+                    clash_severe_distance=final_cycle_cfg.clash_severe_distance,
+                    seed_dfi_metrics=seed_dfi_metrics,
+                    tunnel_metrics_enabled=args.tunnel_metrics,
+                    ligand_min_radius=ligand_geometry_summary.get("min_projected_radius"),
+                    ligand_resname=ligand_geometry_summary.get("ligand_resname"),
+                    log_probs_esmc=log_probs_esmc,
+                    log_probs_saprot=log_probs_saprot,
+                    weights_per_position=weights_per_position,
+                    fitness_cache=fitness_cache,
+                    wt_fitness=wt_fitness,
+                    rank_weights=rank_weights,
+                    rank_targets=rank_targets,
+                    fpocket_druggability_min=cycles[0].fpocket_druggability_min,
+                    chain=CHAIN,
+                )
+                top = _overlay_rows_by_id(top, rescued_top)
+            requested_topk_rows = len(top)
+            topk_tsv, top = _write_final_topk_artifacts(
+                top=top,
+                final_dir=final_dir,
+                pdb_map=all_pdb_maps,
+            )
+            copied_pdbs = len(top)
+            if copied_pdbs != requested_topk_rows:
+                LOGGER.error(
+                    "stage_diverse_topk: wrote %d rows to topk.tsv but only %d "
+                    "PDBs were copied to final_topk/topk_pdbs",
+                    requested_topk_rows, copied_pdbs,
+                )
+            if args.final_filter_backfill and copied_pdbs < args.target_k:
+                LOGGER.warning(
+                    "stage_diverse_topk: final materialized top-K underfilled "
+                    "(%d/%d requested). materializable_candidates=%d",
+                    copied_pdbs, args.target_k, materializable_candidates,
+                )
+
+            if args.copy_input_structure_into_out_dir:
+                final_cycle_cfg = cycles[-1]
+                input_reference_df = _build_input_reference_row(
+                    template_df=top,
+                    seed_pdb=args.seed_pdb,
+                    wt_seq=wt_seq,
+                    wt_fitness=wt_fitness,
+                    expression_result=wt_eng,
+                    seed_ss_reduced=ss.ss_reduced,
+                    seed_sasa=seed_sasa,
+                    position_classes=position_classes,
+                    protein_resnos=protein_resnos,
+                    catalytic_resnos=DEFAULT_CATRES,
+                    fixed_resnos=fixed_resnos,
+                    design_ph=7.5,
+                    n_term_pad="",
+                    c_term_pad="",
+                    net_charge_max=final_cycle_cfg.net_charge_max,
+                    net_charge_min=final_cycle_cfg.net_charge_min,
+                    instability_max=final_cycle_cfg.instability_max,
+                    gravy_min=final_cycle_cfg.gravy_min,
+                    gravy_max=final_cycle_cfg.gravy_max,
+                    aliphatic_min=final_cycle_cfg.aliphatic_min,
+                    boman_max=final_cycle_cfg.boman_max,
+                    pi_min=final_cycle_cfg.pi_min,
+                    pi_max=final_cycle_cfg.pi_max,
+                    clash_filter=final_cycle_cfg.clash_filter,
+                    clash_severe_distance=final_cycle_cfg.clash_severe_distance,
+                    sap_max_threshold=final_cycle_cfg.sap_max_threshold,
+                    seed_dfi_metrics=seed_dfi_metrics,
+                    tunnel_metrics_enabled=args.tunnel_metrics,
+                    ligand_min_radius=ligand_geometry_summary.get("min_projected_radius"),
+                    ligand_resname=ligand_geometry_summary.get("ligand_resname"),
+                    log_probs_esmc=log_probs_esmc,
+                    log_probs_saprot=log_probs_saprot,
+                    weights_per_position=weights_per_position,
+                    final_dir=final_dir,
+                    fpocket_druggability_min=cycles[0].fpocket_druggability_min,
+                )
+                input_reference_path = final_dir / "input_reference.tsv"
+                input_reference_df.to_csv(input_reference_path, sep="\t", index=False)
+                LOGGER.info(
+                    "input reference metrics: wrote %s (id=%s)",
+                    input_reference_path, args.seed_pdb.stem,
+                )
+        else:
+            LOGGER.warning("final: zero survivors across all cycles!")
+            _write_empty_final_artifacts(
+                final_dir=final_dir,
+                run_dir=run_dir,
+                template_df=pd.DataFrame(columns=["id", "sequence"]),
+                status="EMPTY_POOL_ALL_CYCLES",
+                reason="No ranked survivors across any cycle and no seq-stage backfill candidates were available",
+                extra_meta={"n_cycles_run": len(cycles)},
+            )
 
     # ---- Per-cycle metrics snapshot ---------------------------------
     if cycle_metric_rows:
@@ -4188,6 +5916,10 @@ def main() -> None:
         "wt_length": L,
         "target_k": args.target_k,
         "diversity_min_hamming": args.min_hamming,
+        "final_filter_backfill": getattr(args, "final_filter_backfill", True),
+        "copy_input_structure_into_out_dir": getattr(
+            args, "copy_input_structure_into_out_dir", True,
+        ),
         "n_cycles_run": len(cycles),
         "cycle_configs": [asdict(c) for c in cycles],
         "ptm_spec": getattr(args, "ptm", ""),
@@ -4203,6 +5935,7 @@ def main() -> None:
             "final_topk_pdbs": str(final_dir / "topk_pdbs"),
             "final_topk_pdbs_protonated": str(final_dir / "topk_pdbs_protonated"),
             "all_survivors": str(final_dir / "all_survivors.tsv"),
+            "input_reference_tsv": str(final_dir / "input_reference.tsv"),
             "cycle_metrics_tsv": str(run_dir / "cycle_metrics.tsv"),
         },
         "started_at": timestamp,

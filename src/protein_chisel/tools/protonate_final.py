@@ -1668,6 +1668,8 @@ def reorganize_for_shipping(
     strip_intermediates: bool = True,
     pdb_subdir_name: str = "designs",
     minimal: bool = False,
+    seed_pdb: Optional[str | Path] = None,
+    copy_input_structure: bool = True,
 ) -> dict:
     """Build a tidy "ready-to-ship" layout in ``run_dir``.
 
@@ -1720,6 +1722,8 @@ def reorganize_for_shipping(
         "subdirs_removed": [],
         "files_removed": [],
         "designs_tsv_rows": 0,
+        "input_reference_copied": False,
+        "metrics_rows_total": 0,
     }
 
     final_dir = run_dir / "final_topk"
@@ -1766,6 +1770,29 @@ def reorganize_for_shipping(
         pdb_id_old_to_new[old_stem] = new_stem
         stats["designs_moved"] += 1
 
+    input_reference_dst: Optional[Path] = None
+    if copy_input_structure and seed_pdb is not None:
+        seed_src = Path(seed_pdb)
+        if seed_src.is_file():
+            input_reference_dst = designs_dir / seed_src.name
+            try:
+                if seed_src.resolve() != input_reference_dst.resolve():
+                    _shutil.copy2(seed_src, input_reference_dst)
+                stats["input_reference_copied"] = True
+            except Exception as exc:
+                LOGGER.warning(
+                    "reorganize_for_shipping: failed copying input reference "
+                    "%s -> %s (%s)",
+                    seed_src, input_reference_dst, exc,
+                )
+                input_reference_dst = None
+        else:
+            LOGGER.warning(
+                "reorganize_for_shipping: seed_pdb %s not found; skipping "
+                "input-reference copy",
+                seed_src,
+            )
+
     # 2. Build the metrics TSV.
     # Filename is 'chiseled_design_metrics.tsv' (verbose-but-clear) — easy
     # to glob across many runs in jupyterhub. The legacy 'designs.tsv' name
@@ -1793,8 +1820,42 @@ def reorganize_for_shipping(
                 df["run_dir"] = str(run_dir)
             except Exception:
                 pass
+            if copy_input_structure and input_reference_dst is not None:
+                ref_sidecar = final_dir / "input_reference.tsv"
+                if ref_sidecar.is_file():
+                    ref_df = _pd.read_csv(ref_sidecar, sep="\t")
+                else:
+                    ref_df = _pd.DataFrame([{
+                        "id": Path(input_reference_dst).stem,
+                        "source_id": Path(input_reference_dst).stem,
+                        "is_input": True,
+                        "seed_pdb": str(seed_pdb),
+                        "seed_basename": Path(seed_pdb).stem,
+                    }])
+                if len(ref_df) > 0:
+                    ref_df = ref_df.copy()
+                    ref_df["pdb_path"] = str(input_reference_dst)
+                    ref_df["seed_pdb"] = str(seed_pdb)
+                    ref_df["seed_basename"] = Path(seed_pdb).stem
+                    ref_df["run_dir"] = str(run_dir)
+                    if "is_input" in ref_df.columns:
+                        ref_df["is_input"] = True
+                    all_cols = list(df.columns)
+                    for col in ref_df.columns:
+                        if col not in all_cols:
+                            all_cols.append(col)
+                    for col in all_cols:
+                        if col not in df.columns:
+                            df[col] = _pd.NA
+                        if col not in ref_df.columns:
+                            ref_df[col] = _pd.NA
+                    df = _pd.concat(
+                        [df[all_cols], ref_df[all_cols]],
+                        ignore_index=True,
+                    )
             df.to_csv(run_dir / metrics_filename, sep="\t", index=False)
             stats["designs_tsv_rows"] = len(df)
+            stats["metrics_rows_total"] = len(df)
         except Exception as exc:
             LOGGER.warning("reorganize_for_shipping: could not write "
                             "%s (%s); falling back to copying topk.tsv",
@@ -1850,6 +1911,8 @@ def reorganize_for_shipping(
             m["outputs"]["designs_dir"] = str(designs_dir)
             m["outputs"]["designs_tsv"] = str(run_dir / "chiseled_design_metrics.tsv")
             m["outputs"]["designs_fasta"] = str(run_dir / "designs.fasta")
+            if input_reference_dst is not None:
+                m["outputs"]["input_reference_pdb"] = str(input_reference_dst)
             m["shipping_layout"] = True
             m["intermediates_stripped"] = bool(strip_intermediates)
             with open(manifest_path, "w") as f:
@@ -1922,8 +1985,9 @@ def reorganize_for_shipping(
 
     LOGGER.info(
         "reorganize_for_shipping: %d designs -> %s; designs.tsv rows=%d; "
-        "stripped %d subdirs (%s) %d files; minimal=%s",
+        "input_reference=%s; stripped %d subdirs (%s) %d files; minimal=%s",
         stats["designs_moved"], designs_dir, stats["designs_tsv_rows"],
+        stats["input_reference_copied"],
         len(stats["subdirs_removed"]), ",".join(stats["subdirs_removed"]),
         len(stats["files_removed"]), minimal,
     )
