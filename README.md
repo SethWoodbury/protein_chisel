@@ -124,7 +124,12 @@ python scripts/load_chiseled_runs.py \
 | `MINIMAL` | unset | `1` triggers minimal shipping layout + (with explicit `WORK_ROOT`) per-PDB consolidation |
 | `SAVE_INTERMEDIATES` | unset | `1` keeps `cycle_NN/` subtrees for diagnostics |
 | `CONSOLIDATE_TO_WORK_ROOT` | `1` | flatten run_dir into WORK_ROOT when MINIMAL=1 + custom WORK_ROOT |
-| `EXTRA_DRIVER_FLAGS` | `""` | passthrough to `iterative_design_v2.py` (e.g. `"--no_throat_feedback"`) |
+| `USE_NODE_LOCAL_SCRATCH` | `true` | stage intermediates in fast node-local scratch + republish at end (auto-detected; falls back to OUTPUT_DIR if none) |
+| `CLOBBER_EXISTING_OUTPUTS` | `false` | clean wrapper-owned artifacts in OUTPUT_DIR before republish (allowlist-only — never touches arbitrary user files) |
+| `COPY_INPUT_STRUCTURE_INTO_OUT_DIR` | `true` | append the seed PDB scored as a reference row into `chiseled_design_metrics.tsv` |
+| `EXTRA_DRIVER_FLAGS` | `""` | passthrough to `iterative_design_v2.py` (e.g. `"--no_throat_feedback --final_filter_backfill false"`) |
+
+Selection-stage backfill: if the strict fpocket-druggability cutoff would empty the final pool, the pipeline pulls near-miss candidates from each cycle's `02_seq_filter/` artifacts, re-scores them through struct + tunnel + fitness + fpocket, and overlays the results onto the primary pool. New `selection__bucket` / `selection__deferred_rescue_*` columns make rescue activity inspectable. Disable with `EXTRA_DRIVER_FLAGS="--final_filter_backfill false"`. See [`docs/backfill_rescue.md`](docs/backfill_rescue.md).
 
 The pipeline default `--throat_feedback ON` is set inside the driver; pass `EXTRA_DRIVER_FLAGS="--no_throat_feedback"` to disable for diagnostic runs (see "Throat-blocker feedback" below).
 
