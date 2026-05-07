@@ -31,6 +31,20 @@ import sys
 from pathlib import Path
 
 
+def _parse_bool_arg(value: str | bool) -> bool:
+    """Parse a CLI boolean from common true/false spellings."""
+    if isinstance(value, bool):
+        return value
+    s = str(value).strip().lower()
+    if s in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(
+        f"expected boolean true/false for this flag, got {value!r}",
+    )
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--topk_dir", type=Path, required=True)
@@ -66,6 +80,14 @@ def main() -> int:
                         "Drops designs.fasta (sequence column is in the "
                         "TSV) and all aux JSON files. Use for /net/scratch "
                         "space efficiency on production sweeps.")
+    p.add_argument("--copy-input-structure-into-out-dir",
+                   "--copy_input_structure_into_out_dir",
+                   dest="copy_input_structure_into_out_dir",
+                   type=_parse_bool_arg, default=True,
+                   metavar="{true,false}",
+                   help="Default true. Copy the original input PDB into the "
+                        "final shipped output directory and append its metrics "
+                        "row to chiseled_design_metrics.tsv.")
     p.add_argument("--ptm", type=str, default=None,
                    help="Comma-separated PTM declarations recorded in the "
                         "output PDB's REMARK 668 block. ANNOTATION ONLY: "
@@ -114,6 +136,8 @@ def main() -> int:
             run_dir=run_dir,
             strip_intermediates=not args.no_strip_intermediates,
             minimal=args.minimal_layout,
+            seed_pdb=args.seed_pdb,
+            copy_input_structure=args.copy_input_structure_into_out_dir,
         )
         summary["shipping_layout"] = reorg_stats
 

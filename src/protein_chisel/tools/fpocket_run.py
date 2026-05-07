@@ -132,12 +132,14 @@ def fpocket_run(
     workspace = Path(out_dir).resolve() if out_dir else Path(tempfile.mkdtemp(prefix="chisel_fpocket_"))
     workspace.mkdir(parents=True, exist_ok=True)
 
-    # fpocket writes outputs into <workspace>/<stem>_out/. Copy the input
-    # PDB into the workspace first so we control where outputs go.
-    local_pdb = workspace / pdb_path.name
+    # fpocket has an upstream buffer overflow on long input-path strings.
+    # Copy into the workspace under a short fixed name and invoke it by
+    # RELATIVE path from cwd=workspace. Using an absolute /very/long/... path
+    # can abort even when the basename itself is short.
+    local_pdb = workspace / "design.pdb"
     local_pdb.write_bytes(pdb_path.read_bytes())
 
-    cmd = [exe, "-f", str(local_pdb)]
+    cmd = [exe, "-f", local_pdb.name]
     LOGGER.info("running fpocket: %s", " ".join(cmd))
     proc = subprocess.run(
         cmd, cwd=str(workspace), check=False, capture_output=True,

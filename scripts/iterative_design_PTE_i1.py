@@ -655,17 +655,18 @@ def _run_fpocket(pdb_path: Path, work_dir: Path) -> Optional[dict]:
     """Run fpocket on a single PDB; return the largest-pocket dict or None.
 
     fpocket 4.0 has a known buffer overflow in
-    ``do_eraseall_in_dir.c`` when the input filename exceeds ~64 chars.
-    Our designs have ~67-char stems, so we copy to a short local
-    filename (``design.pdb``) inside work_dir before invoking fpocket.
+    ``do_eraseall_in_dir.c`` when the input path string is long.
+    So we must use a short local filename AND pass that short relative
+    name from inside ``work_dir`` rather than an absolute path.
     """
     work_dir.mkdir(parents=True, exist_ok=True)
     # Use a SHORT filename to avoid the upstream buffer overflow.
     local = work_dir / "design.pdb"
     local.write_bytes(pdb_path.read_bytes())
+    cmd = [str(FPOCKET_BIN), "-f", local.name]
     try:
         proc = subprocess.run(
-            [str(FPOCKET_BIN), "-f", str(local)],
+            cmd,
             cwd=str(work_dir),
             capture_output=True, text=True, timeout=300,
             check=False,
@@ -673,8 +674,10 @@ def _run_fpocket(pdb_path: Path, work_dir: Path) -> Optional[dict]:
         info_txt = work_dir / "design_out" / "design_info.txt"
         if proc.returncode != 0 or not info_txt.is_file():
             LOGGER.warning(
-                "fpocket failed for %s: rc=%d info_exists=%s\n  stderr: %s",
+                "fpocket failed for %s: rc=%d info_exists=%s cmd=%s "
+                "cwd_len=%d input_path_len=%d\n  stderr: %s",
                 pdb_path.name, proc.returncode, info_txt.is_file(),
+                " ".join(cmd), len(str(work_dir)), len(str(local)),
                 proc.stderr[-300:],
             )
             return None
