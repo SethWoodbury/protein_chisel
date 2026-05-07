@@ -341,7 +341,14 @@ def debug_short_test_cycles(
     consensus_strength: float = 2.0,
     consensus_max_fraction: float = 0.30,
 ) -> list[CycleConfig]:
-    """Hardcoded fast smoke-test preset: 20/10/10 samples across 3 cycles."""
+    """Hardcoded fast smoke-test preset: 20/10/10 samples across 3 cycles.
+
+    Activated by ``--debug-short-test``. **Unconditionally** clobbers
+    ``args.target_k`` to 5 and ``args.cycles`` to 3, even if the caller
+    set them to other values on the same command line; a WARNING is
+    logged when that happens so it isn't silent. Intended for end-to-
+    end pipeline validation only — never use for production runs.
+    """
     cycles = default_cycles(
         omit_AA=omit_AA,
         use_side_chain_context=use_side_chain_context,
@@ -4236,10 +4243,13 @@ def main() -> None:
                         "or override with a single-cycle short test (1).")
     p.add_argument("--debug-short-test", "--debug_short_test",
                    dest="debug_short_test", action="store_true",
-                   help="Fast smoke-test preset. Hard overrides the normal "
-                        "production schedule to 3 cycles with 20/10/10 sampled "
-                        "designs and forces final target_k=5. Intended only to "
-                        "validate end-to-end execution quickly.")
+                   help="Fast smoke-test preset. UNCONDITIONALLY clobbers "
+                        "--target_k -> 5 and --cycles -> 3 (with a 20/10/10 "
+                        "sample schedule built by debug_short_test_cycles). "
+                        "If you also pass --target_k / --cycles on the same "
+                        "command line, your values are ignored and a WARNING "
+                        "is logged. Intended only to validate end-to-end "
+                        "execution quickly; never use for production runs.")
     p.add_argument("--omit_AA", type=str, default="X",
                    help="AAs MPNN may never sample. Default 'X' (UNK only) -- "
                         "no canonical AAs are silently forbidden. Pass 'CX' "
@@ -4543,7 +4553,11 @@ def main() -> None:
         format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s",
     )
     if debug_short_test_override_msg:
-        LOGGER.info(debug_short_test_override_msg)
+        # WARNING (not INFO): the user passed --target_k / --cycles
+        # explicitly AND --debug-short-test. The preset wins silently;
+        # surface the conflict loudly so production runs don't get
+        # accidentally truncated.
+        LOGGER.warning(debug_short_test_override_msg)
 
     # Auto-derive catalytic resnos from the seed's REMARK 666 block. This
     # makes the same driver/sbatch work on any scaffold in the design
@@ -5268,6 +5282,13 @@ def main() -> None:
                     pdb_map=all_pdb_maps,
                     out_dir=final_dir / "_deferred_rescue_seq_backfill",
                     catalytic_his_resnos=CATALYTIC_HIS_RESNOS,
+                    # XXX assumes catalytic == fixed: works today because
+                    # `fixed_resnos = list(DEFAULT_CATRES)` upstream, so
+                    # the two lists are identical. If a future scaffold
+                    # ever decouples "fixed by design" from "catalytic",
+                    # this call will silently use the wrong set for
+                    # tunnel / fpocket active-site anchoring. Pass an
+                    # explicit catalytic_resnos= value at that point.
                     catalytic_resnos=fixed_resnos,
                     fixed_resnos=fixed_resnos,
                     sap_max_threshold=final_cycle_cfg.sap_max_threshold,
@@ -5449,6 +5470,13 @@ def main() -> None:
                 pdb_map=all_pdb_maps,
                 out_dir=final_dir / "_deferred_rescue_selected_topk",
                 catalytic_his_resnos=CATALYTIC_HIS_RESNOS,
+                # XXX assumes catalytic == fixed: works today because
+                # `fixed_resnos = list(DEFAULT_CATRES)` upstream, so the
+                # two lists are identical. If a future scaffold ever
+                # decouples "fixed by design" from "catalytic", this
+                # call will silently use the wrong set for tunnel/
+                # fpocket active-site anchoring. Pass an explicit
+                # catalytic_resnos= value at that point.
                 catalytic_resnos=fixed_resnos,
                 fixed_resnos=fixed_resnos,
                 sap_max_threshold=final_cycle_cfg.sap_max_threshold,
@@ -5502,6 +5530,18 @@ def main() -> None:
             )
 
         if args.copy_input_structure_into_out_dir:
+            # User-visible signal that we're about to spend ~20-40 sec
+            # re-running struct + tunnel + fpocket on the seed PDB so it
+            # appears as an `input_reference` row in the shipped TSV
+            # alongside the designs. Disable with
+            # --copy_input_structure_into_out_dir false if walltime is
+            # tight (e.g. large sweeps).
+            LOGGER.info(
+                "input-structure scoring: running struct + tunnel + fpocket "
+                "on seed PDB so it appears as an input_reference row in "
+                "chiseled_design_metrics.tsv (~20-40 sec extra walltime; "
+                "disable with --copy_input_structure_into_out_dir false)"
+            )
             final_cycle_cfg = cycles[-1]
             input_reference_df = _build_input_reference_row(
                 template_df=top,
@@ -5615,6 +5655,13 @@ def main() -> None:
                 pdb_map=all_pdb_maps,
                 out_dir=final_dir / "_deferred_rescue_seq_backfill",
                 catalytic_his_resnos=CATALYTIC_HIS_RESNOS,
+                # XXX assumes catalytic == fixed: works today because
+                # `fixed_resnos = list(DEFAULT_CATRES)` upstream, so the
+                # two lists are identical. If a future scaffold ever
+                # decouples "fixed by design" from "catalytic", this
+                # call will silently use the wrong set for tunnel/
+                # fpocket active-site anchoring. Pass an explicit
+                # catalytic_resnos= value at that point.
                 catalytic_resnos=fixed_resnos,
                 fixed_resnos=fixed_resnos,
                 sap_max_threshold=final_cycle_cfg.sap_max_threshold,
@@ -5747,6 +5794,13 @@ def main() -> None:
                     pdb_map=all_pdb_maps,
                     out_dir=final_dir / "_deferred_rescue_selected_topk",
                     catalytic_his_resnos=CATALYTIC_HIS_RESNOS,
+                    # XXX assumes catalytic == fixed: works today because
+                    # `fixed_resnos = list(DEFAULT_CATRES)` upstream, so
+                    # the two lists are identical. If a future scaffold
+                    # ever decouples "fixed by design" from "catalytic",
+                    # this call will silently use the wrong set for
+                    # tunnel / fpocket active-site anchoring. Pass an
+                    # explicit catalytic_resnos= value at that point.
                     catalytic_resnos=fixed_resnos,
                     fixed_resnos=fixed_resnos,
                     sap_max_threshold=final_cycle_cfg.sap_max_threshold,
@@ -5788,6 +5842,12 @@ def main() -> None:
                 )
 
             if args.copy_input_structure_into_out_dir:
+                # See note at the matching call site above — surfaces
+                # the ~20-40 sec input-reference scoring step in the log.
+                LOGGER.info(
+                    "input-structure scoring: running struct + tunnel + "
+                    "fpocket on seed PDB (rescue-path final selection)"
+                )
                 final_cycle_cfg = cycles[-1]
                 input_reference_df = _build_input_reference_row(
                     template_df=top,
