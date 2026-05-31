@@ -610,7 +610,7 @@ def score_tunnels(
         pdb_path: Path to the design PDB.
         catalytic_resnos: int iterable of catalytic motif resnos
             (typically derived from REMARK 666 in the seed PDB and
-            propagated through ``DEFAULT_CATRES`` in iterative_design_v2).
+            propagated through ``DEFAULT_CATRES`` in iterative_design).
         chain: Protein chain ID. Default "A" (PTE_i1 monomer).
         ligand_chain: Ligand chain ID. Auto-detect if None.
         ligand_resname: Ligand 3-letter code. Auto-detect if None.

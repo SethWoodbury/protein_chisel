@@ -1,15 +1,15 @@
-# `iterative_design_v2.py` CLI reference
+# `iterative_design.py` CLI reference
 
 Reference for every flag accepted by
-`/home/woodbuse/codebase_projects/protein_chisel/scripts/iterative_design_v2.py`.
+`/home/woodbuse/codebase_projects/protein_chisel/scripts/iterative_design.py`.
 Defaults reflect the source on `main` as of 2026-05-04. Source of truth:
-`scripts/iterative_design_v2.py`, lines 2536–2725.
+`scripts/iterative_design.py`, lines 2536–2725.
 
 Run via:
 
 ```bash
 cd /home/woodbuse/codebase_projects/protein_chisel
-PYTHONPATH=src:scripts python scripts/iterative_design_v2.py \
+PYTHONPATH=src:scripts python scripts/iterative_design.py \
     --plm_artifacts_dir <dir> --position_table <csv> [flags...]
 ```
 
@@ -312,7 +312,7 @@ MPNN forward passes will fall back to CPU (slower, but functional). Example:
 
 ```bash
 apptainer exec /net/software/containers/universal.sif \
-    python scripts/iterative_design_v2.py \
+    python scripts/iterative_design.py \
     --plm_artifacts_dir <dir> --position_table <csv> \
     --strategy annealing --plm_strength 1.25 \
     --consensus_threshold 0.90 --consensus_strength 1.0 \

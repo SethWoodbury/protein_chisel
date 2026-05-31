@@ -1,6 +1,6 @@
 # Architecture
 
-`protein_chisel`'s production pipeline is `scripts/iterative_design_v2.py` (the "v2 driver"), wrapped by `scripts/run_chisel_design.sh`. It runs in three stages across three apptainer images, with file-based handoffs so each stage is independently restartable.
+`protein_chisel`'s production pipeline is `scripts/iterative_design.py` (the "v2 driver"), wrapped by `scripts/run_chisel_design.sh`. It runs in three stages across three apptainer images, with file-based handoffs so each stage is independently restartable.
 
 ## Pipeline
 
@@ -22,7 +22,7 @@ flowchart TD
         S2B --> S2C
     end
 
-    subgraph Stage3["Stage 3: iterative_design_v2  (universal.sif, GPU or CPU)"]
+    subgraph Stage3["Stage 3: iterative_design  (universal.sif, GPU or CPU)"]
         direction TB
         S3init[runtime PLM re-fusion +<br/>graded-clash bias +<br/>expression-rule omit_AA]
         S3init --> C0

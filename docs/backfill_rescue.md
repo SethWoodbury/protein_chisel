@@ -48,7 +48,7 @@ A run that ships `target_k` purely from primary survivors will show all rescue c
 
 ## Limits
 
-The rescue path is **intra-process only**. It looks at `cycle_NN/02_seq_filter/` artifacts that the same `iterative_design_v2.py` process wrote earlier in its own execution — not at any prior partial run dir. It is robustness against *late-stage filter wipeouts*, not a `--resume` mechanism. (See "Resume from a partial run dir" below for the separate question.)
+The rescue path is **intra-process only**. It looks at `cycle_NN/02_seq_filter/` artifacts that the same `iterative_design.py` process wrote earlier in its own execution — not at any prior partial run dir. It is robustness against *late-stage filter wipeouts*, not a `--resume` mechanism. (See "Resume from a partial run dir" below for the separate question.)
 
 What rescue *cannot* recover:
 - A run that crashed before cycle 0's `02_seq_filter/` was written.
@@ -56,7 +56,7 @@ What rescue *cannot* recover:
 
 ## Resume from a partial run dir (NOT implemented)
 
-If a run crashes mid-cycle, rerunning from scratch is currently the only option. True `--recovery` (re-using cycle output across separate `iterative_design_v2.py` invocations) would require persisting these in-memory arrays to disk after each stage:
+If a run crashes mid-cycle, rerunning from scratch is currently the only option. True `--recovery` (re-using cycle output across separate `iterative_design.py` invocations) would require persisting these in-memory arrays to disk after each stage:
 
 - `log_probs_esmc`, `log_probs_saprot` (already on disk via `plm_artifacts/`)
 - `weights_per_position`, `position_class_array`, `pt`, `ss`, `seed_dfi_metrics` (currently RAM-only)
@@ -80,7 +80,9 @@ CLI flags (e.g. `--use-node-local-scratch true`, `--clobber-existing-outputs tru
 ## How to read the rescue columns in JupyterHub
 
 ```python
-from protein_chisel.tools.load_chiseled_runs import load_runs
+# load_runs lives in scripts/load_chiseled_runs.py (standalone script, not packaged):
+import sys; sys.path.insert(0, "/path/to/protein_chisel/scripts")
+from load_chiseled_runs import load_runs
 df = load_runs("/net/scratch/$USER/chisel_sweep/*/chiseled_design_metrics.tsv")
 
 # How many designs in each top-K were primary vs rescued?

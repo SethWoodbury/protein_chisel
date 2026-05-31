@@ -13,11 +13,8 @@ Run inside the universal.sif (no PyRosetta needed for these tests).
 """
 from __future__ import annotations
 
-import sys
 import tempfile
 from pathlib import Path
-
-sys.path.insert(0, "/home/woodbuse/codebase_projects/protein_chisel/src")
 
 from protein_chisel.tools.protonate_final import (
     parse_ptm_map,
@@ -173,42 +170,3 @@ def test_force_no_ptm_with_dash():
         print("OK  force_no_ptm_with_dash: A/LYS/3:- removes the entry")
     finally:
         seed.unlink()
-
-
-def main() -> int:
-    tests = [
-        test_parse_motif_index_form,
-        test_parse_explicit_form,
-        test_parse_explicit_no_chain,
-        test_parse_mixed,
-        test_parse_list_input,
-        test_parse_empty,
-        test_parse_malformed_skipped,
-        test_motif_resolution_correct,
-        test_motif_resolution_wrong_resname_warns,
-        test_motif_resolution_unknown_index,
-        test_resolve_ptm_map_full,
-        test_force_no_ptm_with_dash,
-    ]
-    failures: list[tuple[str, str]] = []
-    for t in tests:
-        try:
-            t()
-        except AssertionError as e:
-            failures.append((t.__name__, str(e)))
-            print(f"FAIL {t.__name__}: {e}")
-        except Exception as e:
-            failures.append((t.__name__, f"{type(e).__name__}: {e}"))
-            print(f"ERR  {t.__name__}: {e}")
-    print()
-    if failures:
-        print(f"{len(failures)} failures:")
-        for name, msg in failures:
-            print(f"  {name}: {msg}")
-        return 1
-    print(f"All {len(tests)} PTM-spec tests passed.")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

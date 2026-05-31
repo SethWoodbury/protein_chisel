@@ -1,4 +1,4 @@
-"""Precompute PLM artifacts for the iterative_design_v2 driver.
+"""Precompute PLM artifacts for the iterative_design driver.
 
 Runs INSIDE esmc.sif. Inputs:
 - seed PDB

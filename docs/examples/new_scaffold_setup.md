@@ -11,7 +11,7 @@ These three replace cleanly, no code edits required:
 
 1. **Seed PDB** (`--seed_pdb`). Must contain the design backbone +
    ligand HETATM(s) + REMARK 666 / HETNAM / LINK records that
-   `iterative_design_v2.py:_pull_remark_666_hetnam_link` will copy
+   `iterative_design.py:_pull_remark_666_hetnam_link` will copy
    forward into the packed designs. If your seed lacks those records,
    add them before submitting — restoration is what keeps the
    catalytic geometry stable across cycles.
@@ -22,10 +22,10 @@ These three replace cleanly, no code edits required:
    and by stage-3 PyRosetta repacker for restoring catalytic rotamers.
 
 3. **REMARK 666 / catres spec.** The catalytic resnos baked into
-   `iterative_design_v2.py` are PTE-specific:
+   `iterative_design.py` are PTE-specific:
 
    ```python
-   # scripts/iterative_design_v2.py:73-75
+   # scripts/iterative_design.py:73-75
    DEFAULT_CATRES = (60, 64, 128, 131, 132, 157)
    CATALYTIC_HIS_RESNOS = (60, 64, 128, 132)
    CHAIN = "A"
@@ -34,13 +34,13 @@ These three replace cleanly, no code edits required:
    For a new scaffold, edit those three constants before calling the
    driver, OR (cleaner) fork `classify_positions_pte_i1.py` →
    `classify_positions_<scaffold>.py` and add a CLI arg to
-   `iterative_design_v2.py` that overrides `DEFAULT_CATRES`. At
+   `iterative_design.py` that overrides `DEFAULT_CATRES`. At
    present the driver does NOT expose catres on the CLI; this is
    the one edit you'll make.
 
 ## Class-balance reference distribution
 
-`stage_bias` in `iterative_design_v2.py` calls
+`stage_bias` in `iterative_design.py` calls
 `compute_class_balanced_bias_AA(reference="swissprot_ec3_hydrolases_2026_01")`.
 The default reference is the **EC-3 hydrolase Swiss-Prot subset**
 (`src/protein_chisel/expression/data/aa_composition_baselines_2026_01.json`,
@@ -52,7 +52,7 @@ For a new target:
   the default. No change needed.
 - **Other EC class** (oxidoreductase EC-1, transferase EC-2,
   isomerase EC-5, etc.): change the `reference=` argument in
-  `iterative_design_v2.py:2363` to match. Available baselines in
+  `iterative_design.py:2363` to match. Available baselines in
   `aa_composition_baselines_2026_01.json` cover all six top-level EC
   classes plus an `all_swissprot` fallback. Run
   `python -c "import json; print(list(json.load(open('src/protein_chisel/expression/data/aa_composition_baselines_2026_01.json'))['baselines'].keys()))"`
@@ -165,7 +165,7 @@ every design (the column is recorded but doesn't filter).
 
 1. Edit `DEFAULT_INPUT_PDB`, `DEFAULT_LIG_PARAMS`, `DEFAULT_CATRES`,
    `CATALYTIC_HIS_RESNOS`, `CHAIN` constants in
-   `scripts/iterative_design_v2.py:63-75`. (Or pass the first two via
+   `scripts/iterative_design.py:63-75`. (Or pass the first two via
    env / CLI; the rest must be source edits today.)
 2. Optionally fork `scripts/classify_positions_pte_i1.py` → your
    scaffold name, change the `--pose_id` default.

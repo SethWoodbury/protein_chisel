@@ -19,7 +19,7 @@ sbatch \
     /home/woodbuse/codebase_projects/protein_chisel/scripts/run_chisel_design.sh
 ```
 
-If you need to pass non-default `iterative_design_v2.py` flags (the
+If you need to pass non-default `iterative_design.py` flags (the
 sbatch only forwards `SEED_PDB`, `LIG_PARAMS`, `TARGET_K`, `MIN_HAMMING`,
 `N_CYCLES`, `OMIT_AA`, `USE_SIDE_CHAIN_CONTEXT`, `ENHANCE`), copy the
 sbatch and append to the stage-3 `apptainer exec` block. Stage-3 with
@@ -31,7 +31,7 @@ apptainer exec --nv \
     --bind /net/scratch --bind /home/woodbuse \
     --env "PYTHONPATH=/code/src:/cifutils/src" \
     /net/software/containers/universal.sif \
-    python "$REPO/scripts/iterative_design_v2.py" \
+    python "$REPO/scripts/iterative_design.py" \
         --seed_pdb "$SEED_PDB" \
         --ligand_params "$LIG_PARAMS" \
         --plm_artifacts_dir "$PLM_DIR" \
@@ -63,7 +63,7 @@ apptainer exec --nv \
 
 The 6 catalytic resnos `(60, 64, 128, 131, 132, 157)` and binuclear-Zn
 KCX handling (catalytic K157 capped as KCX) are hard-coded in
-`iterative_design_v2.py` constants and are restored automatically by
+`iterative_design.py` constants and are restored automatically by
 `stage_restore_pdbs` (REMARK 666 + HETNAM + LINK + HIS tautomer
 fixup). No flag needed for those.
 

@@ -48,7 +48,6 @@ Possible but requires an interactive `apptainer shell --writable-tmpfs` session 
 | contact_ms | `esmc.sif` (or any sif w/ py_contact_ms) | no | numpy-only; PyRosetta-free |
 | catalytic_pka | `esmc.sif` | no | PROPKA was added there |
 | sample_with_ligand_mpnn | `universal.sif` | yes | fused_mpnn build at `/net/software/lab/fused_mpnn/seth_temp/` |
-| sequence_design_v1 pipeline | mixed: pyrosetta.sif (stage 0) → esmc.sif (stages 1-2) → mlfold.sif (stage 3) → esmc.sif (stages 4-5) | yes | orchestrates 4 sifs |
 | theozyme_satisfaction | host (numpy + io/pdb only) | no | pure-Python Kabsch alignment |
 | iterative_optimize pipeline | host (numpy) | no | proposal sampling + acceptance only |
 | Filters (protparam, protease_sites, length, expression_host) | host | no | sequence-only |
@@ -85,10 +84,14 @@ chisel saprot-score <pdb> [--chain A] [--model saprot_35m]
 # sbatch wrappers
 sbatch scripts/run_comprehensive_metrics.sbatch <pdb> <out_dir> [params_dir]
 sbatch scripts/run_naturalness_metrics.sbatch <pdb> <out_dir> [position_table_dir]
-sbatch scripts/run_sequence_design_v1.sbatch <pdb> <ligand_params> <out_dir>
 ```
 
-Pipelines write a single output directory (see per-pipeline layout in [docs/pipelines.md](pipelines.md)). Restart-safe via manifest-hash matching for `comprehensive_metrics` and `naturalness_metrics`; file-existence only for `sequence_design_v1` (a known weakness).
+> The production de-novo design pipeline is the standalone driver
+> `scripts/iterative_design.py`, run via the 4-stage SLURM wrapper
+> `scripts/run_chisel_design.sh` (see the top-level [README](../README.md) +
+> [docs/architecture.md](architecture.md)) — not a package pipeline.
+
+Pipelines write a single output directory (see per-pipeline layout in [docs/pipelines.md](pipelines.md)). Restart-safe via manifest-hash matching for `comprehensive_metrics` and `naturalness_metrics`.
 
 ## Slurm
 
@@ -96,7 +99,6 @@ Default sbatch templates in `scripts/`:
 
 - `run_comprehensive_metrics.sbatch` — `--partition=cpu`, `--mem=8G`, `--time=02:00:00`.
 - `run_naturalness_metrics.sbatch` — `--partition=gpu --gres=gpu:a4000:1`, `--mem=24G`, `--time=02:00:00`.
-- `run_sequence_design_v1.sbatch` — `--partition=gpu --gres=gpu:a4000:1`, `--mem=32G`, `--time=04:00:00`.
 
 Override per-job with sbatch flags (e.g. `sbatch --time=08:00:00 ...`).
 

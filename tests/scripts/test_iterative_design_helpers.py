@@ -1,4 +1,4 @@
-"""Tests for pure-python helpers in scripts/iterative_design_v2.py.
+"""Tests for pure-python helpers in scripts/iterative_design.py.
 
 We import the script as a module (its sibling-script imports are
 defensive sys.path inserts so this works on host pytest as long as
@@ -19,7 +19,7 @@ SCRIPTS = REPO / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-import iterative_design_v2 as v2   # noqa: E402
+import iterative_design as v2   # noqa: E402
 
 
 # ----------------------------------------------------------------------

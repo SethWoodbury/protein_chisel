@@ -1,4 +1,4 @@
-# Usage: iterative PLM-fusion design (`iterative_design_v2`)
+# Usage: iterative PLM-fusion design (`iterative_design`)
 
 End-to-end guide for running the three-stage iterative-design pipeline that
 produces a diverse top-K of catalytically-constrained designs around a
@@ -74,7 +74,7 @@ apptainer exec --nv \
     --bind /net/scratch --bind /home/woodbuse \
     --env "PYTHONPATH=/code/src:/cifutils/src" \
     /net/software/containers/universal.sif \
-    python "$REPO/scripts/iterative_design_v2.py" \
+    python "$REPO/scripts/iterative_design.py" \
         --seed_pdb "$SEED_PDB" --ligand_params "$LIG_PARAMS" \
         --plm_artifacts_dir "$PLM_DIR" \
         --position_table "$CLASSIFY_DIR/positions.tsv" \
@@ -111,8 +111,8 @@ apptainer shell --nv \
     /net/software/containers/universal.sif
 
 # inside the container:
-python /code/scripts/iterative_design_v2.py --help
-python /code/scripts/iterative_design_v2.py \
+python /code/scripts/iterative_design.py --help
+python /code/scripts/iterative_design.py \
     --seed_pdb $SEED_PDB --ligand_params $LIG_PARAMS \
     --plm_artifacts_dir <prev_run>/plm_artifacts \
     --position_table   <prev_run>/classify/positions.tsv \
@@ -165,7 +165,7 @@ apptainer exec \
     --bind /net/scratch --bind /home/woodbuse \
     --env "PYTHONPATH=/code/src:/cifutils/src" \
     /net/software/containers/universal.sif \
-    python "$REPO/scripts/iterative_design_v2.py" ...
+    python "$REPO/scripts/iterative_design.py" ...
 ```
 
 Empirical timings (1 cycle / 500 samples / full pipeline, 2026-05-04):
@@ -207,7 +207,7 @@ position), then fuses into a calibrated bias matrix via
 
 Idempotent (cache hit if every artifact exists). GPU: ~30–60 s. CPU: ~2 min.
 
-### Stage 3 — `iterative_design_v2.py`
+### Stage 3 — `iterative_design.py`
 
 Three cycles by default. Each cycle (`$RD/cycle_NN/`) runs the same
 five sub-stages and writes them to numbered subdirs:
@@ -235,7 +235,7 @@ parallel sweeps never collide.
 
 The default 3-cycle schedule is a temperature ramp + a sample-budget
 ramp + a filter-tightening ramp + (optionally) a TOPSIS-vs-fitness
-ramp. Defined in `default_cycles()` in `scripts/iterative_design_v2.py`.
+ramp. Defined in `default_cycles()` in `scripts/iterative_design.py`.
 
 ### Per-cycle defaults (`--strategy constant`, the legacy default)
 
@@ -275,4 +275,4 @@ Override the schedule from CLI:
 - `--rank_weights "fitness=2,druggability=1.5"` — TOPSIS reweighting
 - `--rank_targets "charge=-12,aliphatic=80"` — TOPSIS retargeting
 
-See `python scripts/iterative_design_v2.py --help` for the full CLI.
+See `python scripts/iterative_design.py --help` for the full CLI.

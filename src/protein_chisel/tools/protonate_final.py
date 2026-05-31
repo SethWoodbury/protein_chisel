@@ -1702,7 +1702,7 @@ def reorganize_for_shipping(
     the clean files (useful for deep diagnostics).
 
     Args:
-        run_dir: Top-level run directory created by iterative_design_v2.
+        run_dir: Top-level run directory created by iterative_design.
         strip_intermediates: If True (default), remove cycle_NN/, the
             unprotonated final_topk/topk_pdbs/, the seed fpocket workspace,
             fusion_runtime/, seed_tunnel_residues.tsv, and the dual final_topk

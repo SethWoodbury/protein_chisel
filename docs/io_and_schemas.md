@@ -86,7 +86,6 @@ if manifest_matches(expected, "out/_manifest.json"):
 ### Restart-skip semantics
 
 - **`comprehensive_metrics`, `naturalness_metrics`**: full manifest match required. Any change to config / input / tool versions → re-run.
-- **`sequence_design_v1`**: file-existence only (no manifest), so reusing a stage with different config silently reuses old artifacts. **Known weakness.**
 
 ---
 

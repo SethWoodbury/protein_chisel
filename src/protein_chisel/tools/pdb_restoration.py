@@ -512,7 +512,7 @@ def restore_sample_dir(
     result into ``out_pdb_dir`` keyed by candidate id.
 
     Mirrors the in-driver ``stage_restore_pdbs`` signature in
-    ``scripts/iterative_design_v2.py`` so it can drop in directly.
+    ``scripts/iterative_design.py`` so it can drop in directly.
 
     Args:
         sample_dir: LigandMPNN output dir (must contain a ``packed/``

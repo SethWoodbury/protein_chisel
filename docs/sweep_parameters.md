@@ -416,7 +416,7 @@ with L (linearly).
 
 ## Sweep B parameter reference (production)
 
-Set in `scripts/iterative_design_v2.py` defaults as of 2026-05-04:
+Set in `scripts/iterative_design.py` defaults as of 2026-05-04:
 
 | flag | default | notes |
 |---|---|---|

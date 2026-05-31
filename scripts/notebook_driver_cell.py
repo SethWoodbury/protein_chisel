@@ -65,7 +65,7 @@ SAVE_INTERMEDIATES = False           # keep cycle_NN/ for diagnostics
 VERBOSE            = False           # add --verbose to driver (DEBUG log level)
 ENHANCE            = ""              # optional pLDDT-enhanced LigandMPNN ckpt
                                      # name (without .pth). Empty = standard
-                                     # checkpoint. See iterative_design_v2.py
+                                     # checkpoint. See iterative_design.py
                                      # AVAILABLE_ENHANCE_CHECKPOINTS for names.
 
 # Re-run protection: by default we refuse to overwrite an existing

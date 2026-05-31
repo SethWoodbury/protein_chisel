@@ -330,7 +330,7 @@ PTM="${PTM:-}"
 
 # Optional pLDDT-enhanced LigandMPNN checkpoint (--enhance flag).
 # Empty string = use the standard ligand_mpnn checkpoint. Available
-# names listed in iterative_design_v2.py AVAILABLE_ENHANCE_CHECKPOINTS;
+# names listed in iterative_design.py AVAILABLE_ENHANCE_CHECKPOINTS;
 # enhance can boost mean fitness ~+0.02 nats/residue at a small
 # diversity cost. Pass via env: ENHANCE=plddt_residpo_alpha_20250116-aec4d0c4
 ENHANCE="${ENHANCE:-}"
@@ -582,7 +582,7 @@ apptainer exec "${NV_FLAGS[@]}" \
     --bind "$HOME" \
     --env "PYTHONPATH=/code/src:/cifutils/src" \
     "$STAGE3_SIF" \
-    python "$REPO/scripts/iterative_design_v2.py" \
+    python "$REPO/scripts/iterative_design.py" \
         --seed_pdb "$SEED_PDB" \
         --ligand_params "$LIG_PARAMS" \
         --plm_artifacts_dir "$PLM_DIR" \

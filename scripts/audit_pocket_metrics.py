@@ -1,8 +1,8 @@
-"""Audit-only diagnostic tool for the iterative_design_v2 fpocket panel.
+"""Audit-only diagnostic tool for the iterative_design fpocket panel.
 
 Runs fpocket on every PDB in a top-K folder (or any PDB folder) using
 the same active-site-aware logic as ``stage_fpocket_rank`` in
-``iterative_design_v2.py``, and prints / writes a wide-format table of
+``iterative_design.py``, and prints / writes a wide-format table of
 the new pocket diagnostics:
 
     fpocket__druggability
@@ -64,7 +64,7 @@ def _setup_logging() -> None:
 # Reuse the pocket-extraction primitives from the production driver so
 # this audit tool stays bit-exact with what the pipeline computes.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from iterative_design_v2 import _run_fpocket  # noqa: E402
+from iterative_design import _run_fpocket  # noqa: E402
 
 
 _DIAG_COLS = [

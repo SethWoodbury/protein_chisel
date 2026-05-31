@@ -55,7 +55,7 @@ import numpy as np
 import pandas as pd
 
 
-LOGGER = logging.getLogger("iterative_design_v2")
+LOGGER = logging.getLogger("iterative_design")
 
 
 # ----------------------------------------------------------------------
@@ -5966,7 +5966,7 @@ def main() -> None:
 
     # ---- Manifest ---------------------------------------------------
     manifest = {
-        "pipeline": "iterative_design_v2",
+        "pipeline": "iterative_design",
         "seed_pdb": str(args.seed_pdb),
         "ligand_params": str(args.ligand_params),
         "plm_artifacts_dir": str(args.plm_artifacts_dir),

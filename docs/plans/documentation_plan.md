@@ -34,7 +34,7 @@ docs/
 **Writes:** docs/usage.md (running locally vs slurm vs interactive, all 3 stages, common patterns), docs/examples/{pte_default_run.md, pte_diverse_run.md, new_scaffold_setup.md}.
 
 ### Agent 3 — CLI reference
-**Reads:** scripts/iterative_design_v2.py argparse block. Generate `--help` output and convert to organized markdown grouped by topic (sampling, filters, multi-objective ranking, termini, strategy).
+**Reads:** scripts/iterative_design.py argparse block. Generate `--help` output and convert to organized markdown grouped by topic (sampling, filters, multi-objective ranking, termini, strategy).
 **Writes:** docs/cli_reference.md.
 
 ### Agent 4 — Metrics reference (the BIG one)
@@ -76,6 +76,6 @@ Each subagent ~3-5 min. All run in parallel: ~5 min wall-clock for the full doc 
 ## After deployment
 
 - Spot-check each output for accuracy
-- Run `python scripts/iterative_design_v2.py --help` and verify CLI reference matches
+- Run `python scripts/iterative_design.py --help` and verify CLI reference matches
 - Run a smoke design and verify metrics reference matches columns
 - Commit + push

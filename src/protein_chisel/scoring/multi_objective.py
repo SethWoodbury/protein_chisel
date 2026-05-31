@@ -1,6 +1,6 @@
 """Multi-objective ranking via Pareto-front + TOPSIS tie-breaking.
 
-Currently iterative_design_v2 sorts by ``(fitness desc, alpha_radius asc)``,
+Currently iterative_design sorts by ``(fitness desc, alpha_radius asc)``,
 which silently collapses many objectives to two. This module exposes a
 principled alternative:
 
@@ -144,7 +144,7 @@ class MetricSpec:
 
 
 # Default metric set for PTE / hydrolase de-novo design — matches the
-# columns emitted by iterative_design_v2 stage_seq_filter / struct_filter
+# columns emitted by iterative_design stage_seq_filter / struct_filter
 # / fpocket_rank / fitness. Weights tuned 2026-05-04: fitness is 2× the
 # nominal weight; primary structural / catalytic metrics 1×; physico-
 # chemical "stay-in-band" target metrics 0.3× each (enough to break

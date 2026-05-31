@@ -11,7 +11,7 @@ in protein-chisel designs:
 CAVER is the gold-standard tunnel-analysis package (Chovancova et al., PLoS
 Comput Biol 2012). It performs Voronoi-based tunnel detection, average-link
 clustering, and bottleneck profiling. It is **too slow** to run inside the
-`iterative_design_v2` hot path, so we use it offline to validate the top
+`iterative_design` hot path, so we use it offline to validate the top
 designs (e.g. top 5) after a campaign completes.
 
 ## Install
@@ -78,10 +78,10 @@ sampled designs it is not.
 
 ## When to use CAVER
 
-Run CAVER **offline** on the top N designs after `iterative_design_v2`
+Run CAVER **offline** on the top N designs after `iterative_design`
 finishes. Typical workflow:
 
-1. Run `iterative_design_v2` with inline `tunnel_metrics` filtering
+1. Run `iterative_design` with inline `tunnel_metrics` filtering
    (millisecond/PDB).
 2. Pick top 5-10 designs by composite score.
 3. For each design, run `scripts/run_caver.sh` and inspect the JSON summary +

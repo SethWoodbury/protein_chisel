@@ -21,8 +21,6 @@ What still needs work, drawn from [docs/architecture.md](architecture.md), [READ
 
 | Item | File | Reason |
 |---|---|---|
-| `preorganization` | [tools/preorganization.py](../src/protein_chisel/tools/preorganization.py) | Function written; no test in [tests/](../tests/). |
-| End-to-end `sequence_design_v1` | [pipelines/sequence_design_v1.py](../src/protein_chisel/pipelines/sequence_design_v1.py) | Stages tested individually; no full pipeline run in CI. |
 | End-to-end `naturalness_metrics` | [pipelines/naturalness_metrics.py](../src/protein_chisel/pipelines/naturalness_metrics.py) | Underlying tools tested; pipeline orchestration + fusion-bias artifacts not covered. |
 | Live `sample_with_ligand_mpnn` | [tools/ligand_mpnn.py](../src/protein_chisel/tools/ligand_mpnn.py) | Helper-level tests only ([test_ligand_mpnn_unit.py](../tests/test_ligand_mpnn_unit.py)); no real fused_mpnn execution in CI. |
 | ProLIF + Arpeggio | (planned wrappers above) | **Once new sif is built, add cluster tests** for both. |
@@ -76,7 +74,6 @@ From [tools/__init__.py](../src/protein_chisel/tools/__init__.py)'s planned-tool
 | Repo CI | none | No GitHub Actions / cluster CI runner yet. Plan: a small workflow that runs the host-only test suite on PRs, plus a periodic cluster job that runs the `cluster`-marked tests. |
 | Examples | empty | [examples/](../examples/) only has a stub README. End-to-end runnable examples would help onboarding. |
 | Configs | empty | [configs/](../configs/) only has a stub README. YAML configs for each pipeline are planned (`chisel <pipeline> --config configs/<x>.yaml`); the CLI doesn't yet accept `--config` paths. |
-| Manifest hashing for `sequence_design_v1` | weak | The pipeline uses file-existence-only restart logic; switching to manifest hashing (like `comprehensive_metrics`) would prevent the silent stale-config-reuse bug. |
 
 ---
 

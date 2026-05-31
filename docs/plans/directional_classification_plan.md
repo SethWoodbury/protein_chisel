@@ -407,7 +407,7 @@ Set `is_rim_ambiguous = True` if so. Use it for diagnostics; don't gate classifi
 
 ## 11. Implementation sequence (revised, post-codex)
 
-**STEP 0 — consumer audit (NEW per codex):** before touching anything, grep every consumer of the legacy class names (`active_site`, `first_shell`, `pocket`, `buried`, `surface`) and produce a list. Decide per-consumer: update to new names, or use the legacy remap. Files to audit at minimum: `sampling/plm_fusion.py`, `expression/builtin_rules.py`, `pipelines/*`, `scripts/iterative_design_v2.py`, all tests. **No edits until the audit list is in the plan.**
+**STEP 0 — consumer audit (NEW per codex):** before touching anything, grep every consumer of the legacy class names (`active_site`, `first_shell`, `pocket`, `buried`, `surface`) and produce a list. Decide per-consumer: update to new names, or use the legacy remap. Files to audit at minimum: `sampling/plm_fusion.py`, `expression/builtin_rules.py`, `pipelines/*`, `scripts/iterative_design.py`, all tests. **No edits until the audit list is in the plan.**
 
 1. **`utils/geometry.py` additions** — phantom_cb() with BOTH chirality candidates + auto-validation against real Cβ on a non-Gly residue (mean deviation < 0.15 Å). sidechain_atoms(), residue_max_sasa(Tien 2013 table). ~80 LOC + tests.
 2. **`tools/classify_positions.py` rewrite** — new `_classify_one`, new `ClassifyConfig` fields, new metric columns, sanity-gate warnings. Keep current entrypoint signature stable. `ClassifyConfig` is serialized as JSON metadata into the parquet (codex finding 3).

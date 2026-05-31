@@ -2,7 +2,7 @@
 
 ## What it does
 
-After cycle k of `iterative_design_v2`, the top survivors are scored for
+After cycle k of `iterative_design`, the top survivors are scored for
 *pocket entrance accessibility* by `score_tunnels()` (homegrown ray-cast
 + pyKVFinder cavity detection). The per-design output includes a
 **breakdown** — a list of `(resno, resname, mass_weight)` for designable
@@ -135,7 +135,7 @@ Use `--no_throat_feedback` when:
 - `src/protein_chisel/tools/tunnel_metrics.py` — `aggregate_blocker_stats`,
   `build_throat_bias_delta`, plus the existing `score_tunnels` /
   `pyKVFinder_score`.
-- `scripts/iterative_design_v2.py` — `run_cycle` threads
+- `scripts/iterative_design.py` — `run_cycle` threads
   `throat_bias_prev` between cycles, applies decay, accumulates new
   observations, returns `cycle_telem` with `throat_bias_delta` for the
   next cycle.

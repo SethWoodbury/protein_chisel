@@ -1,8 +1,10 @@
 """Load + concatenate ``chiseled_design_metrics.tsv`` files across many runs.
 
-Designed for jupyterhub use:
+Designed for jupyterhub use (this is a standalone script, not part of the
+installed package -- add scripts/ to sys.path to import it):
 
-    >>> from protein_chisel.tools.load_chiseled_runs import load_runs, load_one
+    >>> import sys; sys.path.insert(0, "/path/to/protein_chisel/scripts")
+    >>> from load_chiseled_runs import load_runs, load_one
     >>> df = load_runs("/net/scratch/$USER/iterative_design_*/chiseled_design_metrics.tsv")
     >>> df.shape
     (N_runs * 50, ~150)

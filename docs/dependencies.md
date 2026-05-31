@@ -11,7 +11,7 @@ scaffold-specific assets needed by the example PTE_i1 design campaign.
 ## 1. Container Images (`.sif`)
 
 The pipeline is split across three Apptainer containers. Each stage of
-`iterative_design_v2.py` (and the standalone scripts under `scripts/`) selects
+`iterative_design.py` (and the standalone scripts under `scripts/`) selects
 the appropriate one. **Do not** swap containers casually — `esmc.sif` is the
 only one with `py_contact_ms`, and `pyrosetta.sif` is the only one with the
 full PyRosetta param library.
@@ -34,7 +34,7 @@ Stages that use `universal.sif`:
 - pocket detection (`run_fpocket.py`)
 - SASA / SAP scoring
 - biopython descriptor scoring
-- `iterative_design_v2.py` orchestrator (top-level driver)
+- `iterative_design.py` orchestrator (top-level driver)
 
 ### 1.2 `esmc.sif`
 
@@ -79,7 +79,7 @@ Stages that use `pyrosetta.sif`:
 
 - **Entry point:** `/net/software/lab/fused_mpnn/seth_temp/run.py`
 - **Role:** LigandMPNN sequence sampler with a side-chain packer head. Used
-  by the `mpnn_sample` stage of `iterative_design_v2.py`.
+  by the `mpnn_sample` stage of `iterative_design.py`.
 - **LigandMPNN checkpoint:**
   `/net/databases/mpnn/ligand_mpnn_model_weights/s25_r010_t300_p.pt`
   (sequence model, T=300 sampling, 10% chain-noise, 25% schedule)
@@ -207,7 +207,7 @@ apptainer exec \
     --bind <REPO>:/code \
     --env "PYTHONPATH=/code/src:/cifutils/src" \
     /net/software/containers/universal.sif \
-    python /code/scripts/iterative_design_v2.py [args...]
+    python /code/scripts/iterative_design.py [args...]
 ```
 
 ### 5.4 GPU stage on `esmc.sif` (PLM precompute, CMS)

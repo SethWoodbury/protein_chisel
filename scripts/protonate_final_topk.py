@@ -1,7 +1,7 @@
 """CLI driver: post-design protonation cleanup on a directory of design PDBs.
 
 Wraps ``protein_chisel.tools.protonate_final.protonate_final_topk``. Run
-this INSIDE pyrosetta.sif, after the iterative_design_v2 pipeline finishes.
+this INSIDE pyrosetta.sif, after the iterative_design pipeline finishes.
 
 Inputs:
     --topk_dir         directory of .pdb files (typically final_topk/topk_pdbs/)
@@ -49,7 +49,11 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--topk_dir", type=Path, required=True)
     p.add_argument("--seed_pdb", type=Path, required=True)
-    p.add_argument("--ligand_params", type=Path, nargs="+", required=True)
+    p.add_argument("--ligand_params", type=Path, nargs="*", default=[],
+                   help="Rosetta .params for the ligand. If omitted, PyRosetta "
+                        "ignores the (unparametrized) ligand on load and protonates "
+                        "the apo protein; the ligand block is re-added verbatim from "
+                        "--seed_pdb (apo fallback).")
     p.add_argument("--out_dir", type=Path, default=None)
     p.add_argument("--ligand_resname", default=None,
                    help="Optional 3-letter ligand code; auto-detected if missing")

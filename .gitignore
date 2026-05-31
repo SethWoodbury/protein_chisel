@@ -35,6 +35,8 @@ slurm-*.out
 runs/
 outputs/
 results/
+*.pka                      # PROPKA output
+test_packer_swap_results/  # packer-swap diagnostic outputs (regenerate via scripts/test_packer_swap.py)
 
 # Large artifacts that should never be committed
 *.pdb

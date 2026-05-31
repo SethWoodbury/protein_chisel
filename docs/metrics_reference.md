@@ -1,7 +1,7 @@
 # protein_chisel metrics reference
 
 This document is the per-column reference for the design TSVs that the
-`iterative_design_v2` driver produces — most importantly
+`iterative_design` driver produces — most importantly
 `final_topk/all_survivors.tsv`. Every numeric / categorical column that
 ends up in that file is documented below with its definition, formula,
 direction (max / min / target / informational), units, the actual range
@@ -294,7 +294,7 @@ averaged per design. Implementation in
 
 ## 9. Pocket geometry (fpocket)
 
-`scripts/iterative_design_v2.py:_run_fpocket` runs fpocket on each
+`scripts/iterative_design.py:_run_fpocket` runs fpocket on each
 design, parses the `info.txt` for the most-druggable pocket and
 augments it with bottleneck stats from the per-pocket PQR. The
 underlying Python wrapper is `src/protein_chisel/tools/fpocket_run.py`.
@@ -583,7 +583,7 @@ up in `all_survivors.tsv` but are documented for completeness.
 | `theta_orient_*` | seed PDB | orientation angles of CA-CB vector relative to the ligand centroid (`*` ∈ `phi`, `theta`). Used by `struct_aware_bias.py` to weight per-position MPNN biases. |
 | pairwise Hamming | `select_diverse_topk_two_axis` | greedy max-min selection: a candidate must differ at ≥ `min_hamming_full` (default 3) positions from every previously-kept candidate. |
 | Hamming on primary-sphere positions | same | second axis: candidate must differ at ≥ `min_hamming_active` positions on the primary-sphere indices alone. Default 0 (off); set to 2 to demand active-site diversity. |
-| `hamming_to_WT` / `sequence_identity_to_WT` | not currently emitted | see `iterative_design_v2.py:select_diverse_topk_two_axis` for adding these — they fall out trivially of the same Hamming routine. |
+| `hamming_to_WT` / `sequence_identity_to_WT` | not currently emitted | see `iterative_design.py:select_diverse_topk_two_axis` for adding these — they fall out trivially of the same Hamming routine. |
 
 ---
 
@@ -712,7 +712,7 @@ with `--rank_weights` / `--rank_targets`.
 
 ### Cycle-config knobs
 
-The above thresholds come from `scripts/iterative_design_v2.py`'s
+The above thresholds come from `scripts/iterative_design.py`'s
 `stage_seq_filter` / `stage_struct_filter` defaults and the
 `DEFAULT_METRIC_SPECS`. They're configurable per cycle via the
 `CycleConfig` dataclass in the driver. Common over-rides:
@@ -878,18 +878,18 @@ the upper-quartile band.
 * `src/protein_chisel/tools/geometric_interactions.py` — `ligand_int__*`.
 * `src/protein_chisel/tools/fpocket_run.py` + the in-driver
   `_run_fpocket` / `_compute_pocket_radius_stats` in
-  `scripts/iterative_design_v2.py` — `fpocket__*`.
+  `scripts/iterative_design.py` — `fpocket__*`.
 * `src/protein_chisel/sampling/fitness_score.py` — `fitness__*` cols
   and `seq_hash` / `n_dupes`.
 * `src/protein_chisel/expression/aa_class_balance.py` +
   `expression/aa_composition.py` — z-scores and the `bias_AA` string
   used for next-cycle MPNN sampling.
-* `scripts/iterative_design_v2.py:stage_seq_filter` —
+* `scripts/iterative_design.py:stage_seq_filter` —
   `passed_seq_filter` / `fail_reasons` / `n_expression_*`.
-* `scripts/iterative_design_v2.py:stage_struct_filter` —
+* `scripts/iterative_design.py:stage_struct_filter` —
   `passed_struct_filter` / `struct_fail` / `n_hbonds_to_cat_his` /
   `sap_*`.
-* `scripts/iterative_design_v2.py` (around L3030–3110) —
+* `scripts/iterative_design.py` (around L3030–3110) —
   `mo_topsis_cycle`, `mo_topsis`, `legacy_rank_score`, the
   diverse-top-K selection.
 

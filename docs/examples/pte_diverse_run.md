@@ -19,7 +19,7 @@ apptainer exec --nv \
     --bind /net/scratch --bind /home/woodbuse \
     --env "PYTHONPATH=/code/src:/cifutils/src" \
     /net/software/containers/universal.sif \
-    python "$REPO/scripts/iterative_design_v2.py" \
+    python "$REPO/scripts/iterative_design.py" \
         --seed_pdb "$SEED_PDB" \
         --ligand_params "$LIG_PARAMS" \
         --plm_artifacts_dir "$PLM_DIR" \

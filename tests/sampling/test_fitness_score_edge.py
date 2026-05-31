@@ -1,7 +1,7 @@
 """Edge-case tests for fitness_score not covered by test_fitness_score.py.
 
 Targets the specific failure modes that could blow up an autonomous
-3-cycle iterative_design_v2 run:
+3-cycle iterative_design run:
 - stale ``seq_hash`` columns surviving a TSV round-trip
 - duplicate-collapse + downstream pdb_map lookup integrity
 - empty / all-non-canonical / NaN sequence handling

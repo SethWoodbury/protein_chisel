@@ -1,20 +1,17 @@
 """Robustness tests for the PDB line parsers in protonate_final.
 
 We construct a few intentionally malformed ATOM lines and verify the
-parsers extract reasonable values via either column or whitespace
+parser extracts reasonable values via either column or whitespace
 fallback, never raising.
 """
 from __future__ import annotations
 
-import sys
-sys.path.insert(0, "/home/woodbuse/codebase_projects/protein_chisel/src")
+import pytest
 
-from protein_chisel.tools.protonate_final import (
-    parse_atom_line,
-    _whitespace_parse,
-)
+from protein_chisel.tools.protonate_final import parse_atom_line
 
 
+# (case_name, raw ATOM line, expected field subset or None for "should be None")
 CASES: list[tuple[str, str, dict | None]] = [
     (
         "standard_strict",
@@ -66,37 +63,18 @@ CASES: list[tuple[str, str, dict | None]] = [
 ]
 
 
-def main() -> int:
-    failures: list[str] = []
-    for name, line, expected in CASES:
-        result = parse_atom_line(line)
-        if expected is None:
-            if result is None:
-                print(f"OK  {name}: returned None as expected")
-            else:
-                failures.append(f"FAIL {name}: expected None, got {result}")
-            continue
-        if result is None:
-            failures.append(f"FAIL {name}: parser returned None, expected {expected}")
-            continue
-        for k, v in expected.items():
-            actual = result.get(k)
-            if actual != v:
-                failures.append(
-                    f"FAIL {name}: field {k!r}: expected {v!r}, got {actual!r}"
-                )
-                break
-        else:
-            print(f"OK  {name}: chain={result['chain']!r} resname={result['resname']!r} resno={result['resno']} atom={result['atom_name']!r}")
-
-    if failures:
-        print(f"\n{len(failures)} FAILURES:")
-        for f in failures:
-            print(f"  {f}")
-        return 1
-    print(f"\nAll {len(CASES)} test cases passed.")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+@pytest.mark.parametrize(
+    "line,expected",
+    [(c[1], c[2]) for c in CASES],
+    ids=[c[0] for c in CASES],
+)
+def test_parse_atom_line(line: str, expected: dict | None):
+    result = parse_atom_line(line)
+    if expected is None:
+        assert result is None
+        return
+    assert result is not None
+    for key, value in expected.items():
+        assert result.get(key) == value, (
+            f"field {key!r}: expected {value!r}, got {result.get(key)!r}"
+        )

@@ -1,7 +1,7 @@
 """Aggregate optimization metrics across the 6 PLM × device benchmark runs.
 
 For each run, read final_topk/scored.tsv (or final_topk.tsv) and report
-mean ± SD for every metric the iterative_design_v2 driver optimizes:
+mean ± SD for every metric the iterative_design driver optimizes:
   - fitness, sap_max, charge, pI
   - fpocket: druggability, volume, bottleneck_radius, hydrophobicity, n_alpha_spheres, score
   - ligand_int: strength_total, n_hbond, n_hydrophobic, n_total

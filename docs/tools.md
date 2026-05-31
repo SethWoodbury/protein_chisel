@@ -18,7 +18,7 @@ Single-purpose primitives in `src/protein_chisel/tools/`. Each tool exposes a Py
 | `buns` | [tools/buns.py](../src/protein_chisel/tools/buns.py) | `pyrosetta.sif` | `BUNSResult` (`buns__*`) | [tests/test_chemistry_tools.py](../tests/test_chemistry_tools.py) (cluster) |
 | `catres_quality` | [tools/catres_quality.py](../src/protein_chisel/tools/catres_quality.py) | `pyrosetta.sif` | `CatresQualityResult` (`catres__*`) | [tests/test_chemistry_tools.py](../tests/test_chemistry_tools.py) (cluster) |
 | `theozyme_satisfaction` | [tools/theozyme_satisfaction.py](../src/protein_chisel/tools/theozyme_satisfaction.py) | host (numpy only) | `TheozymeSatisfactionResult` (`theozyme__*`) | [tests/test_theozyme_satisfaction.py](../tests/test_theozyme_satisfaction.py) (host) |
-| `preorganization` | [tools/preorganization.py](../src/protein_chisel/tools/preorganization.py) | `pyrosetta.sif` | `PreorganizationResult` (`preorg__*`) | **untested** |
+| `preorganization` | [scoring/preorganization.py](../src/protein_chisel/scoring/preorganization.py) | host (numpy + io/pdb) | `dict` (`preorg__*` interactome metrics) | [tests/scoring/test_preorganization.py](../tests/scoring/test_preorganization.py) (host) |
 | `catalytic_pka` | [tools/catalytic_pka.py](../src/protein_chisel/tools/catalytic_pka.py) | `esmc.sif` (PROPKA) | `CatalyticPkaResult` (`pka__*`) | [tests/test_catalytic_pka.py](../tests/test_catalytic_pka.py) (cluster) |
 | `fpocket_run` | [tools/fpocket_run.py](../src/protein_chisel/tools/fpocket_run.py) | host (binary required) | `FpocketResult` (`fpocket__*`) | **untested**, binary not installed |
 | `metal3d_score` | [tools/metal3d_score.py](../src/protein_chisel/tools/metal3d_score.py) | `metal3d.sif` (stubbed) | `Metal3DResult` (`metal3d__*`) | **untested**, inference path stubbed |
@@ -112,13 +112,15 @@ Pure-Python (no PyRosetta) Kabsch alignment of catalytic residues vs. a theozyme
 - **Limitations**: No iterative-relax variant (one-shot alignment only). No catalytic angle/dihedral/cstfile parsing yet — only RMSD-based metrics. The "iterative-relax variant" is on [docs/future_plans.md](future_plans.md).
 
 ### `preorganization`
-[src/protein_chisel/tools/preorganization.py:49](../src/protein_chisel/tools/preorganization.py#L49)
+[src/protein_chisel/scoring/preorganization.py:85](../src/protein_chisel/scoring/preorganization.py#L85)
 
-Active-site flexibility via repack ensembles. Catalytic residues + ligand are prevent-repacked (NEVER moved); other protein residues get N independent `PackRotamers` trajectories with different seeds. Per-residue centroid variance across the ensemble = preorganization signal.
+Geometric preorganization metric around the catalytic residues: how rich and well-connected the network of stabilizing interactions is among the catalytic residues plus their first- and second-shell neighbours (shells defined by Cα-Cα distance). Pure-Python; no PyRosetta.
 
-- **Outputs**: `preorg__n_ensemble`, `preorg__mean_catres_variance` (always 0 since catres are locked), `preorg__mean_near_site_variance`, `preorg__seed_pose_score`.
-- **sif**: `pyrosetta.sif`.
-- **Limitations**: **Not yet tested.** The "catres locked" choice is intentional (theozyme geometry preserved) but means catres-variance is always zero by construction; the useful signal is `mean_near_site_variance`. No backrub-ensemble alternative implemented.
+- **Outputs**: `preorg__n_hbonds_to_cat`, `preorg__n_salt_bridges_to_cat`, `preorg__n_pi_to_cat`, `preorg__n_hbonds_within_shells`, `preorg__strength_total`, `preorg__interactome_density`, `preorg__n_first_shell`, `preorg__n_second_shell`.
+- **sif**: host (numpy + io/pdb).
+- **Used by**: the production `iterative_design.py` struct-filter / scoring stage. Tested in [tests/scoring/test_preorganization.py](../tests/scoring/test_preorganization.py).
+
+> An earlier `tools/preorganization.py` (a PyRosetta repack-ensemble variance variant) was never wired into the pipeline and was removed; this interactome score is the one that emits the `preorg__*` columns.
 
 ### `catalytic_pka`
 [src/protein_chisel/tools/catalytic_pka.py:57](../src/protein_chisel/tools/catalytic_pka.py#L57)

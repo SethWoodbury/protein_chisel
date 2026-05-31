@@ -79,7 +79,6 @@ Ligand params at `/home/woodbuse/testing_space/scaffold_optimization/ZZZ_MERGED_
 
 ## What's NOT tested
 
-- **End-to-end `sequence_design_v1` pipeline** — only individual stages and underlying tools.
 - **`naturalness_metrics` pipeline end-to-end** — the underlying ESM-C / SaProt tools are tested but the pipeline orchestration and fusion-bias artifacts are not.
 - **`fpocket_run`** — binary not on cluster.
 - **`metal3d_score`** — inference path stubbed.
