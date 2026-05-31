@@ -61,6 +61,7 @@ import argparse
 import json
 import logging
 import os
+import random
 import shlex
 import shutil
 import subprocess
@@ -199,6 +200,30 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
                    help="Allow Met at the N-terminal residue. Default: omit 'M' at "
                         "position 1 (unless that residue is fixed) since a Met tag is "
                         "added during expression. This is additive to omit_AA.")
+    # --- H-bond sidechain conservation (opt-in) ---
+    p.add_argument("--conserve_hbonds", action="store_true",
+                   help="Detect designable-residue SIDECHAIN H-bonds to the ligand / "
+                        "fixed residues and probabilistically pin those residues into the "
+                        "fixed list (rolled independently per LigandMPNN run).")
+    p.add_argument("--conserve_hbond_prob", type=float, default=0.8,
+                   help="Per-residue fix probability (default 0.8). 0-1, or a percentage "
+                        ">1 (e.g. 80) which is auto-converted with a warning.")
+    p.add_argument("--conserve_hbond_all_or_none", action="store_true",
+                   help="Roll each candidate ONCE and apply to all runs (default: roll "
+                        "independently per run).")
+    p.add_argument("--conserve_seed", type=int, default=None,
+                   help="Seed the conservation rolls for reproducibility (default: random).")
+    p.add_argument("--conserve_anchors", default="ligand,catalytic,user_fixed",
+                   help="Comma list of anchor groups a sidechain must H-bond to "
+                        "(subset of ligand,catalytic,user_fixed; default all).")
+    p.add_argument("--conserve_hbond_max_dist", type=float, default=3.9,
+                   help="Heavy-atom donor···acceptor distance cutoff (default 3.9 A).")
+    p.add_argument("--conserve_hbond_max_angle", type=float, default=90.0,
+                   help="Antecedent-D-A angle gate; larger = more permissive "
+                        "(default 90; stock detector uses 70).")
+    p.add_argument("--conserve_keep_clashing", action="store_true",
+                   help="Keep conserved candidates that clash with fixed backbone / ligand "
+                        "(default: exclude them with a warning).")
     return p.parse_known_args(argv)
 
 
@@ -790,6 +815,62 @@ def build_omit_nterm_met_json(pdb_path: str, label: str, out_json: Path) -> Path
 
 
 # ---------------------------------------------------------------------------
+# H-bond sidechain conservation helpers
+# ---------------------------------------------------------------------------
+def parse_probability(value: float) -> float:
+    """A 0-1 probability, or a percentage >1 (auto-converted with a warning)."""
+    v = float(value)
+    if v < 0:
+        raise SystemExit(f"--conserve_hbond_prob must be >= 0 (got {v})")
+    if v <= 1:
+        return v
+    if v <= 100:
+        LOGGER.warning("--conserve_hbond_prob=%g > 1; interpreting as a percentage -> %g",
+                       v, v / 100.0)
+        return v / 100.0
+    raise SystemExit(f"--conserve_hbond_prob must be 0-1 or a percentage <=100; got {v}")
+
+
+def _protein_resnos(pdb_path: str, chain: str) -> set[int]:
+    out: set[int] = set()
+    with open(pdb_path) as fh:
+        for line in fh:
+            if line.startswith("ATOM  ") and line[21] == chain:
+                try:
+                    out.add(int(line[22:26]))
+                except ValueError:
+                    pass
+    return out
+
+
+def _label_sort_key(lab: str) -> tuple:
+    return (lab[0], int(lab[1:]) if lab[1:].isdigit() else 0)
+
+
+def _fixed_residues_json(pdb_path: str, labels, out_json: Path) -> Path:
+    payload = {str(Path(pdb_path).resolve()): sorted(set(labels), key=_label_sort_key)}
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+    out_json.write_text(json.dumps(payload, indent=2))
+    return out_json
+
+
+def _roll_conserved(labels, prob: float, rng: random.Random) -> set:
+    return {lab for lab in labels if rng.random() < prob}
+
+
+def _fmt_dur(seconds: float) -> str:
+    """Human-readable wall-clock duration (e.g. ``1h02m03s`` / ``2m05s`` / ``12.3s``)."""
+    s = int(round(seconds))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m{sec:02d}s"
+    if m:
+        return f"{m}m{sec:02d}s"
+    return f"{seconds:.1f}s"
+
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 def main(argv: Optional[list[str]] = None) -> int:
@@ -837,12 +918,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     if scanned.has_fixed and not args.no_fix_remark666_catres and not multi:
         say("  fixed residues supplied by user -> skipping REMARK 666 auto-fix")
 
-    injected: list[str] = []   # flags appended to every run (fixed / per-residue omit)
+    # `injected` = flags appended to EVERY run (per-residue omit, etc.).
+    # The fixed-residues source is tracked separately because it becomes
+    # PER-COMBO when --conserve_hbonds is active (rolled independently per run).
+    injected: list[str] = []
+    fixed_residues_json_shared: Optional[Path] = None
     if do_fix:
-        fixed_json = build_fixed_residues_from_remark666(
+        fixed_residues_json_shared = build_fixed_residues_from_remark666(
             catres, scanned.pdb_path, pre_dir / "fixed_residues_remark666.json")
-        if fixed_json:
-            injected += ["--fixed_residues_multi", str(fixed_json)]
 
     # N-terminal Met guard (additive per-residue omit of 'M' at position 1).
     if (not args.no_omit_nterm_met) and scanned.pdb_path and not multi:
@@ -866,6 +949,72 @@ def main(argv: Optional[list[str]] = None) -> int:
                 injected += ["--omit_AA_per_residue_multi", str(omit_json)]
                 say(f"  N-term Met guard: omitting 'M' at {nterm_label} "
                     f"(additive to omit_AA; --no_omit_nterm_met to disable)")
+
+    # ---- H-bond sidechain conservation (opt-in; per-combo fixed residues) ----
+    conserve_active = False
+    conserve_candidates: list[str] = []
+    conserve_base: set[str] = set()
+    conserve_prob = 0.8
+    conserve_once: set[str] = set()
+    conserve_seed_base = args.conserve_seed
+    if args.conserve_hbonds and scanned.pdb_path and not multi:
+        from protein_chisel.tools.conserved_hbonds import find_conservable_sidechain_hbonds
+        conserve_prob = parse_probability(args.conserve_hbond_prob)
+        chain = next(iter(catres.values())).chain if catres else "A"
+        anchors = {a.strip() for a in (args.conserve_anchors or "").split(",") if a.strip()}
+        user_fixed_labels = _parse_user_fixed_labels(extras)
+        user_fixed_resnos = {int(l[1:]) for l in user_fixed_labels if l[1:].isdigit()}
+        cat_resnos = {cr.resno for cr in catres.values()}
+        designable = sorted(_protein_resnos(scanned.pdb_path, chain)
+                            - cat_resnos - user_fixed_resnos)
+        recs = find_conservable_sidechain_hbonds(
+            scanned.pdb_path,
+            designable_resnos=designable,
+            catalytic_resnos=(cat_resnos if "catalytic" in anchors else set()),
+            user_fixed_resnos=(user_fixed_resnos if "user_fixed" in anchors else set()),
+            include_ligand=("ligand" in anchors),
+            chain=chain,
+            max_dist=args.conserve_hbond_max_dist,
+            max_angle_deg=args.conserve_hbond_max_angle,
+        )
+        banner("H-BOND SIDECHAIN CONSERVATION")
+        for r in sorted(recs, key=lambda r: (r.resno, r.distance)):
+            ptag = f"{r.partner_resname}{r.partner_resno if r.partner_resno > 0 else ''}"
+            flag = f"  [CLASH {r.clash_with}]" if r.clashes else ""
+            say(f"  A{r.resno} {r.resname} {r.sidechain_atom} <-> {r.partner_kind} {ptag} "
+                f"{r.partner_atom}  d={r.distance} {r.strength_bin}  "
+                f"donor={r.hypothesized_donor} acceptor={r.hypothesized_acceptor}{flag}")
+        by_res: dict[int, list] = {}
+        for r in recs:
+            by_res.setdefault(r.resno, []).append(r)
+        cand_resnos: list[int] = []
+        for resno, rs in sorted(by_res.items()):
+            if rs[0].clashes and not args.conserve_keep_clashing:
+                say(f"  excluding A{resno}: sidechain clashes with fixed backbone/ligand "
+                    f"({rs[0].clash_with})  [--conserve_keep_clashing to keep]")
+                continue
+            cand_resnos.append(resno)
+        conserve_candidates = [f"{chain}{rn}" for rn in cand_resnos]
+        conserve_base = set(catres_labels) | set(user_fixed_labels)
+        # The per-combo JSON is the sole fixed-residues source while conserving;
+        # drop the shared one and any user-supplied fixed flags (folded into base).
+        fixed_residues_json_shared = None
+        extras = _strip_flags(extras, ["--fixed_residues", "--fixed_residues_multi"])
+        conserve_active = True
+        # Always have an explicit seed so every round's roll is reproducible
+        # after the fact: use --conserve_seed if given, else auto-generate one
+        # and tell the user how to replay it.
+        if conserve_seed_base is None:
+            conserve_seed_base = random.SystemRandom().randint(1, 2**31 - 1)
+            say(f"  no --conserve_seed given; using auto seed {conserve_seed_base} "
+                f"(rerun with --conserve_seed {conserve_seed_base} for identical rolls)")
+        say(f"  conserving {len(conserve_candidates)} candidate residue(s) "
+            f"{conserve_candidates} at p={conserve_prob:.2f} "
+            f"({'one decision for all runs' if args.conserve_hbond_all_or_none else 'independent per run'}"
+            f", seed={conserve_seed_base})")
+        if args.conserve_hbond_all_or_none:
+            conserve_once = _roll_conserved(
+                conserve_candidates, conserve_prob, random.Random(str(conserve_seed_base)))
 
     runs, sweeping = parse_sweep(args, scanned)
     base_out = scanned.out_folder
@@ -904,18 +1053,45 @@ def main(argv: Optional[list[str]] = None) -> int:
             say(f"  bias_AA          = {run.bias_AA}")
             say(f"  packed_suffix    = {run.packed_suffix}")
             say(f"  staging dir      = {run.out_folder}")
-        run_extras = build_run_extras(extras, run, injected, sweeping)
+        # Per-run fixed-residues source: when conserving, roll candidates for THIS
+        # combo and write a combined (base ∪ rolled) JSON; else use the shared one.
+        rolled: set[str] = set()
+        seed_str = ""
+        if conserve_active:
+            if args.conserve_hbond_all_or_none:
+                rolled, seed_str = conserve_once, str(conserve_seed_base)
+            else:
+                seed_str = f"{conserve_seed_base}:{i}"
+                rolled = _roll_conserved(conserve_candidates, conserve_prob,
+                                         random.Random(seed_str))
+            combined = sorted(conserve_base | rolled, key=_label_sort_key)
+            combo_json = pre_dir / f"fixed_residues_{run.run_tag or f'run{i}'}.json"
+            _fixed_residues_json(scanned.pdb_path, combined, combo_json)
+            fixed_inject = ["--fixed_residues_multi", str(combo_json)]
+            if conserve_candidates:
+                say(f"  conserve roll (p={conserve_prob:.2f}, seed={seed_str}): fixing "
+                    f"{sorted(rolled, key=_label_sort_key) or '(none)'} of {conserve_candidates}")
+        else:
+            fixed_inject = (["--fixed_residues_multi", str(fixed_residues_json_shared)]
+                            if fixed_residues_json_shared else [])
+        run_extras = build_run_extras(extras, run, injected + fixed_inject, sweeping)
         inner = ["python", run_script, *run_extras]
         binds = _bind_dirs(
             files=[scanned.pdb_path],
             dir_paths=[run.out_folder, base_out, str(pre_dir)],
         )
         cmd = assemble_apptainer_command(inner, binds, args.sif, nv)
+        t_run = time.time()
         rc = run_streaming(cmd, args.dry_run, label="mpnn")
+        elapsed = time.time() - t_run
         status = "dry-run" if args.dry_run else ("ok" if rc == 0 else f"FAIL({rc})")
         if status == "ok":
             any_ok = True
-        results.append({"run": i, "tag": run.run_tag or "-", "mpnn": status})
+        rec = {"run": i, "tag": run.run_tag or "-", "mpnn": status, "elapsed": elapsed}
+        if conserve_active:
+            rec["fixed"] = sorted(rolled, key=_label_sort_key)
+            rec["seed"] = seed_str
+        results.append(rec)
 
     # ---- Post-process: flatten -> protonate -> transfer REMARKs -> copy input
     subdir = resolve_protonate_subdir(scanned, args)
@@ -1005,9 +1181,25 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # ---- Summary ----------------------------------------------------------
     banner("SUMMARY")
-    say(f"  {'run':<4} {'tag':<18} mpnn")
+    say(f"  {'run':<4} {'tag':<18} {'mpnn':<10} {'time':<9}")
     for r in results:
-        say(f"  {r['run']:<4} {r['tag']:<18} {r['mpnn']}")
+        tm = "-" if args.dry_run else _fmt_dur(r["elapsed"])
+        say(f"  {r['run']:<4} {r['tag']:<18} {r['mpnn']:<10} {tm:<9}")
+    if not args.dry_run and len(results) > 1:
+        say(f"  {'':<4} {'(total)':<18} {'':<10} {_fmt_dur(sum(r['elapsed'] for r in results)):<9}")
+
+    if conserve_active:
+        say("")
+        say(f"  H-bond conservation: {len(conserve_candidates)} conservable "
+            f"residue(s) found{' ' + str(conserve_candidates) if conserve_candidates else ''}")
+        say(f"    seed base: {conserve_seed_base}"
+            + ("" if args.conserve_seed is not None
+               else f"  (auto; rerun with --conserve_seed {conserve_seed_base} to reproduce)"))
+        for r in results:
+            fixed = r.get("fixed", [])
+            say(f"    run {r['run']} [{r['tag']}]  seed={r.get('seed')}  "
+                f"fixed {len(fixed)}/{len(conserve_candidates)}: {fixed or '(none)'}")
+
     if not args.dry_run:
         say("")
         say(f"  output dir  : {base_out}")

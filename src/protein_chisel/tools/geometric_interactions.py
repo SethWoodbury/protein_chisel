@@ -271,13 +271,16 @@ def _detect_hbonds(
     a_atoms: list[dict], b_atoms: list[dict],
     a_by_res: dict, b_by_res: dict,
     *, max_dist: float = HBOND_MAX_DIST,
+    max_angle_deg: float = HBOND_MAX_ANGLE_DEG,
 ) -> list[Interaction]:
     """Heavy-atom h-bond detection with antecedent-angle check.
 
     For every (donor, acceptor) candidate pair within ``max_dist``, also
-    require the antecedent-donor-acceptor angle ≤ HBOND_MAX_ANGLE_DEG
-    (< 70°) — this approximates the donor-H...acceptor geometry without
-    needing explicit hydrogens.
+    require the antecedent-donor-acceptor angle ≤ ``max_angle_deg``
+    (default 70°) — this approximates the donor-H...acceptor geometry
+    without needing explicit hydrogens. A LARGER ``max_angle_deg`` is more
+    permissive (the bond passes when the antecedent-D-A angle ≥
+    ``180 - max_angle_deg``).
     """
     out: list[Interaction] = []
     # Pre-build candidate donor/acceptor atom lists for both selections
@@ -352,7 +355,7 @@ def _detect_hbonds(
             # this angle >= 110 deg (H points toward A, opposite ant);
             # equivalently angle <= 70 means H points away from A.
             ang = _angle_deg(ant_xyz, _xyz(d), _xyz(a))
-            if ang < (180.0 - HBOND_MAX_ANGLE_DEG):
+            if ang < (180.0 - max_angle_deg):
                 return None
         strength = _gauss(r, HBOND_D0, HBOND_SIGMA)
         return Interaction(

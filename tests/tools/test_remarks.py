@@ -84,6 +84,36 @@ def test_truncation_and_exact_dups_deduped(tmp_path):
     assert sum(l.startswith("REMARK QCB") for l in lines) == 1   # exact dup deduped
 
 
+def test_legend_near_duplicate_prefix_collapsed(tmp_path):
+    # input carries the OLD legend (no trailing period); the regenerated design
+    # output carries the NEW legend (added '.'). Neither exact-match nor the
+    # one-directional truncation check collapses them (input is the *shorter*
+    # prefix) -> the prefix-fold must keep only the longer, complete variant.
+    legend_old = "REMARK 665 REMARK 666 = Rosetta enzyme-matcher catalytic-motif anchors"
+    legend_new = legend_old + "."
+    motif = "REMARK 666 MATCH TEMPLATE B LIG  200 MATCH MOTIF A HIS   60  1  1"
+    body = ("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00           N\n"
+            "TER\nEND\n")
+    out = _write(tmp_path / "design.pdb", f"{legend_new}\n{motif}\n{body}")
+    inp = _write(tmp_path / "seed.pdb", f"{legend_old}\n{motif}\n{body}")
+    remarks.reorganize_pdb_remarks(out, inp)
+    lines = Path(out).read_text().splitlines()
+    assert [l for l in lines if l.startswith("REMARK 665")] == [legend_new]  # only the complete one
+    assert sum(l.startswith("REMARK 666 MATCH") for l in lines) == 1
+
+
+def test_design_path_nested_paths_not_prefix_folded(tmp_path):
+    # Two provenance lines where one path nests under the other must BOTH survive
+    # (prefix folding is off for grouped/DESIGN_PATH lines).
+    out = _write(tmp_path / "design.pdb",
+                 "REMARK DESIGN_PATH rfd3 output /net/scratch/run\n"
+                 "REMARK DESIGN_PATH rfd3 output /net/scratch/run/cycle1\n"
+                 "ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00           N\nEND\n")
+    remarks.reorganize_pdb_remarks(out, None)
+    dp = [l for l in Path(out).read_text().splitlines() if l.startswith("REMARK DESIGN_PATH")]
+    assert len(dp) == 2
+
+
 def test_reorganize_without_input_just_records_design_path(tmp_path):
     out = _write(tmp_path / "design.pdb", _OUT_PDB)
     remarks.reorganize_pdb_remarks(out, None, design_path_stage="iterative_design")

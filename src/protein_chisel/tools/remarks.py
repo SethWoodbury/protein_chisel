@@ -111,6 +111,39 @@ def _merge(input_list, output_list):
     return list(input_list) + surviving
 
 
+def _dedupe(lines, *, fold_prefixes=False):
+    """Order-preserving de-duplication for the final REMARK header.
+
+    Always drops a line byte-identical (ignoring trailing whitespace) to one
+    already kept. When ``fold_prefixes`` is set, also collapses prefix
+    duplicates — a shorter line that is a strict prefix of a longer one — into
+    the longer, more complete variant (kept in the shorter line's position).
+    That folds PyRosetta col-80 truncations *and* legend lines that drifted by a
+    trailing edit (e.g. ``…anchors`` vs ``…anchors.``) whichever order they
+    arrive in. Distinct fixed-width data lines (REMARK 666/668) are equal-length
+    and so never strict-prefix one another, so folding is safe for them; it is
+    left OFF for grouped/provenance lines (e.g. DESIGN_PATH) where one path may
+    legitimately nest under another.
+    """
+    kept: list[str] = []
+    kept_s: list[str] = []
+    for line in lines:
+        s = line.rstrip()
+        if not s or s in kept_s:
+            continue
+        if fold_prefixes:
+            if any(k.startswith(s) and len(k) > len(s) for k in kept_s):
+                continue  # shorter truncation of a line already kept
+            longer = next((i for i, k in enumerate(kept_s)
+                           if s.startswith(k) and len(s) > len(k)), None)
+            if longer is not None:
+                kept[longer], kept_s[longer] = line, s  # supersede the kept prefix
+                continue
+        kept.append(line)
+        kept_s.append(s)
+    return kept
+
+
 def reorganize_pdb_remarks(
     output_pdb: str | Path,
     input_pdb: Optional[str | Path] = None,
@@ -159,9 +192,9 @@ def reorganize_pdb_remarks(
 
     new_lines = list(header_kept)
     for n in sorted(numbered.keys()):
-        new_lines.extend(numbered[n])
+        new_lines.extend(_dedupe(numbered[n], fold_prefixes=True))
     for grp in ("QCB", "rfd3_property", "DESIGN_PATH", "_misc"):
-        new_lines.extend(grouped[grp])
+        new_lines.extend(_dedupe(grouped[grp]))
     new_lines.extend(body_lines)
     with open(output_pdb, "w") as fh:
         fh.writelines(new_lines)
