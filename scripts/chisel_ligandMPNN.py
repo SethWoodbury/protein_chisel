@@ -224,6 +224,15 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     p.add_argument("--conserve_keep_clashing", action="store_true",
                    help="Keep conserved candidates that clash with fixed backbone / ligand "
                         "(default: exclude them with a warning).")
+    # --- output sequence de-dup + diversity reporting ---
+    p.add_argument("--no_dedup_sequences", action="store_true",
+                   help="Do NOT de-duplicate identical output sequences. Default: among "
+                        "the flat output PDBs, drop duplicate sequences (keeping one); the "
+                        "copied input structure is NEVER removed and always wins a tie "
+                        "(the newer MPNN duplicate is removed instead).")
+    p.add_argument("--diversity_ligand_cutoff", type=float, default=8.0,
+                   help="Heavy-atom distance (A) defining 'near-ligand' positions for the "
+                        "pocket diversity metric reported in the summary (default 8.0).")
     return p.parse_known_args(argv)
 
 
@@ -871,6 +880,164 @@ def _fmt_dur(seconds: float) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Output sequence de-dup + diversity reporting
+# ---------------------------------------------------------------------------
+# 3-letter -> 1-letter incl. protonation / PTM variants, so identity is read
+# independent of protonation state (HID/HIE/HIP -> H, KCX -> K, ...). Unknown -> X.
+_AA3TO1 = {
+    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C", "GLN": "Q",
+    "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I", "LEU": "L", "LYS": "K",
+    "MET": "M", "PHE": "F", "PRO": "P", "SER": "S", "THR": "T", "TRP": "W",
+    "TYR": "Y", "VAL": "V", "MSE": "M", "SEC": "U", "PYL": "O",
+    "HID": "H", "HIE": "H", "HIP": "H", "HSD": "H", "HSE": "H", "HSP": "H",
+    "ASH": "D", "GLH": "E", "LYN": "K", "CYM": "C", "CYX": "C", "TYM": "Y",
+    "KCX": "K", "MLY": "K", "M3L": "K", "ALY": "K", "SEP": "S", "TPO": "T",
+    "PTR": "Y", "HYP": "P",
+}
+_WATER = {"HOH", "WAT", "DOD", "TIP", "TIP3", "TIP4", "SOL"}
+
+
+def _read_protein_chain(pdb_path, chain: Optional[str] = None):
+    """Return ``(chain, sequence, residue_keys, heavy_by_key)`` for one protein
+    chain in the same residue order as ``io.pdb.extract_sequence`` (first protein
+    chain if ``chain`` is None; alt-locs other than ''/'A' skipped).
+    ``heavy_by_key[key]`` lists ``(x, y, z)`` for that residue's heavy atoms."""
+    from protein_chisel.io.pdb import parse_atom_record
+    seq_chars: list[str] = []
+    keys: list[tuple] = []
+    heavy: dict = {}
+    index: dict = {}
+    target = chain
+    with open(pdb_path) as fh:
+        for line in fh:
+            a = parse_atom_record(line)
+            if a is None or a.record != "ATOM" or a.alt_loc not in ("", "A"):
+                continue
+            if target is None:
+                target = a.chain
+            if a.chain != target:
+                continue
+            key = (a.chain, a.res_seq, a.i_code)
+            if key not in index:
+                index[key] = len(keys)
+                keys.append(key)
+                seq_chars.append(_AA3TO1.get(a.res_name, "X"))
+                heavy[key] = []
+            if (a.element or "").strip().upper() != "H" and not a.name.strip().startswith("H"):
+                heavy[key].append((a.x, a.y, a.z))
+    return target, "".join(seq_chars), keys, heavy
+
+
+def _ligand_heavy_coords(pdb_path) -> list:
+    """Heavy-atom coords of all non-water HETATM (ligand) records."""
+    from protein_chisel.io.pdb import parse_atom_record
+    out = []
+    with open(pdb_path) as fh:
+        for line in fh:
+            a = parse_atom_record(line)
+            if a is None or a.record != "HETATM" or a.res_name in _WATER:
+                continue
+            if (a.element or "").strip().upper() == "H" or a.name.strip().startswith("H"):
+                continue
+            out.append((a.x, a.y, a.z))
+    return out
+
+
+def _pocket_mask(pdb_path, chain: Optional[str], cutoff: float):
+    """Boolean mask over a chain's residues: True where any heavy atom lies
+    within ``cutoff`` A of any ligand heavy atom. Returns ``(mask, n_true)``."""
+    _ch, _seq, keys, heavy = _read_protein_chain(pdb_path, chain)
+    lig = _ligand_heavy_coords(pdb_path)
+    if not lig:
+        return [False] * len(keys), 0
+    c2 = cutoff * cutoff
+    mask = []
+    for key in keys:
+        hit = False
+        for (x, y, z) in heavy.get(key, []):
+            for (lx, ly, lz) in lig:
+                if (x - lx) ** 2 + (y - ly) ** 2 + (z - lz) ** 2 <= c2:
+                    hit = True
+                    break
+            if hit:
+                break
+        mask.append(hit)
+    return mask, sum(mask)
+
+
+def dedup_and_diversity(base_out, input_name: Optional[str], pocket_ref,
+                        *, chain: Optional[str] = None, cutoff: float = 8.0,
+                        do_dedup: bool = True) -> dict:
+    """De-duplicate identical output sequences in ``base_out`` and compute
+    sequence diversity. The copied input (``input_name``) is NEVER removed and
+    always wins a tie (its duplicate MPNN PDB is removed instead); among MPNN
+    duplicates the oldest is kept and newer ones removed. Diversity (mean
+    pairwise Hamming, full + within ``cutoff`` A of the ligand) is computed over
+    the unique DESIGN sequences (input copy excluded). Returns a summary dict."""
+    from protein_chisel.scoring.diversity import hamming_distance
+    base = Path(base_out)
+    pdbs = [p for p in sorted(base.glob("*.pdb")) if not remarks.is_intermediate(p.name)]
+    info = {"total": len(pdbs), "removed": [], "n_unique": 0, "cutoff": cutoff,
+            "mean_full": None, "len_full": 0, "mean_pocket": None, "n_pocket": 0,
+            "note": ""}
+    seqs: dict = {}
+    for p in pdbs:
+        try:
+            seqs[p] = _read_protein_chain(p, chain)[1]
+        except OSError as exc:
+            LOGGER.warning("diversity: could not read %s (%s)", p.name, exc)
+
+    input_path = (base / input_name) if input_name else None
+    if do_dedup:
+        groups: dict = {}
+        for p in (q for q in pdbs if q in seqs):
+            groups.setdefault(seqs[p], []).append(p)
+        for members in groups.values():
+            if len(members) < 2:
+                continue
+            if input_path is not None and input_path in members:
+                drop = [m for m in members if m != input_path]
+            else:  # keep the oldest, remove the newer MPNN duplicates
+                drop = sorted(members, key=lambda m: (m.stat().st_mtime, m.name))[1:]
+            for d in drop:
+                try:
+                    d.unlink()
+                    info["removed"].append(d.name)
+                    seqs.pop(d, None)
+                except OSError as exc:
+                    LOGGER.warning("diversity: could not remove duplicate %s (%s)", d.name, exc)
+
+    design_seqs = [s for p, s in seqs.items() if input_path is None or p != input_path]
+    uniq = sorted(set(design_seqs))
+    info["n_unique"] = len(uniq)
+    if len(uniq) < 2:
+        info["note"] = "need >=2 unique design sequences"
+        return info
+    L = len(uniq[0])
+    eq = [s for s in uniq if len(s) == L]
+    if len(eq) < 2:
+        info["note"] = "design sequences differ in length"
+        return info
+    pairs = [(i, j) for i in range(len(eq)) for j in range(i + 1, len(eq))]
+    info["len_full"] = L
+    info["mean_full"] = sum(hamming_distance(eq[i], eq[j]) for i, j in pairs) / len(pairs)
+    try:
+        mask, n_pocket = _pocket_mask(pocket_ref, chain, cutoff)
+    except OSError as exc:
+        LOGGER.warning("diversity: pocket reference unreadable (%s)", exc)
+        mask, n_pocket = [], 0
+    if n_pocket and len(mask) == L:
+        info["n_pocket"] = n_pocket
+        info["mean_pocket"] = sum(
+            hamming_distance(eq[i], eq[j], mask=mask) for i, j in pairs) / len(pairs)
+    elif not n_pocket:
+        info["note"] = "no ligand atoms for pocket metric"
+    else:
+        info["note"] = f"pocket mask length {len(mask)} != sequence length {L}"
+    return info
+
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 def main(argv: Optional[list[str]] = None) -> int:
@@ -1095,7 +1262,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # ---- Post-process: flatten -> protonate -> transfer REMARKs -> copy input
     subdir = resolve_protonate_subdir(scanned, args)
-    n_pdbs, prot_status, input_copy = 0, "off", None
+    n_pdbs, prot_status, input_copy, divinfo = 0, "off", None, None
     do_remarks = scanned.pdb_path and not multi and not (
         args.no_transfer_remarks and args.no_design_path_remark)
 
@@ -1129,6 +1296,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             say(f"  would copy input -> {Path(base_out) / Path(scanned.pdb_path).name}")
             if not multi and not args.no_transfer_remarks:
                 say("    and (re)build its REMARK 668 block (states + --ptm)")
+        if scanned.pdb_path and base_out and not multi:
+            if not args.no_dedup_sequences:
+                say("  would de-dup identical output sequences (input copy always kept; "
+                    "newer MPNN duplicates removed)")
+            say(f"  would report sequence diversity (full + within "
+                f"{args.diversity_ligand_cutoff:.0f} A of ligand)")
     elif base_out and any_ok:
         banner("POST-PROCESS")
         n_pdbs = finalize_outputs(base_out, runs, sweeping, subdir, args.keep_intermediates)
@@ -1178,6 +1351,20 @@ def main(argv: Optional[list[str]] = None) -> int:
             # override if stale.
             if input_copy and not multi and not args.no_transfer_remarks:
                 annotate_input_copy_remark668(input_copy, args.ptm)
+        # De-dup identical output sequences (input copy always kept) + diversity.
+        # Pocket reference = the input (native sidechains + ligand, same numbering).
+        if scanned.pdb_path and not multi:
+            pocket_ref = (str(Path(base_out) / Path(scanned.pdb_path).name)
+                          if input_copy else (args.seed_pdb or scanned.pdb_path))
+            divinfo = dedup_and_diversity(
+                base_out,
+                Path(scanned.pdb_path).name if input_copy else None,
+                pocket_ref,
+                cutoff=args.diversity_ligand_cutoff,
+                do_dedup=not args.no_dedup_sequences)
+            if divinfo["removed"]:
+                say(f"  de-dup: removed {len(divinfo['removed'])} duplicate-sequence "
+                    f"PDB(s){' (input copy kept)' if input_copy else ''}")
 
     # ---- Summary ----------------------------------------------------------
     banner("SUMMARY")
@@ -1206,6 +1393,26 @@ def main(argv: Optional[list[str]] = None) -> int:
         say(f"  packed PDBs : {n_pdbs}")
         say(f"  protonation : {prot_status}")
         say(f"  input copy  : {Path(input_copy).name if input_copy else '(none)'}")
+
+    if not args.dry_run and divinfo is not None:
+        if args.no_dedup_sequences:
+            say(f"  seq dedup   : off  ({divinfo['n_unique']} unique design sequence(s))")
+        else:
+            say(f"  seq dedup   : removed {len(divinfo['removed'])} duplicate PDB(s)"
+                + (" (input copy kept)" if input_copy else "")
+                + f"  ->  {divinfo['n_unique']} unique design sequence(s)")
+        if divinfo["mean_full"] is not None:
+            L, mf = divinfo["len_full"], divinfo["mean_full"]
+            say(f"  diversity   : full seq (L={L})  mean pairwise Hamming = {mf:.1f}  "
+                f"({100 * mf / L:.1f}% of positions differ)")
+            if divinfo["mean_pocket"] is not None:
+                n, mp = divinfo["n_pocket"], divinfo["mean_pocket"]
+                say(f"                within {divinfo['cutoff']:.0f} A of ligand ({n} positions)"
+                    f"  mean pairwise Hamming = {mp:.1f}  ({100 * mp / n:.1f}%)")
+            elif divinfo["note"]:
+                say(f"                pocket metric n/a: {divinfo['note']}")
+        else:
+            say(f"  diversity   : n/a ({divinfo['note']})")
 
     failed = sum(1 for r in results if r["mpnn"].startswith("FAIL"))
     return 1 if failed else 0
