@@ -504,7 +504,11 @@ def build_fixed_residues_from_remark666(catres: dict, pdb_path: str, out_json: P
         lab = f"{cr.chain}{cr.resno}"
         if lab not in labels:
             labels.append(lab)
-    payload = {str(Path(pdb_path).resolve()): labels}
+    # Key by the LITERAL --pdb_path string (NOT .resolve()): run.py looks up
+    # fixed_residues_multi[args.pdb_path] verbatim, and on symlinked scratch
+    # (/net/scratch -> /mnt/net/scratch on compute nodes) a resolved key would
+    # not match -> KeyError.
+    payload = {str(pdb_path): labels}
     out_json.parent.mkdir(parents=True, exist_ok=True)
     out_json.write_text(json.dumps(payload, indent=2))
     say(f"      fixed_residues tokens : {', '.join(labels)}")
@@ -817,7 +821,8 @@ def _parse_user_fixed_labels(extras: list[str]) -> set[str]:
 
 
 def build_omit_nterm_met_json(pdb_path: str, label: str, out_json: Path) -> Path:
-    payload = {str(Path(pdb_path).resolve()): {label: "M"}}
+    # Literal --pdb_path key (see _fixed_residues_json): run.py matches verbatim.
+    payload = {str(pdb_path): {label: "M"}}
     out_json.parent.mkdir(parents=True, exist_ok=True)
     out_json.write_text(json.dumps(payload, indent=2))
     return out_json
@@ -857,7 +862,9 @@ def _label_sort_key(lab: str) -> tuple:
 
 
 def _fixed_residues_json(pdb_path: str, labels, out_json: Path) -> Path:
-    payload = {str(Path(pdb_path).resolve()): sorted(set(labels), key=_label_sort_key)}
+    # Literal --pdb_path key (NOT .resolve()): run.py looks up by the verbatim
+    # --pdb_path; a resolved key breaks on symlinked scratch (KeyError).
+    payload = {str(pdb_path): sorted(set(labels), key=_label_sort_key)}
     out_json.parent.mkdir(parents=True, exist_ok=True)
     out_json.write_text(json.dumps(payload, indent=2))
     return out_json

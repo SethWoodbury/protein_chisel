@@ -52,9 +52,29 @@ def test_fixed_residues_json(tmp_path):
     out = tmp_path / "fx.json"
     w._fixed_residues_json("/abs/x.pdb", ["A54", "A11", "A54"], out)
     data = json.loads(out.read_text())
-    assert list(data.keys()) == [str(Path("/abs/x.pdb").resolve())]
+    # key is the LITERAL --pdb_path (run.py looks it up verbatim), not resolved
+    assert list(data.keys()) == ["/abs/x.pdb"]
     # de-duped and sorted by (chain, resno)
-    assert data[str(Path("/abs/x.pdb").resolve())] == ["A11", "A54"]
+    assert data["/abs/x.pdb"] == ["A11", "A54"]
+
+
+def test_fixed_residues_json_keeps_literal_path_not_resolved(tmp_path):
+    # Regression: run.py keys fixed_residues_multi by the verbatim --pdb_path, so
+    # the JSON key must be the literal path, NOT Path.resolve() -- on symlinked
+    # scratch (/net/scratch -> /mnt/net/scratch on compute nodes) a resolved key
+    # would not match and run.py raises KeyError (the cluster-array failure).
+    real = tmp_path / "real"; real.mkdir()
+    (real / "x.pdb").write_text("ATOM\n")
+    link = tmp_path / "link"; link.symlink_to(real)   # link/x.pdb -> real/x.pdb
+    literal = str(link / "x.pdb")
+    assert str(Path(literal).resolve()) != literal     # sanity: resolve WOULD differ
+    out = tmp_path / "fx2.json"
+    w._fixed_residues_json(literal, ["A10"], out)
+    assert list(json.loads(out.read_text()).keys()) == [literal]
+
+    out_omit = tmp_path / "omit.json"
+    w.build_omit_nterm_met_json(literal, "A1", out_omit)
+    assert list(json.loads(out_omit.read_text()).keys()) == [literal]
 
 
 def test_label_sort_key():
