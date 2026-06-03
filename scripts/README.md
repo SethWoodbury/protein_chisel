@@ -18,6 +18,16 @@ point).
 
 See the top-level [README](../README.md) and [docs/architecture.md](../docs/architecture.md).
 
+## Standalone LigandMPNN wrapper
+
+- `chisel_ligandMPNN.py` — host-side wrapper around the fused_mpnn LigandMPNN
+  `run.py`. Transparent passthrough + optional catalytic-site fixing (REMARK
+  666), N-term Met guard, protonation (holo / apo-fallback), multi-combo sweep,
+  probabilistic **H-bond sidechain conservation**, REMARK transfer +
+  `DESIGN_PATH`, and output sequence **de-dup + diversity** reporting. A
+  single-shot alternative to the iterative pipeline; it does not submit SLURM
+  itself. **Full reference: [docs/chisel_ligandmpnn.md](../docs/chisel_ligandmpnn.md).**
+
 ## Package-pipeline wrappers
 
 Thin `sbatch` wrappers around the `protein_chisel.pipelines.*` orchestrators:

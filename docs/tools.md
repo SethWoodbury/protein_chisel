@@ -188,3 +188,45 @@ Wraps the modern lab `fused_mpnn` build at `/net/software/lab/fused_mpnn/seth_te
 - **Outputs**: `LigandMPNNResult` with a `CandidateSet` whose rows include parsed header fields (`mpnn_t`, `mpnn_seq_rec`, `mpnn_overall_confidence`, `mpnn_seed`, ...) and a `sampler_params_hash` for downstream provenance.
 - **Limitations**: First entry in fused_mpnn's output FASTA is the input header — the wrapper marks it `is_input=True`. `ligand_params` is accepted in the signature for API parity with older runners but is NOT passed to fused_mpnn (the modern runner reads ligand atoms from HETATMs directly).
 - **Tested**: helper-level only ([tests/test_ligand_mpnn_unit.py](../tests/test_ligand_mpnn_unit.py), host) — bias-matrix conversion, header parsing, config hashing. End-to-end MPNN execution is untested in CI.
+
+---
+
+## Non-metric tool modules
+
+These live in `tools/` but do **not** emit `MetricTable` columns — they're
+host-side utilities used by drivers (notably
+[`scripts/chisel_ligandMPNN.py`](../scripts/chisel_ligandMPNN.py); see
+[docs/chisel_ligandmpnn.md](chisel_ligandmpnn.md)).
+
+| Module | Entry points | sif | Returns | Tested |
+|---|---|---|---|---|
+| `conserved_hbonds` | [tools/conserved_hbonds.py](../src/protein_chisel/tools/conserved_hbonds.py) `find_conservable_sidechain_hbonds(...)` | host (numpy + io/pdb) | `list[ConservableHbond]` | [tests/tools/test_conserved_hbonds.py](../tests/tools/test_conserved_hbonds.py) (host) |
+| `remarks` | [tools/remarks.py](../src/protein_chisel/tools/remarks.py) `reorganize_pdb_remarks` / `transfer_remarks_to_dir` / `replace_remark_block` | host (pure Python) | mutates PDB headers in place / `int` count | [tests/tools/test_remarks.py](../tests/tools/test_remarks.py) (host) |
+
+### `conserved_hbonds`
+[src/protein_chisel/tools/conserved_hbonds.py](../src/protein_chisel/tools/conserved_hbonds.py)
+
+Detects **designable (unfixed) sidechain** H-bonds to the ligand or a fixed
+(catalytic / user) residue — candidates to probabilistically *conserve* (pin
+into the fixed list) during LigandMPNN design. Heavy-atom geometry only (reuses
+`geometric_interactions._detect_hbonds`): donor···acceptor distance + antecedent
+angle, no explicit H needed. The designable side must use its sidechain (backbone
+N/O don't count); the anchor may use sidechain or backbone. Histidine is
+tautomer-agnostic (both ND1 and NE2 as donor + acceptor). Each `ConservableHbond`
+carries a strength bin (`super_strong … super_weak`) and a clash flag (sidechain
+vs non-redesigned backbone/ligand/fixed atoms). Consumed by `chisel_ligandMPNN.py`'s
+`--conserve_hbonds`.
+
+### `remarks`
+[src/protein_chisel/tools/remarks.py](../src/protein_chisel/tools/remarks.py)
+
+Transfer, merge, canonical-order, de-dup, and provenance-stamp PDB REMARK
+headers without PyRosetta. `reorganize_pdb_remarks` rescues REMARK lines from an
+input/seed PDB onto an output, drops `REMARK 0` PyRosetta dump artifacts,
+de-duplicates header lines (prefix-aware for numbered REMARKs so col-80
+truncations and legend drift collapse to the complete variant; exact-only for
+grouped lines so nested `DESIGN_PATH` provenance survives), and appends a
+`REMARK DESIGN_PATH <stage> <kind> <path>` line (the stage is a caller argument).
+`transfer_remarks_to_dir` applies it across a directory; `replace_remark_block`
+swaps a numbered block (e.g. 667/668) in place. Shared by `chisel_ligandMPNN.py`
+and `iterative_design.py`.

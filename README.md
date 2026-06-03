@@ -239,6 +239,7 @@ protein_chisel/
 | [`docs/architecture.md`](docs/architecture.md) | Pipeline diagram, per-cycle data flow, PLM fusion math, consensus + class-balance, TOPSIS, container split |
 | [`docs/usage.md`](docs/usage.md) | sbatch + manual invocation, env knobs, common run patterns |
 | [`docs/cli_reference.md`](docs/cli_reference.md) | All `iterative_design.py` flags grouped by topic |
+| [`docs/chisel_ligandmpnn.md`](docs/chisel_ligandmpnn.md) | `chisel_ligandMPNN.py` — standalone LigandMPNN wrapper: catalytic fixing, protonation, sweep, H-bond conservation, REMARK provenance, output dedup + diversity |
 | [`docs/metrics_reference.md`](docs/metrics_reference.md) | Every column in `chiseled_design_metrics.tsv` with formula / units / range |
 | [`docs/dependencies.md`](docs/dependencies.md) | SIFs, binaries, model checkpoints, HF caches, cluster paths |
 | [`docs/troubleshooting.md`](docs/troubleshooting.md) | Known gotchas (libgfortran, freesasa fallback, AA-skew, position-1 M, consensus diversity) |
