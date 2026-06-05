@@ -109,6 +109,14 @@ def main() -> int:
                         "residue 157 -> KCX. "
                         "Use '-' as code to FORCE no-PTM (overrides "
                         "auto-detect from seed atom inventory).")
+    p.add_argument("--design_path_stage", type=str, default=None,
+                   help="When set (e.g. 'protonate_topk'), use the shared "
+                        "remarks module to rescue REMARK QCB + the full "
+                        "DESIGN_PATH chain from each design PDB onto its "
+                        "protonated output and stamp a "
+                        "'REMARK DESIGN_PATH <stage> output' line (keeping the "
+                        "freshly-rebuilt REMARK 667/668). Default: off — "
+                        "callers that transfer REMARKs separately omit this.")
     args = p.parse_args()
 
     logging.basicConfig(
@@ -130,6 +138,7 @@ def main() -> int:
         ligand_resname=args.ligand_resname,
         keep_intermediate=args.keep_intermediate,
         ptm_map=args.ptm,
+        design_path_stage=args.design_path_stage,
     )
 
     if args.shipping_layout:

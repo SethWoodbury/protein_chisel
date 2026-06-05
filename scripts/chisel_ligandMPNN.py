@@ -832,17 +832,17 @@ def build_omit_nterm_met_json(pdb_path: str, label: str, out_json: Path) -> Path
 # H-bond sidechain conservation helpers
 # ---------------------------------------------------------------------------
 def parse_probability(value: float) -> float:
-    """A 0-1 probability, or a percentage >1 (auto-converted with a warning)."""
-    v = float(value)
-    if v < 0:
-        raise SystemExit(f"--conserve_hbond_prob must be >= 0 (got {v})")
-    if v <= 1:
-        return v
-    if v <= 100:
-        LOGGER.warning("--conserve_hbond_prob=%g > 1; interpreting as a percentage -> %g",
-                       v, v / 100.0)
-        return v / 100.0
-    raise SystemExit(f"--conserve_hbond_prob must be 0-1 or a percentage <=100; got {v}")
+    """A 0-1 probability, or a percentage >1 (auto-converted with a warning).
+
+    Thin CLI wrapper over the shared ``conserved_hbonds.normalize_probability``
+    (used by both this script and scripts/iterative_design.py); maps the library's
+    ``ValueError`` to the CLI's ``SystemExit``.
+    """
+    from protein_chisel.tools.conserved_hbonds import normalize_probability
+    try:
+        return normalize_probability(value)
+    except ValueError as exc:
+        raise SystemExit(f"--conserve_hbond_prob {exc}")
 
 
 def _protein_resnos(pdb_path: str, chain: str) -> set[int]:
@@ -871,7 +871,10 @@ def _fixed_residues_json(pdb_path: str, labels, out_json: Path) -> Path:
 
 
 def _roll_conserved(labels, prob: float, rng: random.Random) -> set:
-    return {lab for lab in labels if rng.random() < prob}
+    # Delegate to the shared roller so this script and iterative_design.py roll
+    # candidates identically (one implementation in conserved_hbonds.py).
+    from protein_chisel.tools.conserved_hbonds import roll_conserved
+    return roll_conserved(labels, prob, rng)
 
 
 def _fmt_dur(seconds: float) -> str:
@@ -1132,7 +1135,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     conserve_once: set[str] = set()
     conserve_seed_base = args.conserve_seed
     if args.conserve_hbonds and scanned.pdb_path and not multi:
-        from protein_chisel.tools.conserved_hbonds import find_conservable_sidechain_hbonds
+        from protein_chisel.tools.conserved_hbonds import (
+            find_conservable_sidechain_hbonds, select_conservable_resnos,
+        )
         conserve_prob = parse_probability(args.conserve_hbond_prob)
         chain = next(iter(catres.values())).chain if catres else "A"
         anchors = {a.strip() for a in (args.conserve_anchors or "").split(",") if a.strip()}
@@ -1158,16 +1163,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             say(f"  A{r.resno} {r.resname} {r.sidechain_atom} <-> {r.partner_kind} {ptag} "
                 f"{r.partner_atom}  d={r.distance} {r.strength_bin}  "
                 f"donor={r.hypothesized_donor} acceptor={r.hypothesized_acceptor}{flag}")
-        by_res: dict[int, list] = {}
-        for r in recs:
-            by_res.setdefault(r.resno, []).append(r)
-        cand_resnos: list[int] = []
-        for resno, rs in sorted(by_res.items()):
-            if rs[0].clashes and not args.conserve_keep_clashing:
-                say(f"  excluding A{resno}: sidechain clashes with fixed backbone/ligand "
-                    f"({rs[0].clash_with})  [--conserve_keep_clashing to keep]")
-                continue
-            cand_resnos.append(resno)
+        cand_resnos, _excluded = select_conservable_resnos(
+            recs, keep_clashing=args.conserve_keep_clashing)
+        for resno, clash_with in _excluded:
+            say(f"  excluding A{resno}: sidechain clashes with fixed backbone/ligand "
+                f"({clash_with})  [--conserve_keep_clashing to keep]")
         conserve_candidates = [f"{chain}{rn}" for rn in cand_resnos]
         conserve_base = set(catres_labels) | set(user_fixed_labels)
         # The per-combo JSON is the sole fixed-residues source while conserving;

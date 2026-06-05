@@ -81,6 +81,21 @@ DEFAULT_CATRES = (60, 64, 128, 131, 132, 157)
 CATALYTIC_HIS_RESNOS = (60, 64, 128, 132)
 CHAIN = "A"
 
+# Probabilistic conserved-sidechain-H-bond fixing (Feature 1) + canonical REMARK
+# transfer (Feature 2). Set in main() from argparse; kept as module globals (like
+# DEFAULT_CATRES above) so stage_sample/stage_restore_pdbs read them without
+# threading through run_cycle's large signature. The detection/rolling/transfer
+# logic lives in the SHARED protein_chisel.tools.{conserved_hbonds,remarks}
+# modules — the same code scripts/chisel_ligandMPNN.py uses.
+CONSERVE_HBONDS = False
+CONSERVE_HBOND_PROB = 0.8
+CONSERVE_HBOND_MAX_DIST = 3.9
+CONSERVE_HBOND_MAX_ANGLE = 90.0
+CONSERVE_ANCHORS: tuple[str, ...] = ("ligand", "catalytic", "user_fixed")
+CONSERVE_KEEP_CLASHING = False
+CONSERVE_SEED_BASE = 0
+TRANSFER_REMARKS = True
+
 
 def _parse_bool_arg(value: str | bool) -> bool:
     """Parse a CLI boolean from common true/false spellings."""
@@ -784,6 +799,46 @@ def stage_sample(
         extra_flags=tuple(extra_flags),
     )
 
+    # ---- Feature 1: per-cycle probabilistic conserved-sidechain-H-bond fixing.
+    # Detect designable sidechains H-bonding to the ligand / fixed residues and
+    # probabilistically pin them into THIS cycle's fixed set (independent roll per
+    # cycle, reproducible from CONSERVE_SEED_BASE). Uses the SHARED
+    # protein_chisel.tools.conserved_hbonds helpers (same as chisel_ligandMPNN.py).
+    fixed_resnos = set(int(r) for r in fixed_resnos)
+    if CONSERVE_HBONDS:
+        from protein_chisel.tools.conserved_hbonds import (
+            find_conservable_sidechain_hbonds, roll_conserved,
+            select_conservable_resnos,
+        )
+        designable = sorted(set(int(r) for r in protein_resnos) - fixed_resnos)
+        recs = find_conservable_sidechain_hbonds(
+            seed_pdb,
+            designable_resnos=designable,
+            catalytic_resnos=(fixed_resnos if "catalytic" in CONSERVE_ANCHORS else ()),
+            include_ligand=("ligand" in CONSERVE_ANCHORS),
+            chain=chain,
+            max_dist=CONSERVE_HBOND_MAX_DIST,
+            max_angle_deg=CONSERVE_HBOND_MAX_ANGLE,
+        )
+        candidates, excluded = select_conservable_resnos(
+            recs, keep_clashing=CONSERVE_KEEP_CLASHING)
+        for resno, clash_with in excluded:
+            LOGGER.info(
+                "stage_sample[cycle=%d]: excluding conserved A%d "
+                "(sidechain clashes %s; --conserve_keep_clashing to keep)",
+                cycle_cfg.cycle_idx, resno, clash_with,
+            )
+        seed_str = f"{CONSERVE_SEED_BASE}:{cycle_cfg.cycle_idx}"
+        rolled = roll_conserved(candidates, CONSERVE_HBOND_PROB,
+                                random.Random(seed_str))
+        fixed_resnos |= rolled
+        LOGGER.info(
+            "stage_sample[cycle=%d]: conserve-hbond roll (p=%.2f, seed=%s): "
+            "fixing %s of candidates %s",
+            cycle_cfg.cycle_idx, CONSERVE_HBOND_PROB, seed_str,
+            sorted(rolled), candidates,
+        )
+
     LOGGER.info(
         "stage_sample[cycle=%d]: n=%d, T=%.3f, fixed=%s, "
         "mean_abs_bias=%.4f, bias_AA=%r",
@@ -838,7 +893,7 @@ def stage_restore_pdbs(
         "stage_restore_pdbs: restoring header+tautomers for %d candidates",
         len(candidate_ids),
     )
-    return restore_sample_dir(
+    out_map = restore_sample_dir(
         sample_dir=sample_dir,
         ref_pdb=ref_pdb,
         out_pdb_dir=out_pdb_dir,
@@ -848,6 +903,26 @@ def stage_restore_pdbs(
         catalytic_resnos=catalytic_resnos,
         catalytic_hydrogens=catalytic_hydrogens,
     )
+    # ---- Feature 2: canonical REMARK transfer (no DESIGN_PATH stamp here).
+    # restore_sample_dir only carries REMARK 666 / HETNAM / LINK / PDBinfo-LABEL;
+    # rescue the rest of the seed's records (665/667/668/QCB/DESIGN_PATH chain)
+    # onto the per-cycle restored PDBs via the SHARED protein_chisel.tools.remarks
+    # module. These are INTERMEDIATES, so we pass design_path_stage=None — the
+    # single iterative_design DESIGN_PATH line is stamped once at final adoption
+    # (_write_final_topk_artifacts), pointing at the adopted top-K PDB rather than
+    # an intermediate cycle path.
+    if TRANSFER_REMARKS:
+        from protein_chisel.tools.remarks import transfer_remarks_to_dir
+        n = transfer_remarks_to_dir(
+            out_pdb_dir, ref_pdb,
+            transfer_input=True,
+            design_path_stage=None,
+        )
+        LOGGER.info(
+            "stage_restore_pdbs: carried canonical REMARKs (665/666/667/668/QCB/"
+            "DESIGN_PATH chain) onto %d intermediate PDB(s)", n,
+        )
+    return out_map
 
 
 OMPT_ONLY_PATTERNS = [
@@ -2764,6 +2839,7 @@ def _write_final_topk_artifacts(
     top: pd.DataFrame,
     final_dir: Path,
     pdb_map: dict[str, Path],
+    seed_pdb: Optional[Path] = None,
 ) -> tuple[Path, pd.DataFrame]:
     """Write a self-consistent top-K artifact set and return the realized rows."""
     pdb_out = final_dir / "topk_pdbs"
@@ -2790,6 +2866,16 @@ def _write_final_topk_artifacts(
                 "stage_diverse_topk: failed copying %s -> %s (%s)",
                 src, pdb_out / f"{row['id']}.pdb", exc,
             )
+    # Canonical REMARK transfer + DESIGN_PATH provenance on the shipped top-K
+    # (Feature 2), so adopted designs always carry 665/666/667/668/QCB. Shared
+    # protein_chisel.tools.remarks module; see stage_restore_pdbs.
+    if TRANSFER_REMARKS and copied_rows and seed_pdb is not None:
+        from protein_chisel.tools.remarks import transfer_remarks_to_dir
+        transfer_remarks_to_dir(
+            pdb_out, seed_pdb,
+            transfer_input=True,
+            design_path_stage="iterative_design",
+        )
     materialized_top = (
         pd.DataFrame(copied_rows)
         if copied_rows else top.head(0).copy()
@@ -4389,6 +4475,47 @@ def main() -> None:
                         "Empty default — caller must opt in per scaffold. "
                         "PTE_i1: 'A/LYS/3:KCX' (catalytic lysine motif). "
                         "Use '-' as code to force no-PTM annotation.")
+    # ---- Conserved-sidechain-H-bond fixing (Feature 1) -------------------
+    p.add_argument("--conserve_hbonds", type=_parse_bool_arg, nargs="?",
+                   const=True, default=False,
+                   help="Detect designable-residue SIDECHAIN H-bonds to the "
+                        "ligand / fixed residues and probabilistically pin "
+                        "those residues into the per-cycle fixed list (rolled "
+                        "independently each cycle). Default: off. Shares "
+                        "protein_chisel.tools.conserved_hbonds with "
+                        "scripts/chisel_ligandMPNN.py.")
+    p.add_argument("--conserve_hbond_prob", type=float, default=0.8,
+                   help="Per-residue fix probability per cycle (0-1, or a "
+                        "percentage <=100). Default 0.8.")
+    p.add_argument("--conserve_anchors", type=str,
+                   default="ligand,catalytic,user_fixed",
+                   help="Comma list of anchor groups a designable sidechain "
+                        "must H-bond to (subset of ligand,catalytic,"
+                        "user_fixed). NOTE: this driver has no separate "
+                        "user-fixed list, so 'user_fixed' is inert here. "
+                        "Default: ligand,catalytic,user_fixed.")
+    p.add_argument("--conserve_hbond_max_dist", type=float, default=3.9,
+                   help="Heavy-atom donor...acceptor distance cutoff (A). "
+                        "Default 3.9.")
+    p.add_argument("--conserve_hbond_max_angle", type=float, default=90.0,
+                   help="Antecedent-D-A angle gate (deg); larger = more "
+                        "permissive (stock detector uses 70). Default 90.")
+    p.add_argument("--conserve_keep_clashing", action="store_true",
+                   help="Keep conserved candidates whose sidechain clashes "
+                        "with fixed backbone/ligand (default: exclude with a "
+                        "log line).")
+    p.add_argument("--conserve_seed", type=int, default=None,
+                   help="Base seed for per-cycle conservation rolls (seed = "
+                        "'<base>:<cycle>'). Default: auto-generated and logged "
+                        "so the run is replayable with --conserve_seed.")
+    # ---- Canonical REMARK transfer + DESIGN_PATH provenance (Feature 2) ---
+    p.add_argument("--transfer_remarks", type=_parse_bool_arg, nargs="?",
+                   const=True, default=True,
+                   help="Transfer canonical REMARKs (665/666/667/668/QCB/"
+                        "DESIGN_PATH) from the seed onto restored + final PDBs "
+                        "and stamp DESIGN_PATH iterative_design provenance, via "
+                        "the shared protein_chisel.tools.remarks module. "
+                        "Default: on.")
     p.add_argument("--verbose", "-v", action="store_true",
                    help="Set log level to DEBUG. The per-cycle metrics "
                         "snapshot (cycle_metrics.tsv + cycle_metrics.json) "
@@ -4575,6 +4702,36 @@ def main() -> None:
         )
     DEFAULT_CATRES = derived_catres
     CATALYTIC_HIS_RESNOS = derived_his
+
+    # ---- Conserved-hbond + REMARK-transfer config (Features 1 & 2) -------
+    global CONSERVE_HBONDS, CONSERVE_HBOND_PROB, CONSERVE_HBOND_MAX_DIST
+    global CONSERVE_HBOND_MAX_ANGLE, CONSERVE_ANCHORS, CONSERVE_KEEP_CLASHING
+    global CONSERVE_SEED_BASE, TRANSFER_REMARKS
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from protein_chisel.tools.conserved_hbonds import normalize_probability
+    CONSERVE_HBONDS = bool(args.conserve_hbonds)
+    try:
+        CONSERVE_HBOND_PROB = normalize_probability(args.conserve_hbond_prob)
+    except ValueError as exc:
+        p.error(f"--conserve_hbond_prob {exc}")
+    CONSERVE_HBOND_MAX_DIST = float(args.conserve_hbond_max_dist)
+    CONSERVE_HBOND_MAX_ANGLE = float(args.conserve_hbond_max_angle)
+    CONSERVE_ANCHORS = tuple(
+        a.strip() for a in (args.conserve_anchors or "").split(",") if a.strip()
+    )
+    CONSERVE_KEEP_CLASHING = bool(args.conserve_keep_clashing)
+    TRANSFER_REMARKS = bool(args.transfer_remarks)
+    if CONSERVE_HBONDS:
+        CONSERVE_SEED_BASE = (
+            args.conserve_seed if args.conserve_seed is not None
+            else random.SystemRandom().randint(1, 2**31 - 1)
+        )
+        LOGGER.info(
+            "H-bond conservation ON: p=%.2f anchors=%s keep_clashing=%s "
+            "seed_base=%s (rerun with --conserve_seed %s for identical rolls)",
+            CONSERVE_HBOND_PROB, CONSERVE_ANCHORS, CONSERVE_KEEP_CLASHING,
+            CONSERVE_SEED_BASE, CONSERVE_SEED_BASE,
+        )
 
     # Include microseconds + PID to prevent concurrent-job collisions on
     # second-precision timestamps (real bug observed during a 4-job
@@ -5503,6 +5660,7 @@ def main() -> None:
             top=top,
             final_dir=final_dir,
             pdb_map=all_pdb_maps,
+            seed_pdb=args.seed_pdb,
         )
         copied_pdbs = len(top)
         if copied_pdbs != requested_topk_rows:
@@ -5826,6 +5984,7 @@ def main() -> None:
                 top=top,
                 final_dir=final_dir,
                 pdb_map=all_pdb_maps,
+                seed_pdb=args.seed_pdb,
             )
             copied_pdbs = len(top)
             if copied_pdbs != requested_topk_rows:

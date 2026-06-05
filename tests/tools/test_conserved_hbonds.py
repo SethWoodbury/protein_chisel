@@ -1,8 +1,16 @@
 """Unit tests for tools.conserved_hbonds (designable sidechain H-bond detection)."""
 from __future__ import annotations
 
+import random
+
+import pytest
+
 from protein_chisel.tools.conserved_hbonds import (
+    ConservableHbond,
     find_conservable_sidechain_hbonds,
+    normalize_probability,
+    roll_conserved,
+    select_conservable_resnos,
     strength_bin,
 )
 
@@ -120,3 +128,57 @@ def test_strength_bins():
     assert strength_bin(0.50) == "moderate"
     assert strength_bin(0.30) == "weak"
     assert strength_bin(0.05) == "super_weak"
+
+
+# ----------------------------------------------------------------------
+# shared selection / rolling helpers (used by chisel_ligandMPNN.py AND
+# iterative_design.py — one implementation for both)
+# ----------------------------------------------------------------------
+def test_normalize_probability_decimal_and_percentage():
+    assert normalize_probability(0.8) == 0.8
+    assert normalize_probability(0.0) == 0.0
+    assert normalize_probability(1.0) == 1.0
+    assert normalize_probability(80) == pytest.approx(0.8)   # percentage -> /100
+    assert normalize_probability(100) == pytest.approx(1.0)
+
+
+def test_normalize_probability_errors():
+    with pytest.raises(ValueError):
+        normalize_probability(-0.1)
+    with pytest.raises(ValueError):
+        normalize_probability(150)
+
+
+def test_roll_conserved_bounds_and_reproducible():
+    items = [10, 20, 30, 40, 50]                 # resno ints
+    assert roll_conserved(items, 1.0, random.Random(0)) == set(items)
+    assert roll_conserved(items, 0.0, random.Random(0)) == set()
+    a = roll_conserved(items, 0.5, random.Random("7:0"))
+    b = roll_conserved(items, 0.5, random.Random("7:0"))
+    assert a == b and a.issubset(set(items))     # same seed -> identical
+    # type-agnostic: also works on "A157"-style labels
+    labels = ["A10", "A20", "A30"]
+    assert roll_conserved(labels, 1.0, random.Random(0)) == set(labels)
+
+
+def _rec(resno, *, clashes=False, clash_with=""):
+    return ConservableHbond(
+        resno=resno, resname="SER", sidechain_atom="OG",
+        partner_kind="ligand", partner_resno=-1, partner_resname="LIG",
+        partner_atom="O1", distance=2.8, strength=0.9, strength_bin="super_strong",
+        hypothesized_donor=f"SER{resno}/OG", hypothesized_acceptor="LIG/O1",
+        clashes=clashes, clash_with=clash_with,
+    )
+
+
+def test_select_conservable_resnos_excludes_clashing_by_default():
+    recs = [_rec(40), _rec(30, clashes=True, clash_with="GLY90/O"), _rec(40)]
+    candidates, excluded = select_conservable_resnos(recs)
+    assert candidates == [40]                    # deduped + sorted, clashing dropped
+    assert excluded == [(30, "GLY90/O")]
+
+
+def test_select_conservable_resnos_keep_clashing():
+    recs = [_rec(40), _rec(30, clashes=True, clash_with="GLY90/O")]
+    candidates, excluded = select_conservable_resnos(recs, keep_clashing=True)
+    assert candidates == [30, 40] and excluded == []

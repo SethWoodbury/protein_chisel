@@ -335,6 +335,44 @@ PTM="${PTM:-}"
 # diversity cost. Pass via env: ENHANCE=plddt_residpo_alpha_20250116-aec4d0c4
 ENHANCE="${ENHANCE:-}"
 
+# Probabilistic conserved-sidechain-H-bond fixing (Feature 1). Forwarded to
+# iterative_design.py's --conserve_* flags, which share the conserved_hbonds
+# module with chisel_ligandMPNN.py. CONSERVE_HBONDS=1 enables; off by default.
+# Per-cycle: each detected ligand/catalytic-H-bonding designable sidechain is
+# independently rolled into the fixed set at CONSERVE_HBOND_PROB. Set
+# CONSERVE_SEED for reproducible rolls (else auto-seeded + logged for replay).
+CONSERVE_HBONDS="${CONSERVE_HBONDS:-0}"
+CONSERVE_HBOND_PROB="${CONSERVE_HBOND_PROB:-0.8}"
+CONSERVE_ANCHORS="${CONSERVE_ANCHORS:-ligand,catalytic,user_fixed}"
+CONSERVE_SEED="${CONSERVE_SEED:-}"
+
+# Canonical REMARK transfer + DESIGN_PATH provenance (Feature 2). On by default;
+# carries REMARK 665/666/667/668/QCB from the seed onto restored + final PDBs.
+TRANSFER_REMARKS="${TRANSFER_REMARKS:-1}"
+
+# Assemble the driver CLI fragment for the two features once (avoids fragile
+# inline quoting in the apptainer invocation below).
+CONSERVE_CLI=()
+if [[ "$CONSERVE_HBONDS" == 1 ]]; then
+    CONSERVE_CLI+=( --conserve_hbonds
+                    --conserve_hbond_prob "$CONSERVE_HBOND_PROB"
+                    --conserve_anchors "$CONSERVE_ANCHORS" )
+    [[ -n "$CONSERVE_SEED" ]] && CONSERVE_CLI+=( --conserve_seed "$CONSERVE_SEED" )
+fi
+if [[ "$TRANSFER_REMARKS" == 0 ]]; then
+    CONSERVE_CLI+=( --transfer_remarks false )
+else
+    CONSERVE_CLI+=( --transfer_remarks true )
+fi
+
+# Stage-4 protonation: when REMARK transfer is on, have the protonation step
+# rescue QCB + the DESIGN_PATH chain onto the protonated output and stamp its
+# own DESIGN_PATH (protonate_topk) via the shared remarks module. Empty = legacy.
+PROTONATE_REMARK_CLI=()
+if [[ "$TRANSFER_REMARKS" != 0 ]]; then
+    PROTONATE_REMARK_CLI+=( --design_path_stage protonate_topk )
+fi
+
 # PLM model variants (only matter for stage 2 — precompute_plm_artifacts).
 #   ESMC_MODEL  : esmc_300m (~46s GPU) | esmc_600m (default, ~90s GPU)
 #   SAPROT_MODEL: saprot_35m (~10s GPU) | saprot_650m | saprot_650m_af2
@@ -598,6 +636,7 @@ apptainer exec "${NV_FLAGS[@]}" \
         "${DRIVER_CLI_ARGS[@]}" \
         ${PTM:+--ptm "$PTM"} \
         ${ENHANCE:+--enhance "$ENHANCE"} \
+        "${CONSERVE_CLI[@]}" \
         ${EXTRA_DRIVER_FLAGS:-}
 
 # Stage 3 wrote run_dir's path into $WORK_DIR/run_dir.txt as soon as
@@ -652,7 +691,8 @@ else
             --summary_json "$RUN_DIR/protonation_summary.json" \
             --copy_input_structure_into_out_dir "$COPY_INPUT_STRUCTURE_INTO_OUT_DIR_BOOL" \
             $SHIPPING_FLAGS \
-            ${PTM:+--ptm "$PTM"}
+            ${PTM:+--ptm "$PTM"} \
+            "${PROTONATE_REMARK_CLI[@]}"
 fi
 
 # === Publish / consolidate ==========================================

@@ -215,3 +215,56 @@ def _annotate_clashes(records, atoms, designable, chain, clash_dist):
         if r.resno in clash_with:
             r.clashes = True
             r.clash_with = clash_with[r.resno]
+
+
+# ---------------------------------------------------------------------------
+# Selection / rolling helpers — shared by scripts/chisel_ligandMPNN.py and
+# scripts/iterative_design.py so both pick + roll candidates identically.
+# ---------------------------------------------------------------------------
+def normalize_probability(value: float) -> float:
+    """A 0-1 probability, or a percentage in (1, 100] (auto-converted, logged).
+
+    Raises ``ValueError`` on anything else; callers map it to their own error
+    type (``SystemExit`` for a CLI, ``argparse`` error for a driver).
+    """
+    v = float(value)
+    if v < 0:
+        raise ValueError(f"must be >= 0 (got {v})")
+    if v <= 1:
+        return v
+    if v <= 100:
+        LOGGER.warning("probability %g > 1; interpreting as a percentage -> %g",
+                       v, v / 100.0)
+        return v / 100.0
+    raise ValueError(f"must be 0-1 or a percentage <=100 (got {v})")
+
+
+def roll_conserved(items: Iterable, prob: float, rng) -> set:
+    """Independently keep each item with probability ``prob`` using the supplied
+    ``random.Random``. Type-agnostic (resno ints or ``"A157"`` labels). Items are
+    rolled in iteration order, so pass an ordered sequence for reproducibility.
+    """
+    return {x for x in items if rng.random() < prob}
+
+
+def select_conservable_resnos(
+    records: Iterable[ConservableHbond],
+    *,
+    keep_clashing: bool = False,
+) -> tuple[list[int], list[tuple[int, str]]]:
+    """Collapse per-bond records to a sorted list of candidate residue numbers,
+    excluding residues whose sidechain clashes with fixed backbone/ligand unless
+    ``keep_clashing``. Returns ``(candidates, excluded)`` where ``excluded`` is
+    ``[(resno, clash_with), ...]`` for logging.
+    """
+    by_res: dict[int, list[ConservableHbond]] = {}
+    for r in records:
+        by_res.setdefault(r.resno, []).append(r)
+    candidates: list[int] = []
+    excluded: list[tuple[int, str]] = []
+    for resno, rs in sorted(by_res.items()):
+        if rs[0].clashes and not keep_clashing:
+            excluded.append((resno, rs[0].clash_with))
+            continue
+        candidates.append(resno)
+    return candidates, excluded

@@ -1549,6 +1549,7 @@ def protonate_final_topk(
     ptm_map: Optional[
         dict[tuple[str, int], str] | Iterable[PtmSpec] | str
     ] = None,
+    design_path_stage: Optional[str] = None,
 ) -> dict:
     """End-to-end driver for the post-design protonation cleanup.
 
@@ -1573,6 +1574,12 @@ def protonate_final_topk(
             ``{(chain, resno) -> code}``. Use ``"-"`` as the value to
             FORCE no-PTM annotation for a residue (overrides auto-detect).
             ``None`` = auto-detect-only from seed.
+        design_path_stage: When set (e.g. ``"protonate_topk"``), run the shared
+            ``remarks.reorganize_pdb_remarks`` on each protonated PDB to rescue
+            ``REMARK QCB`` + the full ``DESIGN_PATH`` chain from the design PDB
+            being protonated and stamp a ``DESIGN_PATH <stage> output`` line,
+            keeping the freshly-rebuilt REMARK 667/668. ``None`` (default) = no
+            transfer (legacy behavior; for callers that transfer separately).
 
     Returns:
         Stats dict aggregated across all PDBs processed.
@@ -1626,6 +1633,22 @@ def protonate_final_topk(
                 ptm_map=ptm_map,
             )
             stats["variants_remapped"] = len(variant_map)
+            # Canonical REMARK transfer + provenance via the SHARED remarks module
+            # (same one scripts/chisel_ligandMPNN.py uses). Rescue QCB + the full
+            # DESIGN_PATH chain (incl. the iterative_design stamp) from the design
+            # PDB being protonated, keep the freshly-rebuilt 667/668 (protonation
+            # is authoritative), and stamp this stage. Off (None) by default so
+            # callers that do their own transfer (chisel) are unaffected.
+            if design_path_stage is not None:
+                from protein_chisel.tools.remarks import reorganize_pdb_remarks
+                reorganize_pdb_remarks(
+                    final_pdb, input_pdb=pdb,
+                    design_path_stage=design_path_stage,
+                    keep_output_numbered=(667, 668),
+                    # Keep HETNAM/LINK (and any HEADER) the protonated PDB carries;
+                    # without this they're non-REMARK header lines and get dropped.
+                    include_all_header_lines=True,
+                )
         except Exception as exc:
             failures.append((pdb.name, str(exc)))
             summary["pdbs_failed"] += 1

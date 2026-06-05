@@ -151,11 +151,18 @@ def reorganize_pdb_remarks(
     design_path_stage: Optional[str] = None,
     design_path_kind: str = "output",
     include_all_header_lines: bool = False,
+    keep_output_numbered: Iterable[int] = (),
     verbose: bool = False,
 ) -> None:
     """Rewrite ``output_pdb``'s header into a canonical REMARK layout, rescuing
     any REMARK lines present in ``input_pdb`` (REMARK 665/666, QCB,
     rfd3_property, DESIGN_PATH, misc) — input lines win on conflict.
+
+    ``keep_output_numbered`` lists numbered-REMARK kinds (e.g. ``(667, 668)``)
+    for which ``output_pdb``'s own lines are authoritative: the input's lines for
+    those numbers are NOT merged in. Use it when ``output_pdb`` already carries a
+    freshly-rebuilt block (e.g. a protonation REMARK 668 reflecting the actual
+    pose) that must not be overwritten by a stale copy from ``input_pdb``.
 
     When ``design_path_stage`` is given, append a
     ``REMARK DESIGN_PATH <design_path_stage> <design_path_kind> <output_pdb>``
@@ -180,7 +187,10 @@ def reorganize_pdb_remarks(
             in_numbered, in_grouped, _h, _b = _parse(
                 in_lines, capture_body=False,
                 include_all_header_lines=include_all_header_lines)
+            keep_out = {int(n) for n in keep_output_numbered}
             for num, lst in in_numbered.items():
+                if num in keep_out:
+                    continue  # output's lines for this REMARK number are authoritative
                 numbered[num] = _merge(lst, numbered.get(num, []))
             for grp, lst in in_grouped.items():
                 grouped[grp] = _merge(lst, grouped[grp])
@@ -207,6 +217,7 @@ def transfer_remarks_to_dir(
     transfer_input: bool = True,
     design_path_stage: Optional[str] = None,
     design_path_kind: str = "output",
+    keep_output_numbered: Iterable[int] = (),
 ) -> int:
     """Apply :func:`reorganize_pdb_remarks` to every non-intermediate ``*.pdb`` in
     ``directory``. Returns the number of PDBs processed."""
@@ -218,6 +229,7 @@ def transfer_remarks_to_dir(
             input_pdb if transfer_input else None,
             design_path_stage=design_path_stage,
             design_path_kind=design_path_kind,
+            keep_output_numbered=keep_output_numbered,
         )
     return len(pdbs)
 

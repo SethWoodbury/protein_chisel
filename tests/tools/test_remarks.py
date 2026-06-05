@@ -58,6 +58,38 @@ def test_design_path_stage_appends_exactly_one(tmp_path):
     assert any(l.startswith("REMARK DESIGN_PATH rfd3 output") for l in lines)
 
 
+def test_keep_output_numbered_keeps_rebuilt_668(tmp_path):
+    # Models Stage-4 protonation: the OUTPUT carries a freshly-rebuilt REMARK 668
+    # (e.g. KCX declared); the INPUT (design PDB) has a STALE 668 + QCB + chain.
+    # keep_output_numbered=(667,668) must keep the rebuilt 668 while still rescuing
+    # QCB + the DESIGN_PATH chain and stamping the protonate stage.
+    out = _write(tmp_path / "prot.pdb",
+                 "REMARK 666 MATCH TEMPLATE B LIG  200 MATCH MOTIF A LYS  109  4  1\n"
+                 "REMARK 668   4   A LYS    109   LYS KCX -                       LYS\n"
+                 "HETNAM     PBJ LIGAND\n"
+                 "ATOM      1  CA  LYS A 109       0.000   0.000   0.000  1.00  0.00           C\n"
+                 "TER\nEND\n")
+    inp = _write(tmp_path / "design.pdb",
+                 "REMARK 666 MATCH TEMPLATE B LIG  200 MATCH MOTIF A LYS  109  4  1\n"
+                 "REMARK 668   4   A LYS    109   LYS -   -                       LYS\n"
+                 "REMARK QCB LIGAND_CHARGE +3\n"
+                 "REMARK DESIGN_PATH iterative_design output /scratch/topk/d0.pdb\n"
+                 "ATOM      1  CA  LYS A 109       0.000   0.000   0.000  1.00  0.00           C\n"
+                 "TER\nEND\n")
+    # Mirrors the Stage-4 protonation call exactly.
+    remarks.reorganize_pdb_remarks(
+        out, inp, design_path_stage="protonate_topk",
+        keep_output_numbered=(667, 668), include_all_header_lines=True)
+    text = Path(out).read_text()
+    r668 = [l for l in text.splitlines() if l.startswith("REMARK 668 ")]
+    assert len(r668) == 1                       # no duplicate IDX 4 row
+    assert "LYS KCX" in r668[0]                  # rebuilt (output) 668 won
+    assert "HETNAM     PBJ LIGAND" in text                             # HETNAM preserved
+    assert "REMARK QCB LIGAND_CHARGE +3" in text                       # rescued
+    assert "REMARK DESIGN_PATH iterative_design output /scratch/topk/d0.pdb" in text  # chain
+    assert "REMARK DESIGN_PATH protonate_topk output" in text          # stage stamp
+
+
 def test_design_path_stage_none_adds_nothing(tmp_path):
     out = _write(tmp_path / "design.pdb", _OUT_PDB)
     inp = _write(tmp_path / "seed.pdb", _IN_PDB)
