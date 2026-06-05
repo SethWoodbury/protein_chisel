@@ -24,9 +24,10 @@ way ``scoring/preorganization`` does.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import random as _random
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 from protein_chisel.structure.clash_check import SIDECHAIN_ATOM_NAMES
 from protein_chisel.tools.geometric_interactions import (
@@ -268,3 +269,149 @@ def select_conservable_resnos(
             continue
         candidates.append(resno)
     return candidates, excluded
+
+
+# ---------------------------------------------------------------------------
+# Active-site interaction-network growth (recursive shells from the active site)
+# ---------------------------------------------------------------------------
+SUPPORTED_INTERACTION_TYPES = ("hbond",)
+
+
+@dataclass
+class InteractionShell:
+    depth: int                       # 1 = directly bonding the active site
+    anchors: list[int]               # what this shell bonded to (prev shell / active site)
+    candidates: list[int]            # detected, clash-filtered designable residues
+    rolled: list[int]                # the subset pinned this shell
+    excluded: list[tuple[int, str]]  # (resno, clash_with) dropped for clashing
+
+
+@dataclass
+class InteractionNetworkResult:
+    rolled: set[int]                 # union of all shells' pinned residues (the network)
+    shells: list[InteractionShell] = field(default_factory=list)
+    records: list = field(default_factory=list)   # all detected records (for logging)
+
+
+def _detect_network_records(
+    pdb_path,
+    *,
+    designable_resnos,
+    anchor_resnos,
+    include_ligand,
+    interaction_types,
+    chain,
+    max_dist,
+    max_angle_deg,
+    clash_dist,
+):
+    """Detect conservable designable-residue interactions to the current anchors.
+
+    For ``interaction_types == ("hbond",)`` this is the EXACT existing
+    sidechain-H-bond detector (so the single-shell hbond case is byte-identical).
+    Other interaction types are a planned extension via
+    ``geometric_interactions.detect_interactions`` (NotImplementedError for now).
+    """
+    types = tuple(interaction_types)
+    if set(types) == {"hbond"}:   # set-based so ("hbond","hbond") also works
+        return find_conservable_sidechain_hbonds(
+            pdb_path,
+            designable_resnos=designable_resnos,
+            catalytic_resnos=anchor_resnos,
+            user_fixed_resnos=(),
+            include_ligand=include_ligand,
+            chain=chain,
+            max_dist=max_dist,
+            max_angle_deg=max_angle_deg,
+            clash_dist=clash_dist,
+        )
+    bad = [t for t in types if t not in SUPPORTED_INTERACTION_TYPES]
+    raise NotImplementedError(
+        f"interaction_types {bad} not yet supported; only {SUPPORTED_INTERACTION_TYPES} "
+        "are wired. Other types (salt_bridge / pi_pi / pi_cation / hydrophobic) are a "
+        "planned extension via geometric_interactions.detect_interactions."
+    )
+
+
+def build_interaction_network(
+    pdb_path: str | Path,
+    *,
+    designable_resnos: Iterable[int],
+    catalytic_resnos: Iterable[int] = (),
+    user_fixed_resnos: Iterable[int] = (),
+    include_ligand: bool = True,
+    interaction_types: Sequence[str] = ("hbond",),
+    chain: str = "A",
+    depth: int = 1,
+    prob: float = 1.0,
+    shell_decay: float = 1.0,
+    keep_clashing: bool = False,
+    seed: str = "0",
+    max_dist: float = DEFAULT_MAX_DIST,
+    max_angle_deg: float = DEFAULT_MAX_ANGLE_DEG,
+    clash_dist: float = DEFAULT_CLASH_DIST,
+) -> InteractionNetworkResult:
+    """Grow a conserved-interaction network outward from the active site.
+
+    Shell 0 = the active-site anchors (catalytic + user-fixed residues, plus the
+    ligand). Shell *d* = designable residues that interact (of ``interaction_types``)
+    with a residue pinned at shell *d-1*; those get probabilistically pinned and
+    become the anchors for shell *d+1*. BFS to ``depth``. This is "fix H-bonds to
+    catalytic residues, then H-bonds to those, ..." building a network around the
+    active site.
+
+    ``depth=1`` + ``interaction_types=("hbond",)`` reduces EXACTLY to the legacy
+    single-shell conserved-H-bond fixing (shell 1 uses the same detector,
+    selection, and ``random.Random(seed)`` roll), so the default is byte-identical.
+
+    Per-shell roll probability is ``prob * shell_decay**(depth-1)`` (outer shells
+    optionally rolled less aggressively). Each shell's roll is seeded
+    ``seed`` (shell 1) / ``f"{seed}:shell{d}"`` (deeper) for reproducibility.
+    """
+    designable = {int(r) for r in designable_resnos}
+    anchor0 = {int(r) for r in catalytic_resnos} | {int(r) for r in user_fixed_resnos}
+    avail = designable - anchor0
+    frontier = anchor0
+    ligand_this = include_ligand
+    rolled_all: set[int] = set()
+    shells: list[InteractionShell] = []
+    records_all: list = []
+    for d in range(1, int(depth) + 1):
+        # The ligand is a shell-0 anchor too: shell 1 can run with an empty
+        # residue frontier as long as the ligand is active (ligand-only anchors,
+        # e.g. CONSERVE_ANCHORS=ligand). Deeper shells require a residue frontier.
+        if not avail or (not frontier and not ligand_this):
+            break
+        recs = _detect_network_records(
+            pdb_path,
+            designable_resnos=sorted(avail),
+            anchor_resnos=frontier,
+            include_ligand=ligand_this,
+            interaction_types=interaction_types,
+            chain=chain,
+            max_dist=max_dist,
+            max_angle_deg=max_angle_deg,
+            clash_dist=clash_dist,
+        )
+        candidates, excluded = select_conservable_resnos(
+            recs, keep_clashing=keep_clashing)
+        if not candidates and not excluded:
+            break  # nothing interacts with this shell's anchors -> network stops
+        records_all.extend(recs)
+        # Clamp to a valid probability (shell_decay>1 could otherwise exceed 1).
+        shell_prob = min(1.0, max(0.0, prob * (shell_decay ** (d - 1))))
+        shell_seed = seed if d == 1 else f"{seed}:shell{d}"
+        rolled = roll_conserved(candidates, shell_prob, _random.Random(shell_seed))
+        shells.append(InteractionShell(
+            depth=d, anchors=sorted(frontier), candidates=list(candidates),
+            rolled=sorted(rolled), excluded=excluded,
+        ))
+        rolled_all |= rolled
+        if not rolled:
+            break  # rolled nothing -> no frontier for the next shell
+        # Next shell bonds to THIS shell's new residues; ligand is shell-0 only.
+        frontier = set(rolled)
+        avail = avail - rolled
+        ligand_this = False
+    return InteractionNetworkResult(
+        rolled=rolled_all, shells=shells, records=records_all)

@@ -5,8 +5,10 @@ import random
 
 import pytest
 
+from protein_chisel.tools import conserved_hbonds as ch
 from protein_chisel.tools.conserved_hbonds import (
     ConservableHbond,
+    build_interaction_network,
     find_conservable_sidechain_hbonds,
     normalize_probability,
     roll_conserved,
@@ -182,3 +184,108 @@ def test_select_conservable_resnos_keep_clashing():
     recs = [_rec(40), _rec(30, clashes=True, clash_with="GLY90/O")]
     candidates, excluded = select_conservable_resnos(recs, keep_clashing=True)
     assert candidates == [30, 40] and excluded == []
+
+
+# ----------------------------------------------------------------------
+# build_interaction_network (recursive shells from the active site)
+# ----------------------------------------------------------------------
+def test_network_depth1_reduces_to_single_shell(tmp_path):
+    # Real geometry: Tyr54 OH -> catalytic His16 ND1. depth=1 must match the
+    # legacy find_conservable + select + roll path exactly.
+    pdb = _tyr_his(tmp_path)
+    recs = find_conservable_sidechain_hbonds(
+        pdb, designable_resnos=[54], catalytic_resnos=[16], chain="A")
+    cands, _ = select_conservable_resnos(recs)
+    import random
+    legacy_rolled = roll_conserved(cands, 1.0, random.Random("7:0"))
+    net = build_interaction_network(
+        pdb, designable_resnos=[54], catalytic_resnos=[16], include_ligand=False,
+        chain="A", depth=1, prob=1.0, seed="7:0")
+    assert net.rolled == legacy_rolled == {54}
+    assert len(net.shells) == 1 and net.shells[0].depth == 1
+
+
+def test_network_unsupported_type_raises(tmp_path):
+    pdb = _tyr_his(tmp_path)
+    with pytest.raises(NotImplementedError):
+        build_interaction_network(
+            pdb, designable_resnos=[54], catalytic_resnos=[16],
+            interaction_types=("salt_bridge",), depth=1)
+
+
+def test_network_grows_shells_bfs(tmp_path, monkeypatch):
+    # Mock the detector to make a 2-shell chain: ligand<-res40 (shell1),
+    # res40<-res50 (shell2). Verifies BFS frontier advance + per-shell rolls.
+    def fake_detect(pdb_path, *, designable_resnos, catalytic_resnos,
+                    user_fixed_resnos=(), include_ligand=True, chain="A", **kw):
+        anchors = set(catalytic_resnos) | set(user_fixed_resnos)
+        if include_ligand:                       # shell 1: bonds the ligand
+            return [_rec(40)] if 40 in set(designable_resnos) else []
+        if 40 in anchors:                        # shell 2: bonds res 40
+            return [_rec(50)] if 50 in set(designable_resnos) else []
+        return []
+    monkeypatch.setattr(ch, "find_conservable_sidechain_hbonds", fake_detect)
+
+    net1 = build_interaction_network(
+        "x.pdb", designable_resnos=[40, 50], catalytic_resnos=[16],
+        depth=1, prob=1.0, seed="s")
+    assert net1.rolled == {40} and len(net1.shells) == 1
+
+    net2 = build_interaction_network(
+        "x.pdb", designable_resnos=[40, 50], catalytic_resnos=[16],
+        depth=2, prob=1.0, seed="s")
+    assert net2.rolled == {40, 50}
+    assert [s.depth for s in net2.shells] == [1, 2]
+    assert net2.shells[1].anchors == [40]        # shell-2 bonded shell-1's residue
+
+
+def test_network_ligand_only_anchors_still_conserves(tmp_path):
+    # Regression (C1): with NO catalytic/user-fixed residues but ligand active,
+    # shell 1 must still detect+conserve ligand H-bonders (legacy behavior).
+    lines = [
+        _atom(1, "CB", "SER", "A", 40, 0, 0, 0.0, element="C"),
+        _atom(2, "OG", "SER", "A", 40, 0, 0, 1.4, element="O"),
+        _atom(3, "O3", "LIG", "B", 200, 0, 0, 4.1, record="HETATM", element="O"),
+    ]
+    pdb = _write(tmp_path, "ligonly.pdb", lines)
+    net = build_interaction_network(
+        pdb, designable_resnos=[40], catalytic_resnos=[], include_ligand=True,
+        chain="A", depth=1, prob=1.0, seed="s")
+    assert net.rolled == {40} and len(net.shells) == 1
+
+
+def test_network_duplicate_hbond_type_ok(tmp_path):
+    pdb = _tyr_his(tmp_path)
+    net = build_interaction_network(
+        pdb, designable_resnos=[54], catalytic_resnos=[16], include_ligand=False,
+        interaction_types=("hbond", "hbond"), depth=1, prob=1.0, seed="s")
+    assert net.rolled == {54}
+
+
+def test_network_shell_decay_zero_stops_after_shell1(monkeypatch):
+    # decay=0 -> shell-2 prob 0 -> nothing rolled -> network stops at shell 1.
+    def fake_detect(pdb_path, *, designable_resnos, catalytic_resnos,
+                    user_fixed_resnos=(), include_ligand=True, chain="A", **kw):
+        if include_ligand:
+            return [_rec(40)] if 40 in set(designable_resnos) else []
+        if 40 in (set(catalytic_resnos) | set(user_fixed_resnos)):
+            return [_rec(50)] if 50 in set(designable_resnos) else []
+        return []
+    monkeypatch.setattr(ch, "find_conservable_sidechain_hbonds", fake_detect)
+    net = build_interaction_network(
+        "x.pdb", designable_resnos=[40, 50], catalytic_resnos=[16],
+        depth=3, prob=1.0, shell_decay=0.0, seed="s")
+    assert net.rolled == {40}            # shell 1 rolled; shell 2 prob 0 -> none
+
+
+def test_network_stops_when_shell_empty(tmp_path, monkeypatch):
+    # Only shell 1 produces a residue; depth=3 should stop after shell 2 is empty.
+    def fake_detect(pdb_path, *, designable_resnos, catalytic_resnos,
+                    user_fixed_resnos=(), include_ligand=True, chain="A", **kw):
+        return [_rec(40)] if include_ligand and 40 in set(designable_resnos) else []
+    monkeypatch.setattr(ch, "find_conservable_sidechain_hbonds", fake_detect)
+    net = build_interaction_network(
+        "x.pdb", designable_resnos=[40, 50], catalytic_resnos=[16],
+        depth=3, prob=1.0, seed="s")
+    assert net.rolled == {40}
+    assert len(net.shells) == 1                  # stopped once the frontier emptied

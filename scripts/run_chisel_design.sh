@@ -345,6 +345,13 @@ CONSERVE_HBONDS="${CONSERVE_HBONDS:-0}"
 CONSERVE_HBOND_PROB="${CONSERVE_HBOND_PROB:-0.8}"
 CONSERVE_ANCHORS="${CONSERVE_ANCHORS:-ligand,catalytic,user_fixed}"
 CONSERVE_SEED="${CONSERVE_SEED:-}"
+# Active-site interaction-network growth (add-on #6). depth=1 + hbond + no-grow
+# = legacy single-shell fixing. depth>1 grows the network outward ("fix H-bonds
+# to catalytic, then to those, ..."); grow=1 deepens it across cycles too.
+CONSERVE_HBOND_DEPTH="${CONSERVE_HBOND_DEPTH:-1}"
+CONSERVE_INTERACTION_TYPES="${CONSERVE_INTERACTION_TYPES:-hbond}"
+CONSERVE_SHELL_DECAY="${CONSERVE_SHELL_DECAY:-1.0}"
+CONSERVE_GROW_NETWORK="${CONSERVE_GROW_NETWORK:-0}"
 
 # Canonical REMARK transfer + DESIGN_PATH provenance (Feature 2). On by default;
 # carries REMARK 665/666/667/668/QCB from the seed onto restored + final PDBs.
@@ -358,6 +365,12 @@ if [[ "$CONSERVE_HBONDS" == 1 ]]; then
                     --conserve_hbond_prob "$CONSERVE_HBOND_PROB"
                     --conserve_anchors "$CONSERVE_ANCHORS" )
     [[ -n "$CONSERVE_SEED" ]] && CONSERVE_CLI+=( --conserve_seed "$CONSERVE_SEED" )
+    # Network-growth knobs (only emitted when non-default, so depth-1 hbond stays
+    # the legacy single-shell behavior).
+    [[ "$CONSERVE_HBOND_DEPTH" != 1 ]] && CONSERVE_CLI+=( --conserve_hbond_depth "$CONSERVE_HBOND_DEPTH" )
+    [[ "$CONSERVE_INTERACTION_TYPES" != hbond ]] && CONSERVE_CLI+=( --conserve_interaction_types "$CONSERVE_INTERACTION_TYPES" )
+    [[ "$CONSERVE_SHELL_DECAY" != 1.0 ]] && CONSERVE_CLI+=( --conserve_shell_decay "$CONSERVE_SHELL_DECAY" )
+    [[ "$CONSERVE_GROW_NETWORK" == 1 ]] && CONSERVE_CLI+=( --conserve_grow_network )
 fi
 if [[ "$TRANSFER_REMARKS" == 0 ]]; then
     CONSERVE_CLI+=( --transfer_remarks false )

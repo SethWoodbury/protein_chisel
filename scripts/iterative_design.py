@@ -94,6 +94,15 @@ CONSERVE_HBOND_MAX_ANGLE = 90.0
 CONSERVE_ANCHORS: tuple[str, ...] = ("ligand", "catalytic", "user_fixed")
 CONSERVE_KEEP_CLASHING = False
 CONSERVE_SEED_BASE = 0
+# Active-site interaction-network growth (Phase 2 / add-on #6). depth=1 +
+# hbond + no-grow = the legacy single-shell conserved-hbond fixing (byte-identical).
+CONSERVE_HBOND_DEPTH = 1
+CONSERVE_INTERACTION_TYPES: tuple[str, ...] = ("hbond",)
+CONSERVE_SHELL_DECAY = 1.0
+CONSERVE_GROW_NETWORK = False
+# Cross-cycle accumulator: when CONSERVE_GROW_NETWORK, residues pinned in a cycle
+# become extra anchors next cycle (the network deepens as design proceeds).
+_CONSERVE_GROWN_ANCHORS: set[int] = set()
 TRANSFER_REMARKS = True
 
 
@@ -806,38 +815,48 @@ def stage_sample(
     # protein_chisel.tools.conserved_hbonds helpers (same as chisel_ligandMPNN.py).
     fixed_resnos = set(int(r) for r in fixed_resnos)
     if CONSERVE_HBONDS:
-        from protein_chisel.tools.conserved_hbonds import (
-            find_conservable_sidechain_hbonds, roll_conserved,
-            select_conservable_resnos,
-        )
+        from protein_chisel.tools.conserved_hbonds import build_interaction_network
         designable = sorted(set(int(r) for r in protein_resnos) - fixed_resnos)
-        recs = find_conservable_sidechain_hbonds(
+        # When growing the network across cycles, residues pinned in earlier
+        # cycles join the active-site anchors so the network deepens over time.
+        extra_anchors = (_CONSERVE_GROWN_ANCHORS & set(protein_resnos)
+                         if CONSERVE_GROW_NETWORK else set())
+        seed_str = f"{CONSERVE_SEED_BASE}:{cycle_cfg.cycle_idx}"
+        # depth=1 + ("hbond",) + no extra anchors == legacy single-shell fixing.
+        net = build_interaction_network(
             seed_pdb,
             designable_resnos=designable,
             catalytic_resnos=(fixed_resnos if "catalytic" in CONSERVE_ANCHORS else ()),
+            user_fixed_resnos=extra_anchors,
             include_ligand=("ligand" in CONSERVE_ANCHORS),
+            interaction_types=CONSERVE_INTERACTION_TYPES,
             chain=chain,
+            depth=CONSERVE_HBOND_DEPTH,
+            prob=CONSERVE_HBOND_PROB,
+            shell_decay=CONSERVE_SHELL_DECAY,
+            keep_clashing=CONSERVE_KEEP_CLASHING,
+            seed=seed_str,
             max_dist=CONSERVE_HBOND_MAX_DIST,
             max_angle_deg=CONSERVE_HBOND_MAX_ANGLE,
         )
-        candidates, excluded = select_conservable_resnos(
-            recs, keep_clashing=CONSERVE_KEEP_CLASHING)
-        for resno, clash_with in excluded:
+        for shell in net.shells:
+            for resno, clash_with in shell.excluded:
+                LOGGER.info(
+                    "stage_sample[cycle=%d]: excluding conserved A%d "
+                    "(sidechain clashes %s; --conserve_keep_clashing to keep)",
+                    cycle_cfg.cycle_idx, resno, clash_with,
+                )
             LOGGER.info(
-                "stage_sample[cycle=%d]: excluding conserved A%d "
-                "(sidechain clashes %s; --conserve_keep_clashing to keep)",
-                cycle_cfg.cycle_idx, resno, clash_with,
+                "stage_sample[cycle=%d]: conserve shell %d (p=%.2f, seed=%s): "
+                "fixing %s of candidates %s",
+                cycle_cfg.cycle_idx, shell.depth,
+                CONSERVE_HBOND_PROB * (CONSERVE_SHELL_DECAY ** (shell.depth - 1)),
+                seed_str, shell.rolled, shell.candidates,
             )
-        seed_str = f"{CONSERVE_SEED_BASE}:{cycle_cfg.cycle_idx}"
-        rolled = roll_conserved(candidates, CONSERVE_HBOND_PROB,
-                                random.Random(seed_str))
+        rolled = net.rolled
         fixed_resnos |= rolled
-        LOGGER.info(
-            "stage_sample[cycle=%d]: conserve-hbond roll (p=%.2f, seed=%s): "
-            "fixing %s of candidates %s",
-            cycle_cfg.cycle_idx, CONSERVE_HBOND_PROB, seed_str,
-            sorted(rolled), candidates,
-        )
+        if CONSERVE_GROW_NETWORK:
+            _CONSERVE_GROWN_ANCHORS.update(rolled)
 
     LOGGER.info(
         "stage_sample[cycle=%d]: n=%d, T=%.3f, fixed=%s, "
@@ -4513,6 +4532,26 @@ def main() -> None:
                    help="Base seed for per-cycle conservation rolls (seed = "
                         "'<base>:<cycle>'). Default: auto-generated and logged "
                         "so the run is replayable with --conserve_seed.")
+    # ---- Active-site interaction-network growth (add-on #6) ---------------
+    p.add_argument("--conserve_hbond_depth", type=int, default=1,
+                   help="Grow the conserved network outward in shells from the "
+                        "active site: shell 1 bonds the ligand/catalytic, shell 2 "
+                        "bonds shell-1 residues, etc. Default 1 = legacy "
+                        "single-shell fixing (byte-identical).")
+    p.add_argument("--conserve_interaction_types", default="hbond",
+                   help="Comma list of interaction types defining the network "
+                        "edges. Currently only 'hbond' is wired (salt_bridge/"
+                        "pi_pi/pi_cation/hydrophobic are a planned extension). "
+                        "Default 'hbond'.")
+    p.add_argument("--conserve_shell_decay", type=float, default=1.0,
+                   help="Per-shell multiplier on the fix probability "
+                        "(prob * decay**(depth-1)); <1 rolls outer shells less "
+                        "aggressively. Default 1.0 (no decay).")
+    p.add_argument("--conserve_grow_network", type=_parse_bool_arg, nargs="?",
+                   const=True, default=False,
+                   help="Accumulate pinned residues across cycles as extra "
+                        "anchors, so the network deepens as design proceeds. "
+                        "Default off.")
     # ---- Canonical REMARK transfer + DESIGN_PATH provenance (Feature 2) ---
     p.add_argument("--transfer_remarks", type=_parse_bool_arg, nargs="?",
                    const=True, default=True,
@@ -4712,8 +4751,12 @@ def main() -> None:
     global CONSERVE_HBONDS, CONSERVE_HBOND_PROB, CONSERVE_HBOND_MAX_DIST
     global CONSERVE_HBOND_MAX_ANGLE, CONSERVE_ANCHORS, CONSERVE_KEEP_CLASHING
     global CONSERVE_SEED_BASE, TRANSFER_REMARKS
+    global CONSERVE_HBOND_DEPTH, CONSERVE_INTERACTION_TYPES, CONSERVE_SHELL_DECAY
+    global CONSERVE_GROW_NETWORK
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-    from protein_chisel.tools.conserved_hbonds import normalize_probability
+    from protein_chisel.tools.conserved_hbonds import (
+        SUPPORTED_INTERACTION_TYPES, normalize_probability,
+    )
     CONSERVE_HBONDS = bool(args.conserve_hbonds)
     try:
         CONSERVE_HBOND_PROB = normalize_probability(args.conserve_hbond_prob)
@@ -4725,6 +4768,18 @@ def main() -> None:
         a.strip() for a in (args.conserve_anchors or "").split(",") if a.strip()
     )
     CONSERVE_KEEP_CLASHING = bool(args.conserve_keep_clashing)
+    CONSERVE_HBOND_DEPTH = max(1, int(args.conserve_hbond_depth))
+    CONSERVE_INTERACTION_TYPES = tuple(
+        t.strip() for t in (args.conserve_interaction_types or "").split(",") if t.strip()
+    ) or ("hbond",)
+    bad_types = [t for t in CONSERVE_INTERACTION_TYPES
+                 if t not in SUPPORTED_INTERACTION_TYPES]
+    if bad_types:
+        p.error(f"--conserve_interaction_types {bad_types} not supported; "
+                f"only {list(SUPPORTED_INTERACTION_TYPES)} are wired")
+    CONSERVE_SHELL_DECAY = float(args.conserve_shell_decay)
+    CONSERVE_GROW_NETWORK = bool(args.conserve_grow_network)
+    _CONSERVE_GROWN_ANCHORS.clear()  # reset cross-cycle accumulator per run
     TRANSFER_REMARKS = bool(args.transfer_remarks)
     if CONSERVE_HBONDS:
         CONSERVE_SEED_BASE = (
@@ -4732,10 +4787,12 @@ def main() -> None:
             else random.SystemRandom().randint(1, 2**31 - 1)
         )
         LOGGER.info(
-            "H-bond conservation ON: p=%.2f anchors=%s keep_clashing=%s "
-            "seed_base=%s (rerun with --conserve_seed %s for identical rolls)",
-            CONSERVE_HBOND_PROB, CONSERVE_ANCHORS, CONSERVE_KEEP_CLASHING,
-            CONSERVE_SEED_BASE, CONSERVE_SEED_BASE,
+            "H-bond conservation ON: p=%.2f anchors=%s depth=%d types=%s "
+            "shell_decay=%.2f grow=%s keep_clashing=%s seed_base=%s "
+            "(rerun with --conserve_seed %s for identical rolls)",
+            CONSERVE_HBOND_PROB, CONSERVE_ANCHORS, CONSERVE_HBOND_DEPTH,
+            CONSERVE_INTERACTION_TYPES, CONSERVE_SHELL_DECAY, CONSERVE_GROW_NETWORK,
+            CONSERVE_KEEP_CLASHING, CONSERVE_SEED_BASE, CONSERVE_SEED_BASE,
         )
 
     # Include microseconds + PID to prevent concurrent-job collisions on
