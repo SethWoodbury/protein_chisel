@@ -61,6 +61,21 @@ def test_ragged_sequences_dropped():
     seqs = ["ACD", "AED", "AC"]            # last is ragged -> dropped
     res = covariation_diagnostic(seqs)
     assert res.n_sequences == 2 and res.length == 3
+    assert res.meta["dropped_ragged"] == 1
+
+
+def test_raw_mi_is_nonnegative():
+    # marginals derived from the smoothed joint -> MI is a proper >= 0 quantity.
+    rng = np.random.default_rng(7)
+    seqs = ["".join(rng.choice(list("ACDEFG"), size=5)) for _ in range(80)]
+    raw = mutual_information_matrix(seqs, apc=False)
+    assert (raw >= -1e-12).all()
+
+
+def test_invalid_pseudocount_raises():
+    import pytest
+    with pytest.raises(ValueError):
+        mutual_information_matrix(["AC", "AD"], pseudocount=-1.0)
 
 
 def test_anticorrelated_pairs_threshold():

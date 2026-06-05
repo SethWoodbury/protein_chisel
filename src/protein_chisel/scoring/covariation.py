@@ -51,11 +51,6 @@ def _encode(sequences):
     return arr
 
 
-def _site_freqs(col, pseudocount):
-    f = np.bincount(col, minlength=_K).astype(np.float64) + pseudocount
-    return f / f.sum()
-
-
 def mutual_information_matrix(
     sequences,
     *,
@@ -64,26 +59,27 @@ def mutual_information_matrix(
 ) -> np.ndarray:
     """Per-position-pair mutual information (nats), optionally APC-corrected (MIp).
 
-    Pseudocount-regularized joint/marginal frequencies guard the small-N regime.
-    APC (average product correction, Dunn et al. 2008) subtracts the background
-    ``MI_i * MI_j / MI_mean`` that inflates MI from conservation/phylogeny.
-    Returns an (L, L) symmetric matrix with zero diagonal.
+    Marginals are derived FROM the pseudocount-smoothed joint (so joint and
+    product-of-marginals use consistent smoothing and MI is a proper, >= 0
+    quantity). APC (average product correction, Dunn et al. 2008) subtracts the
+    background ``MI_i * MI_j / MI_mean`` that inflates MI from conservation/
+    phylogeny. Returns an (L, L) symmetric matrix with zero diagonal.
     """
+    if not np.isfinite(pseudocount) or pseudocount < 0:
+        raise ValueError(f"pseudocount must be finite and >= 0, got {pseudocount}")
     arr = _encode(sequences)
     if arr.size == 0:
         return np.zeros((0, 0))
     N, L = arr.shape
     raw = np.zeros((L, L), dtype=np.float64)
-    margs = [_site_freqs(arr[:, i], pseudocount) for i in range(L)]
     for i in range(L):
-        fi = margs[i]
         for j in range(i + 1, L):
-            # joint counts (K x K) with pseudocount
-            joint = np.zeros((_K, _K), dtype=np.float64)
+            # Smoothed joint (K x K); marginals derived from it for consistency.
+            joint = np.full((_K, _K), pseudocount, dtype=np.float64)
             np.add.at(joint, (arr[:, i], arr[:, j]), 1.0)
-            joint += pseudocount
             joint /= joint.sum()
-            fj = margs[j]
+            fi = joint.sum(axis=1)
+            fj = joint.sum(axis=0)
             outer = np.outer(fi, fj)
             with np.errstate(divide="ignore", invalid="ignore"):
                 term = joint * np.log(joint / outer)
@@ -109,14 +105,22 @@ def covariation_diagnostic(
     pseudocount: float = 0.5,
     apc: bool = True,
 ) -> CovariationResult:
-    """Compute the MIp matrix + the top-N most-coupled position pairs (0-indexed)."""
-    seqs = [s for s in sequences if s]
+    """Compute the MIp matrix + the top-N most-coupled position pairs (0-indexed).
+
+    Note: APC-corrected MIp can be negative; a negative entry means "no coupling",
+    not anti-correlation. ``top_pairs`` is ranked descending, so use
+    :func:`anticorrelated_pairs` (with a positive threshold) to act on real
+    couplings. Reliable couplings need a reasonable pool (>= ~tens of sequences).
+    """
+    nonempty = [s for s in sequences if s]
+    seqs = nonempty
     if seqs:
         L0 = len(seqs[0])
-        seqs = [s for s in seqs if len(s) == L0]   # drop ragged (match MI)
+        seqs = [s for s in seqs if len(s) == L0]    # drop ragged (match MI)
+    dropped = len(nonempty) - len(seqs)
     mip = mutual_information_matrix(seqs, pseudocount=pseudocount, apc=apc)
     L = mip.shape[0]
-    pairs: list[tuple] = []
+    pairs: list[tuple[int, int, float]] = []
     if L >= 2:
         iu = np.triu_indices(L, k=1)
         vals = mip[iu]
@@ -125,7 +129,8 @@ def covariation_diagnostic(
     return CovariationResult(
         mip=mip, top_pairs=pairs,
         n_sequences=len(seqs), length=L,
-        meta={"pseudocount": pseudocount, "apc": apc},
+        meta={"pseudocount": pseudocount, "apc": apc,
+              "dropped_ragged": dropped, "alphabet_size": _K},
     )
 
 

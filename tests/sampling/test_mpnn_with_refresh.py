@@ -72,3 +72,10 @@ def test_negative_rounds_raises():
         run_with_refresh("b0", rounds=-1, sample_fn=lambda b: "r",
                          choose_representative_fn=lambda r: None,
                          recompute_bias_fn=lambda s, b: None)
+
+
+def test_non_int_rounds_raises():
+    with pytest.raises(ValueError):
+        run_with_refresh("b0", rounds=2.0, sample_fn=lambda b: "r",
+                         choose_representative_fn=lambda r: None,
+                         recompute_bias_fn=lambda s, b: None)

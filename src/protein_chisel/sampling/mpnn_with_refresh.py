@@ -48,15 +48,18 @@ def run_with_refresh(
     Returns:
         The final ``sample_result`` (after the last successful round).
     """
+    if not isinstance(rounds, int) or isinstance(rounds, bool):
+        raise ValueError(f"rounds must be an int, got {type(rounds).__name__}")
     if rounds < 0:
         raise ValueError(f"rounds must be >= 0, got {rounds}")
+    if rounds > 0:
+        LOGGER.warning(
+            "PLM refresh ENABLED (rounds=%d): each round adds ~one full masked-LM "
+            "precompute (minutes on GPU, more on CPU). This is COSTLY.", rounds,
+        )
     result = sample_fn(initial_bias)
     if rounds == 0:
         return result
-    LOGGER.warning(
-        "PLM refresh ENABLED (rounds=%d): each round adds ~one full masked-LM "
-        "precompute (minutes on GPU, more on CPU). This is COSTLY.", rounds,
-    )
     bias = initial_bias
     for r in range(1, rounds + 1):
         rep = choose_representative_fn(result)
