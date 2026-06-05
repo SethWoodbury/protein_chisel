@@ -4315,6 +4315,11 @@ def main() -> None:
     p.add_argument("--ligand_params", type=Path, required=True,
                    help="Path to the Rosetta .params file for the ligand.")
     p.add_argument("--plm_artifacts_dir", type=Path, required=True)
+    p.add_argument("--experts", default="esmc,saprot",
+                   help="Comma list of fusion experts (registry names) whose "
+                        "<name>_log_probs.npy artifacts to load + fuse. Default "
+                        "'esmc,saprot' = the legacy two-PLM fusion (byte-identical). "
+                        "Must match the --experts used in precompute.")
     p.add_argument("--position_table", type=Path, required=True)
     p.add_argument("--out_root", type=Path, default=DEFAULT_OUT_ROOT)
     p.add_argument("--run_dir_marker", type=Path, default=None,
@@ -4773,17 +4778,25 @@ def main() -> None:
 
     # ---- Load PLM artifacts -----------------------------------------
     art = args.plm_artifacts_dir
-    log_probs_esmc = np.load(art / "esmc_log_probs.npy")
-    log_probs_saprot = np.load(art / "saprot_log_probs.npy")
+    expert_names = [n.strip() for n in args.experts.split(",") if n.strip()]
+    expert_logprobs = [np.load(art / f"{n}_log_probs.npy") for n in expert_names]
+    # Back-compat bindings: downstream fitness/refresh code references the two
+    # PLMs by name. For the default ["esmc","saprot"] these ARE the two experts;
+    # with a custom set they bind to the first two so existing paths still run.
+    log_probs_esmc = expert_logprobs[0]
+    log_probs_saprot = (expert_logprobs[1] if len(expert_logprobs) > 1
+                        else expert_logprobs[0])
     cached_base_bias = np.load(art / "fusion_bias.npy")
-    cached_weights = np.load(art / "fusion_weights.npy")
-    LOGGER.info("loaded raw PLM log-probs: L=%d", log_probs_esmc.shape[0])
+    _weights_npy = art / "fusion_weights.npy"
+    cached_weights = np.load(_weights_npy) if _weights_npy.exists() else None
+    LOGGER.info("loaded raw PLM log-probs for experts %s: L=%d",
+                 expert_names, log_probs_esmc.shape[0])
 
     # ---- Load PositionTable -----------------------------------------
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
     from protein_chisel.io.schemas import PositionTable
     from protein_chisel.io.pdb import extract_sequence
-    from protein_chisel.sampling.plm_fusion import FusionConfig, fuse_plm_logits
+    from protein_chisel.sampling.plm_fusion import FusionConfig, fuse_experts
 
     pt = PositionTable.from_parquet(args.position_table)
     # Detect legacy (5-class) PositionTable and re-classify with the new
@@ -4826,20 +4839,28 @@ def main() -> None:
     # result to the run dir so offline analysis/replays use the
     # *actual* bias the cycles saw, not the stale cached one.
     fusion_cfg = FusionConfig(global_strength=args.plm_strength)
-    fusion_res = fuse_plm_logits(
-        log_probs_esmc=log_probs_esmc,
-        log_probs_saprot=log_probs_saprot,
-        position_classes=position_classes,
-        config=fusion_cfg,
+    # Default ["esmc","saprot"] (no per-expert knobs) -> fuse_experts delegates to
+    # the legacy fuse_plm_logits via its N=2 fast-path -> byte-identical bias
+    # (see tests/sampling/test_fuse_experts.py). >=3 experts use the N-way path.
+    fusion_res = fuse_experts(
+        expert_logprobs, position_classes,
+        config=fusion_cfg, expert_names=expert_names,
     )
     base_bias = fusion_res.bias
     weights_per_position = fusion_res.weights_per_position
     fusion_dir = run_dir / "fusion_runtime"
     fusion_dir.mkdir(parents=True, exist_ok=True)
     np.save(fusion_dir / "base_bias.npy", base_bias)
-    np.save(fusion_dir / "weights_per_position.npy", weights_per_position)
-    np.save(fusion_dir / "log_odds_esmc.npy", fusion_res.log_odds_esmc)
-    np.save(fusion_dir / "log_odds_saprot.npy", fusion_res.log_odds_saprot)
+    # Legacy snapshots (populated for the default 2-expert case); guarded so a
+    # custom >=3-expert set doesn't crash on the None legacy fields.
+    if weights_per_position is not None:
+        np.save(fusion_dir / "weights_per_position.npy", weights_per_position)
+    if fusion_res.log_odds_esmc is not None:
+        np.save(fusion_dir / "log_odds_esmc.npy", fusion_res.log_odds_esmc)
+    if fusion_res.log_odds_saprot is not None:
+        np.save(fusion_dir / "log_odds_saprot.npy", fusion_res.log_odds_saprot)
+    if fusion_res.weights_per_expert is not None and len(expert_names) != 2:
+        np.save(fusion_dir / "weights_per_expert.npy", fusion_res.weights_per_expert)
     with open(fusion_dir / "fusion_config.json", "w") as fh:
         json.dump({
             "class_weights": fusion_cfg.class_weights,

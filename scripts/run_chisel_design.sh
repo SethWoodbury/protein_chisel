@@ -389,6 +389,16 @@ fi
 ESMC_MODEL="${ESMC_MODEL:-esmc_600m}"
 SAPROT_MODEL="${SAPROT_MODEL:-saprot_1.3b}"
 
+# Fusion experts (Phase 1 pluggable registry). Default 'esmc,saprot' = the
+# legacy two-PLM fusion (byte-identical). Add e.g. 'esmc,saprot,hermes' to fuse
+# more per-position experts. Only emitted as --experts when NON-default, so the
+# default stage-2/stage-3 commands are byte-identical to before.
+EXPERTS="${EXPERTS:-esmc,saprot}"
+EXPERTS_CLI=()
+if [[ "$EXPERTS" != "esmc,saprot" ]]; then
+    EXPERTS_CLI+=( --experts "$EXPERTS" )
+fi
+
 # === Output base ====================================================
 # OUTPUT_DIR | WORK_ROOT (caller picks; WORK_ROOT remains the internal
 # variable). Top-level directory under which work_dir/ and run_dir/ get
@@ -583,7 +593,8 @@ apptainer exec "${NV_FLAGS[@]}" \
         --position_table "$CLASSIFY_DIR/positions.tsv" \
         --out_dir "$PLM_DIR" \
         --esmc_model "$ESMC_MODEL" \
-        --saprot_model "$SAPROT_MODEL"
+        --saprot_model "$SAPROT_MODEL" \
+        "${EXPERTS_CLI[@]}"
 
 # Stage 3 sif selection. The protein_chisel suite at the canonical
 # user-shared dir uses friendly names:
@@ -637,6 +648,7 @@ apptainer exec "${NV_FLAGS[@]}" \
         ${PTM:+--ptm "$PTM"} \
         ${ENHANCE:+--enhance "$ENHANCE"} \
         "${CONSERVE_CLI[@]}" \
+        "${EXPERTS_CLI[@]}" \
         ${EXTRA_DRIVER_FLAGS:-}
 
 # Stage 3 wrote run_dir's path into $WORK_DIR/run_dir.txt as soon as

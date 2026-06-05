@@ -72,6 +72,13 @@ def main() -> None:
     p.add_argument("--device", default="auto",
                    help="'auto' picks cuda if available else cpu. Pass "
                         "'cpu' to force CPU even on a GPU node.")
+    p.add_argument(
+        "--experts", default="esmc,saprot",
+        help="Comma list of fusion experts (registry names). Default "
+             "'esmc,saprot' reproduces the legacy two-PLM artifacts exactly. "
+             "Add e.g. 'esmc,saprot,hermes' to fuse more experts. Per-expert "
+             "model variants come from --esmc_model/--saprot_model.",
+    )
     args = p.parse_args()
 
     logging.basicConfig(
@@ -81,13 +88,11 @@ def main() -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     # Lazy imports — only available inside esmc.sif
+    import time
     from protein_chisel.io.pdb import extract_sequence
     from protein_chisel.io.schemas import PositionTable
-    from protein_chisel.tools.esmc import esmc_logits
-    from protein_chisel.tools.saprot import saprot_logits
-    from protein_chisel.sampling.plm_fusion import (
-        FusionConfig, fuse_plm_logits,
-    )
+    from protein_chisel.experts import ExpertContext, resolve_experts
+    from protein_chisel.sampling.plm_fusion import FusionConfig, fuse_experts
 
     seq = extract_sequence(args.seed_pdb, chain=args.chain)
     L = len(seq)
@@ -104,42 +109,33 @@ def main() -> None:
     LOGGER.info("position classes (counts): %s",
                  protein_rows["class"].value_counts().to_dict())
 
-    # ---- ESM-C masked-LM marginals ---------------------------------------
-    esmc_path = args.out_dir / "esmc_log_probs.npy"
-    if esmc_path.exists():
-        LOGGER.info("esmc cache hit -> %s", esmc_path)
-        esmc_lp = np.load(esmc_path)
-    else:
-        LOGGER.info("running ESM-C (%s) masked-LM (L=%d forward passes)",
-                     args.esmc_model, L)
-        esmc_lp = esmc_logits(
-            seq, model_name=args.esmc_model, device=args.device, masked=True,
-        ).log_probs
-        np.save(esmc_path, esmc_lp)
-        LOGGER.info("esmc -> %s shape=%s", esmc_path, esmc_lp.shape)
-
-    # ---- SaProt masked-LM marginals --------------------------------------
-    saprot_path = args.out_dir / "saprot_log_probs.npy"
-    if saprot_path.exists():
-        LOGGER.info("saprot cache hit -> %s", saprot_path)
-        saprot_lp = np.load(saprot_path)
-    else:
-        LOGGER.info("running SaProt (%s) masked-LM", args.saprot_model)
-        saprot_lp = saprot_logits(
-            args.seed_pdb, chain=args.chain,
-            model_name=args.saprot_model, device=args.device, masked=True,
-        ).log_probs
-        np.save(saprot_path, saprot_lp)
-        LOGGER.info("saprot -> %s shape=%s", saprot_path, saprot_lp.shape)
-
-    if esmc_lp.shape != saprot_lp.shape:
-        raise RuntimeError(
-            f"ESM-C shape {esmc_lp.shape} != SaProt {saprot_lp.shape}"
-        )
-    if esmc_lp.shape[0] != L:
-        raise RuntimeError(
-            f"PLM log-probs length {esmc_lp.shape[0]} != seq length {L}"
-        )
+    # ---- Per-expert masked-LM marginals (registry-driven) ----------------
+    # Default experts ["esmc","saprot"] reproduce the legacy artifacts exactly:
+    # each Expert writes <name>_log_probs.npy (esmc_log_probs.npy /
+    # saprot_log_probs.npy) and the fusion delegates to the legacy 2-PLM path.
+    # Experts are computed one at a time (load model -> compute -> free) so we
+    # never hold multiple large models resident.
+    experts = resolve_experts(
+        args.experts,
+        model_names={"esmc": args.esmc_model, "saprot": args.saprot_model},
+    )
+    expert_names = [e.name for e in experts]
+    LOGGER.info("experts: %s", [e.version for e in experts])
+    ctx = ExpertContext(seq=seq, pdb_path=args.seed_pdb, chain=args.chain,
+                        device=args.device, out_dir=args.out_dir)
+    expert_lps = []
+    for exp in experts:
+        t0 = time.perf_counter()
+        lp = exp.log_probs(ctx)   # cached <name>_log_probs.npy via out_dir
+        if lp.shape[0] != L:
+            raise RuntimeError(
+                f"{exp.name} log-probs length {lp.shape[0]} != seq length {L}")
+        LOGGER.info("expert %s -> shape=%s (%.1fs)", exp.name, lp.shape,
+                    time.perf_counter() - t0)
+        expert_lps.append(lp)
+    shapes = {tuple(lp.shape) for lp in expert_lps}
+    if len(shapes) != 1:
+        raise RuntimeError(f"expert log-prob shapes disagree: {shapes}")
 
     # ---- Calibrated fusion -----------------------------------------------
     bias_path = args.out_dir / "fusion_bias.npy"
@@ -151,22 +147,47 @@ def main() -> None:
         LOGGER.info("fusion cache hit -> %s", bias_path)
         bias = np.load(bias_path)
     else:
-        LOGGER.info("fusing PLM log-probs -> bias matrix")
-        result = fuse_plm_logits(
-            log_probs_esmc=esmc_lp,
-            log_probs_saprot=saprot_lp,
-            position_classes=pos_classes,
-            config=fusion_cfg,
+        t0 = time.perf_counter()
+        LOGGER.info("fusing %d expert log-prob array(s) -> bias matrix",
+                     len(experts))
+        # For the default ["esmc","saprot"] (no per-expert knobs) fuse_experts
+        # takes its N=2 fast-path and DELEGATES to the legacy fuse_plm_logits, so
+        # the bias + legacy artifacts are byte-identical (proven by
+        # tests/sampling/test_fuse_experts.py::test_default_two_expert_byte_identical).
+        result = fuse_experts(
+            expert_lps, pos_classes, config=fusion_cfg, expert_names=expert_names,
         )
         np.save(bias_path, result.bias)
-        np.save(log_odds_esmc_path, result.log_odds_esmc)
-        np.save(log_odds_saprot_path, result.log_odds_saprot)
-        np.save(weights_path, result.weights_per_position)
+        # Legacy 2-expert artifacts: kept whenever the result populated them (the
+        # N=2 case) so the iterative_design loader + fitness scorer are unchanged.
+        if (result.log_odds_esmc is not None
+                and result.log_odds_saprot is not None
+                and result.weights_per_position is not None):
+            np.save(log_odds_esmc_path, result.log_odds_esmc)
+            np.save(log_odds_saprot_path, result.log_odds_saprot)
+            np.save(weights_path, result.weights_per_position)
+        # Generic per-expert artifacts only for non-default expert sets.
+        if result.log_odds is not None and len(experts) != 2:
+            for nm, lo in zip(expert_names, result.log_odds):
+                np.save(args.out_dir / f"fusion_log_odds_{nm}.npy", lo)
+            if result.weights_per_expert is not None:
+                np.save(args.out_dir / "fusion_weights_per_expert.npy",
+                        result.weights_per_expert)
         bias = result.bias
-        LOGGER.info("fusion bias shape=%s, mean_abs=%.4f",
-                     bias.shape, float(np.abs(bias).mean()))
+        LOGGER.info("fusion bias shape=%s, mean_abs=%.4f (%.2fs)",
+                     bias.shape, float(np.abs(bias).mean()),
+                     time.perf_counter() - t0)
 
     # ---- Manifest --------------------------------------------------------
+    outputs = {
+        f"{e.name}_log_probs": str(args.out_dir / e.cache_filename)
+        for e in experts
+    }
+    outputs["fusion_bias"] = str(bias_path)
+    if len(experts) == 2:
+        outputs["fusion_log_odds_esmc"] = str(log_odds_esmc_path)
+        outputs["fusion_log_odds_saprot"] = str(log_odds_saprot_path)
+        outputs["fusion_weights"] = str(weights_path)
     manifest = {
         "tool": "precompute_plm_artifacts",
         "seed_pdb": str(args.seed_pdb),
@@ -175,20 +196,17 @@ def main() -> None:
         "wt_length": L,
         "esmc_model": args.esmc_model,
         "saprot_model": args.saprot_model,
+        # Provenance: which experts (+ versions) and fusion math produced the bias.
+        "experts": expert_names,
+        "expert_versions": {e.name: e.version for e in experts},
+        "fusion_version": fusion_cfg.version,
         "fusion_config": {
             "entropy_match": fusion_cfg.entropy_match,
             "shrink_disagreement": fusion_cfg.shrink_disagreement,
             "shrink_threshold": fusion_cfg.shrink_threshold,
             "class_weights": dict(fusion_cfg.class_weights),
         },
-        "outputs": {
-            "esmc_log_probs": str(esmc_path),
-            "saprot_log_probs": str(saprot_path),
-            "fusion_bias": str(bias_path),
-            "fusion_log_odds_esmc": str(log_odds_esmc_path),
-            "fusion_log_odds_saprot": str(log_odds_saprot_path),
-            "fusion_weights": str(weights_path),
-        },
+        "outputs": outputs,
     }
     with open(args.out_dir / "manifest.json", "w") as fh:
         json.dump(manifest, fh, indent=2)
