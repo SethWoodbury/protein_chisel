@@ -84,15 +84,36 @@ class FusionConfig:
     # agreement; 0 = orthogonal. Below `shrink_threshold`, weight is
     # scaled by the actual cosine value.
     shrink_threshold: float = 0.7
+    # --- N-way expert extensions (default no-op; see fuse_experts) ---------
+    # Per-expert global multiplier (missing key -> 1.0). Lets you up/down-weight
+    # a specific expert (e.g. {"hermes": 0.25} to avoid double-counting structure
+    # that MPNN already sees).
+    expert_weights: dict[str, float] = field(default_factory=dict)
+    # Per-(expert, position-class) multiplier (missing -> 1.0). e.g.
+    # {"hermes": {"primary_sphere": 0.0}} to mute an expert at the active site.
+    expert_class_weights: dict[str, dict[str, float]] = field(default_factory=dict)
+    # Per-expert extra temperature on the calibrated log-odds (missing -> 1.0),
+    # applied multiplicatively after entropy-match.
+    expert_temperatures: dict[str, float] = field(default_factory=dict)
+    # Fusion-math version tag, recorded in run provenance.
+    version: str = "fusion-v1"
 
 
 @dataclass
 class FusionResult:
     bias: np.ndarray            # (L, 20) — additive bias for LigandMPNN
-    log_odds_esmc: np.ndarray   # (L, 20) — calibrated ESM-C log-odds
-    log_odds_saprot: np.ndarray # (L, 20) — calibrated SaProt log-odds
-    weights_per_position: np.ndarray   # (L, 2) — final β, γ per position
+    log_odds_esmc: np.ndarray   # (L, 20) — calibrated ESM-C log-odds (N=2 legacy)
+    log_odds_saprot: np.ndarray # (L, 20) — calibrated SaProt log-odds (N=2 legacy)
+    weights_per_position: np.ndarray   # (L, 2) — final β, γ per position (N=2 legacy)
     config: FusionConfig
+    # --- N-way generic fields (populated by fuse_experts) -----------------
+    # log_odds[i] = calibrated (L,20) log-odds for expert i; weights_per_expert
+    # is (L, N); expert_names lists the experts in order. For the default 2-expert
+    # case the legacy fields above are ALSO populated so existing callers are
+    # untouched.
+    log_odds: Optional[list] = None
+    weights_per_expert: Optional[np.ndarray] = None
+    expert_names: Optional[list] = None
 
 
 def calibrate_log_odds(log_probs: np.ndarray, aa_bg: np.ndarray) -> np.ndarray:
@@ -158,6 +179,51 @@ def cosine_similarity_per_position(
         np.linalg.norm(p_a, axis=-1) * np.linalg.norm(p_b, axis=-1) + 1e-12
     )
     return num / denom
+
+
+def entropy_match_temperatures(
+    logprobs_list: Sequence[np.ndarray],
+) -> tuple[float, ...]:
+    """N-way generalization of :func:`entropy_match_temperature`.
+
+    Returns one multiplier per expert that rescales its log-odds toward the
+    geometric-mean median entropy. **Reduces exactly to the pairwise function at
+    N=2** (it delegates), so the default 2-expert path is byte-identical.
+    """
+    n = len(logprobs_list)
+    if n == 2:
+        return entropy_match_temperature(logprobs_list[0], logprobs_list[1])
+    if n == 0:
+        return ()
+    hs = [float(np.median(per_position_entropy(lp))) for lp in logprobs_list]
+    if all(h > 0 for h in hs):
+        h_target = float(np.exp(np.mean(np.log(hs))))  # geometric mean
+    else:
+        h_target = 1.0
+    return tuple(h / h_target if h > 0 else 1.0 for h in hs)
+
+
+def mean_pairwise_cosine(logprobs_list: Sequence[np.ndarray]) -> np.ndarray:
+    """Per-position mean pairwise cosine agreement across N experts.
+
+    **Reduces exactly to :func:`cosine_similarity_per_position` at N=2** (it
+    delegates). A single expert is treated as perfect agreement (all ones).
+    """
+    n = len(logprobs_list)
+    if n == 2:
+        return cosine_similarity_per_position(logprobs_list[0], logprobs_list[1])
+    if n == 0:
+        return np.zeros(0)
+    L = logprobs_list[0].shape[0]
+    if n < 2:
+        return np.ones(L)
+    acc = np.zeros(L)
+    pairs = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            acc = acc + cosine_similarity_per_position(logprobs_list[i], logprobs_list[j])
+            pairs += 1
+    return acc / pairs
 
 
 def fuse_plm_logits(
@@ -246,6 +312,115 @@ def fuse_plm_logits(
     )
 
 
+def fuse_experts(
+    expert_logprobs: Sequence[np.ndarray],
+    position_classes: Sequence[str],
+    config: Optional[FusionConfig] = None,
+    expert_names: Optional[Sequence[str]] = None,
+) -> FusionResult:
+    """Fuse N per-position expert log-prob arrays into a (L, 20) MPNN bias.
+
+    Generalizes :func:`fuse_plm_logits` from the two hard-coded PLMs (ESM-C +
+    SaProt) to an arbitrary list of per-position experts (add HERMES, a third PLM,
+    future models) while keeping our calibration (log-odds vs background →
+    entropy-match → structural class weights → shrink-at-disagreement).
+
+    The multi-expert / registry / product-of-experts design is borrowed from
+    Sebastian (sebols) and Joe Mi's ``fused_mpnn_poe`` (decode-time PoE); here we
+    keep the *static, calibrated* fusion and just make it N-way.
+
+    **Default 2-expert case (no per-expert knobs set) delegates verbatim to
+    ``fuse_plm_logits``**, so it is byte-identical to the legacy path. The generic
+    fields (``log_odds``, ``weights_per_expert``, ``expert_names``) are always
+    populated; the legacy ``log_odds_esmc/saprot`` + ``weights_per_position`` are
+    also populated whenever N==2 so existing callers are untouched.
+    """
+    cfg = config or FusionConfig()
+    n = len(expert_logprobs)
+    if n == 0:
+        raise ValueError("fuse_experts requires >= 1 expert")
+    names = (list(expert_names) if expert_names is not None
+             else [f"expert{i}" for i in range(n)])
+    if len(names) != n:
+        raise ValueError(f"expert_names length {len(names)} != n experts {n}")
+    L = expert_logprobs[0].shape[0]
+    if len(position_classes) != L:
+        raise ValueError(f"position_classes length {len(position_classes)} != L {L}")
+    for lp in expert_logprobs:
+        if lp.shape != expert_logprobs[0].shape:
+            raise ValueError("all experts must share the same (L, 20) shape")
+
+    knobs_set = bool(cfg.expert_weights or cfg.expert_class_weights
+                     or cfg.expert_temperatures)
+
+    # ---- Fast path: default 2-expert -> delegate to the UNTOUCHED legacy fn ----
+    # This is the byte-identity guarantee: the default pipeline runs literally the
+    # same code as before; only opt-in (>=3 experts or per-expert knobs) diverges.
+    if n == 2 and not knobs_set:
+        res = fuse_plm_logits(expert_logprobs[0], expert_logprobs[1],
+                              position_classes, cfg)
+        # Generic fields alias the legacy arrays here (read-only consumers only —
+        # do not mutate weights_per_expert in place or you corrupt
+        # weights_per_position).
+        res.log_odds = [res.log_odds_esmc, res.log_odds_saprot]
+        res.weights_per_expert = res.weights_per_position
+        res.expert_names = names
+        return res
+
+    # ---- General N-way path (>=3 experts, or per-expert knobs set) ----
+    los = [calibrate_log_odds(lp, cfg.aa_background) for lp in expert_logprobs]
+    if cfg.entropy_match:
+        ms = entropy_match_temperatures(expert_logprobs)
+        los = [lo * m if m > 0 else lo for lo, m in zip(los, ms)]
+    los = [lo * float(cfg.expert_temperatures.get(nm, 1.0))
+           for lo, nm in zip(los, names)]
+
+    from protein_chisel.tools.classify_positions import LEGACY_CLASS_REMAP
+
+    def _lookup(cls: str) -> float:
+        if cls in cfg.class_weights:
+            return cfg.class_weights[cls]
+        new_cls = LEGACY_CLASS_REMAP.get(cls)
+        if new_cls is not None and new_cls in cfg.class_weights:
+            return cfg.class_weights[new_cls]
+        return 0.0
+
+    base_weights = np.array(
+        [_lookup(c) for c in position_classes], dtype=np.float64,
+    ) * float(cfg.global_strength)
+
+    if cfg.shrink_disagreement and n >= 2:
+        agree = mean_pairwise_cosine(expert_logprobs)
+        shrink = np.where(agree >= cfg.shrink_threshold, 1.0, np.maximum(agree, 0.0))
+    else:
+        shrink = np.ones(L)
+
+    weights = []
+    for nm in names:
+        w = base_weights * shrink * float(cfg.expert_weights.get(nm, 1.0))
+        ecw = cfg.expert_class_weights.get(nm)
+        if ecw:
+            w = w * np.array([ecw.get(c, 1.0) for c in position_classes],
+                             dtype=np.float64)
+        weights.append(w)
+
+    bias = np.zeros((L, 20), dtype=np.float64)
+    for w, lo in zip(weights, los):
+        bias = bias + w[:, None] * lo
+    weights_per_expert = np.stack(weights, axis=-1)  # (L, N)
+
+    return FusionResult(
+        bias=bias,
+        log_odds_esmc=los[0],
+        log_odds_saprot=(los[1] if n >= 2 else None),
+        weights_per_position=(weights_per_expert if n == 2 else None),
+        config=cfg,
+        log_odds=los,
+        weights_per_expert=weights_per_expert,
+        expert_names=names,
+    )
+
+
 __all__ = [
     "AA_ORDER",
     "AA_BG_VEC",
@@ -255,6 +430,9 @@ __all__ = [
     "calibrate_log_odds",
     "cosine_similarity_per_position",
     "entropy_match_temperature",
+    "entropy_match_temperatures",
+    "fuse_experts",
     "fuse_plm_logits",
+    "mean_pairwise_cosine",
     "per_position_entropy",
 ]
