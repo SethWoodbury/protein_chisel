@@ -4936,6 +4936,31 @@ def main() -> None:
         float(np.abs(cached_base_bias).mean()),
         args.plm_strength, fusion_cfg.class_weights,
     )
+    # ---- Run provenance (version control) ----------------------------
+    # Records experts (+versions), fusion math, backend, and conserve-network
+    # settings so this run is reproducible/auditable. expert_versions come from
+    # the precompute manifest when available. Additive artifact (no PDB change).
+    from protein_chisel.provenance import RunProvenance
+    _expert_versions = {}
+    try:
+        _pre_manifest = json.loads((art / "manifest.json").read_text())
+        _expert_versions = _pre_manifest.get("expert_versions", {})
+    except Exception:
+        pass
+    run_provenance = RunProvenance(
+        experts=list(expert_names),
+        expert_versions=_expert_versions,
+        fusion_version=getattr(fusion_cfg, "version", "fusion-v1"),
+        conserve_hbonds=CONSERVE_HBONDS,
+        conserve_depth=CONSERVE_HBOND_DEPTH,
+        conserve_interaction_types=list(CONSERVE_INTERACTION_TYPES),
+        conserve_grow_network=CONSERVE_GROW_NETWORK,
+        conserve_seed_base=(CONSERVE_SEED_BASE if CONSERVE_HBONDS else None),
+    )
+    run_provenance.write_json(run_dir / "provenance.json")
+    LOGGER.info("provenance -> %s (experts=%s, fusion=%s)",
+                 run_dir / "provenance.json", run_provenance.experts,
+                 run_provenance.fusion_version)
     # Diagnostic: per-class total bias mass with the new weights.
     import collections as _coll
     cls_mass: dict[str, float] = _coll.defaultdict(float)
