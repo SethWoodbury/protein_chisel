@@ -600,6 +600,8 @@ apptainer exec "${NV_FLAGS[@]}" \
     --env "HF_HOME=/net/databases/huggingface/esmc" \
     --env "HF_HUB_CACHE=/net/databases/huggingface/esmc/hub" \
     --env "SAPROT_HF_CACHE=/net/databases/huggingface/saprot/hub" \
+    --env "HF_HUB_OFFLINE=1" \
+    --env "TRANSFORMERS_OFFLINE=1" \
     "$STAGE2_SIF" \
     python "$REPO/scripts/precompute_plm_artifacts.py" \
         --seed_pdb "$SEED_PDB" \
