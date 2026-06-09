@@ -740,9 +740,11 @@ if [[ "$MPNN_BACKEND" == "poe" ]]; then
     echo "###  PoE 3b: host PoE sampling (poe_mpnn.sif) experts=$ADDITIONAL_EXPERTS lambdas=$EXPERT_LAMBDAS pool=$POE_NUM_DESIGNS->$POE_ACTUAL omit_AA=$OMIT_AA ###"
     # Build the host PoE command from the single source (build_poe_command) INSIDE
     # the stage-3 container, then exec it at HOST level (nested apptainer is blocked).
-    # Capture status explicitly: mapfile via process-substitution would otherwise
-    # swallow a builder failure, leaving POE_CMD empty (a silent no-op).
-    POE_CMD_RAW="$(apptainer exec \
+    # The command is emitted NUL-separated; write it to a FILE (NOT $(...), which
+    # strips NUL bytes) so the separators survive, and check the build exit status
+    # via the redirect so a builder failure can't become a silent empty no-op.
+    POE_CMD_FILE="$WORK_DIR/poe_cmd.nul"
+    apptainer exec \
         --bind "$REPO:/code" --bind /net/software --bind /net/databases \
         --bind /net/scratch --bind "$HOME" \
         --env "PYTHONPATH=/code/src:/cifutils/src" \
@@ -756,10 +758,10 @@ if [[ "$MPNN_BACKEND" == "poe" ]]; then
             --omit_AA "$OMIT_AA" \
             --use_side_chain_context "$USE_SIDE_CHAIN_CONTEXT" \
             --batch_size 10 --number_of_batches "$POE_NBATCH" \
-            --temperature "$POE_TEMPERATURE")" || {
+            --temperature "$POE_TEMPERATURE" > "$POE_CMD_FILE" || {
         echo "ERROR: PoE command build failed (poe_emit_command.py)" >&2; exit 3; }
-    mapfile -d '' POE_CMD < <(printf '%s' "$POE_CMD_RAW")
-    if [[ ${#POE_CMD[@]} -eq 0 || "${POE_CMD[0]}" != "apptainer" ]]; then
+    mapfile -d '' POE_CMD < "$POE_CMD_FILE"
+    if [[ ${#POE_CMD[@]} -lt 2 || "${POE_CMD[0]}" != "apptainer" ]]; then
         echo "ERROR: empty/invalid PoE command (got ${#POE_CMD[@]} tokens)" >&2; exit 3
     fi
     echo "###  PoE host command: ${POE_CMD[*]}"
