@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from protein_chisel import __version__ as _CHISEL_VERSION
+
 import numpy as np
 import pandas as pd
 
@@ -116,7 +118,7 @@ def _manifest_for_pose(entry, cfg: NaturalnessConfig) -> Manifest:
             "save_logits": cfg.save_logits,
             "save_fusion_bias": cfg.save_fusion_bias,
         },
-        tool_versions={"protein_chisel": "0.0.1"},
+        tool_versions={"protein_chisel": _CHISEL_VERSION},
     )
 
 
