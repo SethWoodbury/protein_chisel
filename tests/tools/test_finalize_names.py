@@ -107,8 +107,10 @@ def test_design_path_collapsed(tmp_path):
     txt = (root / "x_chisel_00.pdb").read_text()
     assert "DESIGN_PATH iterative_design" not in txt
     assert "DESIGN_PATH protonate_topk" not in txt
+    import os
     dp = [l for l in txt.splitlines() if l.startswith("REMARK DESIGN_PATH chisel_iterative_design output")]
-    assert len(dp) == 1 and dp[0].endswith(str((root / "x_chisel_00.pdb").resolve()))
+    assert len(dp) == 1
+    assert dp[0].endswith(os.path.abspath(str(root / "x_chisel_00.pdb")))
     # upstream chain + other REMARKs preserved
     for keep in ("DESIGN_PATH rfd3 input", "DESIGN_PATH predesign_cart_relax",
                  "DESIGN_PATH chisel_ligandmpnn", "REMARK 665", "REMARK 666",
@@ -143,12 +145,50 @@ def test_idempotent(tmp_path):
     assert (root / "chiseled_design_metrics.tsv").read_text() == tsv1
 
 
-def test_width_scales(tmp_path):
-    names = [f"y_chisel_{i}" for i in range(12)]   # 12 designs -> width 2 (max idx 11)
+def test_width_two_digits(tmp_path):
+    names = [f"y_chisel_{i}" for i in range(12)]   # 12 designs -> width 2
     root = _make_run(tmp_path, names, names)
     out = finalize_design_names(root)
     assert out["width"] == 2
     assert (root / "y_chisel_00.pdb").exists() and (root / "y_chisel_11.pdb").exists()
+
+
+def test_width_three_digits_at_100(tmp_path):
+    names = [f"y_chisel_{i}" for i in range(100)]  # 100 designs -> count-width 3
+    root = _make_run(tmp_path, names, names)
+    out = finalize_design_names(root)
+    assert out["width"] == 3
+    assert (root / "y_chisel_000.pdb").exists() and (root / "y_chisel_099.pdb").exists()
+
+
+def test_partial_swap_failure_no_data_loss(tmp_path, monkeypatch):
+    # If os.replace fails mid-swap, finalize must raise but LOSE NO design content
+    # (staged copies retained in the temp dir; originals not pre-deleted).
+    import pytest
+    import protein_chisel.tools.finalize_names as fn
+    root = _make_run(tmp_path, ["x_chisel_3", "x_chisel_9", "x_chisel_5"],
+                     ["x_chisel_9", "x_chisel_3", "x_chisel_5"])
+    for nm, tag in [("x_chisel_9", "T9"), ("x_chisel_3", "T3"), ("x_chisel_5", "T5")]:
+        (root / f"{nm}.pdb").write_text(_pdb_text() + f"REMARK TAG {tag}\n")
+
+    import os as _os
+    real_replace = _os.replace
+    calls = {"n": 0}
+
+    def flaky(src, dst):
+        calls["n"] += 1
+        if calls["n"] == 2:           # first os.replace = swap-1; second = swap-2
+            raise OSError("injected mid-swap failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(fn.os, "replace", flaky)
+    with pytest.raises(OSError):
+        fn.finalize_design_names(root)
+    # Every design's content must still exist somewhere under root (designs dir or
+    # the retained .finalize_tmp_* recovery dir).
+    blob = "".join(p.read_text() for p in root.rglob("*.pdb"))
+    for tag in ("T9", "T3", "T5"):
+        assert f"REMARK TAG {tag}" in blob, f"design content {tag} was LOST"
 
 
 def test_no_designs_noop(tmp_path):

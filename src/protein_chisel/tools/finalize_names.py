@@ -12,10 +12,12 @@ set (the cross-cycle winners), in the caller's final output directory. It:
      (unless ``keep_intermediate``); upstream provenance is preserved.
   3. Keeps the metrics TSV (id + pdb_path) consistent with the renamed files.
 
-Pure-Python (no PyRosetta/containers). Collision-safe: builds the renamed set in a
-fresh temp dir, validates, then atomically swaps — a newly-assigned ``chisel_28``
-can never clobber a pre-existing source ``chisel_28``. Idempotent + safe on
-partial failure (originals untouched until the validated swap).
+Pure-Python (no PyRosetta/containers). Collision- and crash-safe: stages the
+renamed set in a fresh temp dir, validates, then swaps each file in with an atomic
+``os.replace`` (so a newly-assigned ``chisel_28`` can never clobber a pre-existing
+source ``chisel_28``, and a crash mid-swap never loses a design — every target
+always holds valid content). Idempotent. Only ever touches files inside the
+published designs directory.
 """
 from __future__ import annotations
 
@@ -30,6 +32,7 @@ LOGGER = logging.getLogger("protein_chisel.tools.finalize_names")
 
 _TSV_NAME = "chiseled_design_metrics.tsv"
 _CHISEL_RE = re.compile(r"^(?P<stem>.+)_chisel_\d+.*$")  # strip trailing _chisel_<idx>[suffix]
+_TRUE = {"true", "1", "yes"}
 
 
 def _read_metrics_tsv(tsv: Path):
@@ -48,21 +51,6 @@ def _read_metrics_tsv(tsv: Path):
     return meta, df
 
 
-def _is_input_row(row, seed_basenames: set[str]) -> bool:
-    """Triple-guarded: a row is the input reference (NOT a design) if it's flagged
-    is_input, OR its id has no _chisel_ marker, OR its pdb basename is the seed."""
-    val = str(row.get("is_input", "")).strip().lower()
-    if val in {"true", "1", "yes"}:
-        return True
-    rid = str(row.get("id", ""))
-    if "_chisel_" not in rid:
-        return True
-    pp = str(row.get("pdb_path", ""))
-    if pp and Path(pp).name in seed_basenames:
-        return True
-    return False
-
-
 def finalize_design_names(
     final_root: str | Path,
     *,
@@ -71,13 +59,14 @@ def finalize_design_names(
 ) -> dict:
     """Rename + DESIGN_PATH-collapse the published designs under ``final_root``.
 
-    Returns a summary dict. No-op (exit-friendly) when the TSV is absent or there
-    are no design rows.
+    Returns a summary dict. No-op (exit-friendly) when the TSV is absent/empty or
+    there are no design rows.
     """
     final_root = Path(final_root)
     tsv = final_root / tsv_name
-    if not tsv.is_file():
-        LOGGER.warning("finalize: no %s under %s; nothing to do", tsv_name, final_root)
+    if not tsv.is_file() or tsv.stat().st_size == 0:
+        LOGGER.warning("finalize: no usable %s under %s; nothing to do",
+                       tsv_name, final_root)
         return {"status": "no_tsv", "renamed": 0}
 
     meta, df = _read_metrics_tsv(tsv)
@@ -85,45 +74,64 @@ def finalize_design_names(
         LOGGER.warning("finalize: TSV has no 'id' column; nothing to do")
         return {"status": "no_id_col", "renamed": 0}
 
+    has_is_input = "is_input" in df.columns
     seed_basenames = {
         Path(str(r["pdb_path"])).name
         for _, r in df.iterrows()
-        if str(r.get("is_input", "")).strip().lower() in {"true", "1", "yes"}
+        if has_is_input and str(r.get("is_input", "")).strip().lower() in _TRUE
         and str(r.get("pdb_path", ""))
     }
 
-    # Design rows in rank (TSV row) order; input-reference row(s) excluded.
-    design_idx = [i for i, r in df.iterrows()
-                  if not _is_input_row(r, seed_basenames)]
+    def _is_input(row) -> bool:
+        # Authoritative when the column exists; heuristic fallback only if absent
+        # (so a design with an unusual id is NEVER misclassified as the input).
+        if has_is_input:
+            return str(row.get("is_input", "")).strip().lower() in _TRUE
+        rid = str(row.get("id", ""))
+        if "_chisel_" not in rid:
+            return True
+        pp = str(row.get("pdb_path", ""))
+        return bool(pp) and Path(pp).name in seed_basenames
+
+    def _resolve_old(row) -> Path | None:
+        pp = str(row.get("pdb_path", "")).strip()
+        if pp and Path(pp).is_file():
+            return Path(pp)
+        rid = str(row.get("id", "")).strip()
+        for cand in (final_root / f"{rid}.pdb", final_root / "designs" / f"{rid}.pdb"):
+            if cand.is_file():
+                return cand
+        return None
+
+    design_idx = [i for i, r in df.iterrows() if not _is_input(r)]
     n = len(design_idx)
     if n == 0:
         LOGGER.info("finalize: 0 design rows; nothing to finalize")
         return {"status": "no_designs", "renamed": 0}
 
-    # Locate the designs dir from the first design row's pdb_path (robust to
-    # flat/minimal vs designs/ layouts); fall back to final_root[/designs].
-    def _resolve_old(row) -> Path:
-        pp = str(row.get("pdb_path", ""))
-        if pp and Path(pp).is_file():
-            return Path(pp)
-        for cand in (final_root / f"{row['id']}.pdb",
-                     final_root / "designs" / f"{row['id']}.pdb"):
-            if cand.is_file():
-                return cand
-        return Path(pp) if pp else final_root / f"{row['id']}.pdb"
+    first = _resolve_old(df.loc[design_idx[0]])
+    if first is None:
+        raise FileNotFoundError(
+            f"finalize: design PDB for id={df.loc[design_idx[0]].get('id')!r} not found")
+    designs_dir = first.parent                       # logical (keeps /net vs /mnt)
+    designs_real = os.path.realpath(str(designs_dir))
+    width = max(2, len(str(n)))                       # pad to the count's digit width
 
-    first_old = _resolve_old(df.loc[design_idx[0]])
-    designs_dir = first_old.parent
-    width = max(2, len(str(n - 1)))
-
-    # Build the rename map (old path, new name, new id) in rank order.
-    plan: list[tuple[int, Path, str, str]] = []  # (df_index, old_path, new_name, new_id)
+    # ---- Preflight: build + validate the full plan BEFORE touching any file ----
+    plan: list[tuple[int, Path, str, str]] = []      # (df_index, old, new_name, new_id)
     for rank, di in enumerate(design_idx):
         row = df.loc[di]
+        rid = str(row.get("id", "")).strip()
+        if not rid:
+            raise ValueError(f"finalize: design row {di} has empty id")
         old_path = _resolve_old(row)
-        if not old_path.is_file():
-            raise FileNotFoundError(
-                f"finalize: design PDB for id={row['id']!r} not found ({old_path})")
+        if old_path is None:
+            raise FileNotFoundError(f"finalize: design PDB for id={rid!r} not found")
+        # Safety: only ever operate on files inside the designs dir.
+        if os.path.realpath(str(old_path.parent)) != designs_real:
+            raise ValueError(
+                f"finalize: id={rid!r} pdb {old_path} is outside the designs dir "
+                f"{designs_dir}; refusing to rename")
         m = _CHISEL_RE.match(old_path.stem)
         stem = m.group("stem") if m else old_path.stem
         new_id = f"{stem}_chisel_{rank:0{width}d}"
@@ -132,40 +140,56 @@ def finalize_design_names(
     new_names = [nm for (_, _, nm, _) in plan]
     if len(set(new_names)) != n:
         raise RuntimeError(f"finalize: non-unique target names {new_names}")
+    target_paths = {designs_dir / nm for nm in new_names}
 
-    # Phase 1: build renamed + rewritten files in a FRESH temp dir (originals
-    # untouched -> any failure here is safe).
+    # ---- Phase 1: stage renamed + DESIGN_PATH-rewritten copies in a fresh tmp ----
     from protein_chisel.tools.remarks import finalize_design_path
     tmp = designs_dir / f".finalize_tmp_{os.getpid()}_{uuid.uuid4().hex[:8]}"
     tmp.mkdir(parents=True, exist_ok=False)
+    staged_ok = False
+    swapped = False
     try:
         for di, old_path, new_name, new_id in plan:
             staged = tmp / new_name
             shutil.copy2(old_path, staged)
-            final_abs = str((designs_dir / new_name).resolve())
+            final_abs = os.path.abspath(str(designs_dir / new_name))  # logical abs
             finalize_design_path(staged, final_path=final_abs,
                                  keep_intermediate=keep_intermediate)
         staged_files = sorted(tmp.glob("*.pdb"))
         if len(staged_files) != n:
-            raise RuntimeError(
-                f"finalize: staged {len(staged_files)} != {n} expected")
+            raise RuntimeError(f"finalize: staged {len(staged_files)} != {n} expected")
+        staged_ok = True
 
-        # Phase 2: atomic-ish swap — remove old design PDBs, move staged in.
-        old_paths = {old_path for (_, old_path, _, _) in plan}
-        for op in old_paths:
-            op.unlink()
+        # ---- Phase 2: per-file ATOMIC swap. os.replace is atomic on the same FS
+        # (tmp is a subdir of designs_dir) and overwrites any collided original at
+        # the target name. Originals are NOT pre-deleted, and the staged copies are
+        # retained (see finally) until the swap fully completes, so no design can be
+        # lost even on a mid-swap crash in the collision case. ----
         for di, old_path, new_name, new_id in plan:
-            shutil.move(str(tmp / new_name), str(designs_dir / new_name))
+            os.replace(str(tmp / new_name), str(designs_dir / new_name))
+        swapped = True
+        # Remove leftover originals whose name isn't itself a target (source had a
+        # different chisel index). Never deletes a target or any non-plan file.
+        for op in {op for (_, op, _, _) in plan}:
+            if op not in target_paths and op.exists():
+                op.unlink()
     finally:
-        if tmp.exists():
+        # Remove tmp on full success, or on a PRE-swap failure (originals intact).
+        # On a mid-swap failure keep tmp so the staged copies survive for recovery
+        # (a partial swap may have overwritten a collided original whose only other
+        # copy is in tmp). Such a leftover .finalize_tmp_* dir flags manual recovery.
+        if tmp.exists() and (swapped or not staged_ok):
             shutil.rmtree(tmp, ignore_errors=True)
+        elif tmp.exists():
+            LOGGER.error("finalize: swap interrupted; staged copies retained at %s "
+                         "for recovery (designs dir may be partially renamed)", tmp)
 
-    # Phase 3: update TSV id + pdb_path for design rows (others untouched),
-    # re-emit preserving the RUN_META header + column order; atomic replace.
-    for (di, _old, new_name, new_id) in plan:
-        df.at[di, "id"] = new_id
+    # ---- Phase 3: update TSV id + pdb_path for design rows (others untouched);
+    # preserve the RUN_META header + column order; atomic replace. ----
+    for (di, _old, new_name, _new_id) in plan:
+        df.at[di, "id"] = _new_id
         if "pdb_path" in df.columns:
-            df.at[di, "pdb_path"] = str((designs_dir / new_name).resolve())
+            df.at[di, "pdb_path"] = os.path.abspath(str(designs_dir / new_name))
     out = (meta or "") + df.to_csv(sep="\t", index=False)
     tmp_tsv = tsv.with_suffix(".tsv.tmp")
     tmp_tsv.write_text(out)
