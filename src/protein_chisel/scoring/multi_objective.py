@@ -339,6 +339,26 @@ def apply_cli_overrides(
     return out
 
 
+def select_specs_by_label(
+    specs: list[MetricSpec],
+    labels: Optional[Iterable[str]],
+) -> list[MetricSpec]:
+    """Keep only ranking specs whose label (or column) is in ``labels``.
+
+    Used by the metric-registry ``--metrics`` gating: a deselected objective metric
+    drops out of the TOPSIS basket. Order is preserved.
+
+    ``labels=None`` returns ``specs`` unchanged (no gating). At the default
+    ``--metrics all`` the driver passes ``None`` (not the full label set), so this is
+    the identity and the default ranking is byte-identical. Passing the full label
+    set is equivalent (also identity).
+    """
+    if labels is None:
+        return list(specs)
+    keep = set(labels)
+    return [s for s in specs if (s.label or s.column) in keep]
+
+
 __all__ = __all__ + [
     "DEFAULT_METRIC_SPECS",
     "MetricSpec",
@@ -346,4 +366,5 @@ __all__ = __all__ + [
     "compute_topsis_scores_v2",
     "parse_kv_string",
     "select_diverse_topk_two_axis",
+    "select_specs_by_label",
 ]

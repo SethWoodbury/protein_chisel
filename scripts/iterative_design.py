@@ -81,6 +81,30 @@ DEFAULT_CATRES = (60, 64, 128, 131, 132, 157)
 CATALYTIC_HIS_RESNOS = (60, 64, 128, 132)
 CHAIN = "A"
 
+# --metrics objective-gating filter (add-on #7). Set once in main() from the
+# resolved metric selection: a frozenset of multi_objective labels to keep in the
+# TOPSIS basket, or None for "no gating" (the default --metrics all => byte-identical
+# ranking). Read by the ranking sites + the backfill/rescue helpers via
+# select_specs_by_label(); a module global avoids threading it through every
+# helper call site (the helpers run once per process).
+_RANKING_LABEL_FILTER = None
+
+# --filters survivor-gating set (add-on #7). Set once in main(): a frozenset of
+# filter metric names allowed to DROP designs, or None for "all filters on" (the
+# default --filters all => byte-identical survivor sets). Read via
+# _filter_active() at every filter predicate (seq/struct/clash/tunnel/fpocket).
+# A module global avoids threading it through the struct worker's positional-tuple
+# argument and the many backfill/rescue call sites (run once per process).
+_ACTIVE_FILTERS = None
+
+
+def _filter_active(name: str) -> bool:
+    """True if filter ``name`` may drop designs (i.e. it is selected). With the
+    default --filters all (``_ACTIVE_FILTERS is None``) every filter is active, so
+    gating is a no-op and survivor sets are byte-identical."""
+    return _ACTIVE_FILTERS is None or name in _ACTIVE_FILTERS
+
+
 # Probabilistic conserved-sidechain-H-bond fixing (Feature 1) + canonical REMARK
 # transfer (Feature 2). Set in main() from argparse; kept as module globals (like
 # DEFAULT_CATRES above) so stage_sample/stage_restore_pdbs read them without
@@ -1020,11 +1044,18 @@ def stage_seq_filter(
     df = deduplicate_by_sequence(df)
     LOGGER.info("stage_seq_filter: input n=%d (post-dedup, post-WT-drop)", len(df))
 
+    # --filters gating: a filter that isn't selected must not append a reject
+    # reason (so it stops dropping designs). Reads the module-global selection via
+    # _filter_active(); at --filters all every filter is on => byte-identical.
+    # Predicates are short-circuited by `_on(name) and <cond>` so the (cheap) check
+    # isn't even evaluated when the filter is off.
+    _on = _filter_active
+
     rows: list[dict] = []
     for _, row in df.iterrows():
         seq = row["sequence"]
         reasons: list[str] = []
-        if len(seq) != wt_length:
+        if _on("length") and len(seq) != wt_length:
             reasons.append(f"length {len(seq)} != WT {wt_length}")
         pp = protparam_metrics(
             seq, ph=design_ph,
@@ -1033,33 +1064,33 @@ def stage_seq_filter(
         # Filter on the ROBUST full-HH charge (all 7 ionizables + termini).
         # The minimalist 'no_HIS' (still computed below as a diagnostic
         # column) is too lenient because it misses Cys/Tyr at high pH.
-        if pp.charge_at_pH_full_HH >= net_charge_max:
+        if _on("net_charge") and pp.charge_at_pH_full_HH >= net_charge_max:
             reasons.append(
                 f"net_charge_full_HH={pp.charge_at_pH_full_HH:.2f} >= {net_charge_max}"
             )
-        if pp.charge_at_pH_full_HH <= net_charge_min:
+        if _on("net_charge") and pp.charge_at_pH_full_HH <= net_charge_min:
             reasons.append(
                 f"net_charge_full_HH={pp.charge_at_pH_full_HH:.2f} <= {net_charge_min}"
             )
-        if not (pi_min <= pp.pi <= pi_max):
+        if _on("pi") and not (pi_min <= pp.pi <= pi_max):
             reasons.append(f"pI={pp.pi:.2f} outside [{pi_min}, {pi_max}]")
 
         # Light de-novo filters on cheap sequence-only metrics. Each
         # threshold is set so they catch *truly broken* designs only —
         # the production pool typically passes all of these comfortably.
-        if pp.instability_index >= instability_max:
+        if _on("instability") and pp.instability_index >= instability_max:
             reasons.append(
                 f"instability_index={pp.instability_index:.1f} >= {instability_max}"
             )
-        if not (gravy_min <= pp.gravy <= gravy_max):
+        if _on("gravy") and not (gravy_min <= pp.gravy <= gravy_max):
             reasons.append(
                 f"GRAVY={pp.gravy:+.3f} outside [{gravy_min}, {gravy_max}]"
             )
-        if pp.aliphatic_index < aliphatic_min:
+        if _on("aliphatic") and pp.aliphatic_index < aliphatic_min:
             reasons.append(
                 f"aliphatic_index={pp.aliphatic_index:.1f} < {aliphatic_min}"
             )
-        if pp.boman_index >= boman_max:
+        if _on("boman") and pp.boman_index >= boman_max:
             reasons.append(
                 f"boman_index={pp.boman_index:.2f} >= {boman_max}"
             )
@@ -1077,8 +1108,9 @@ def stage_seq_filter(
             fixed_resnos=fixed_resnos,
             protein_resnos=seed_protein_resnos,
         )
-        for h in eng_res.hard_filter_hits:
-            reasons.append(f"{h.rule_name}: {h.reason}")
+        if _on("expression"):
+            for h in eng_res.hard_filter_hits:
+                reasons.append(f"{h.rule_name}: {h.reason}")
         n_warnings = len(eng_res.warnings)
         n_soft_bias = len(eng_res.soft_bias_hits)
         n_hard_omit = len(eng_res.hard_omit_hits)
@@ -1086,22 +1118,25 @@ def stage_seq_filter(
         # sequence sits beyond each numeric threshold. This lets final
         # seq-stage backfill prefer near-misses over sequences that fail
         # by a wide margin, without changing the production hard filters.
-        length_gap = abs(len(seq) - wt_length) / max(1, wt_length)
-        charge_high_gap = _normalized_upper_bound_gap(
-            pp.charge_at_pH_full_HH, net_charge_max,
-        )
-        charge_low_gap = _normalized_lower_bound_gap(
-            pp.charge_at_pH_full_HH, net_charge_min,
-        )
-        pi_gap = _normalized_interval_gap(pp.pi, pi_min, pi_max)
-        instability_gap = _normalized_upper_bound_gap(
-            pp.instability_index, instability_max,
-        )
-        gravy_gap = _normalized_interval_gap(pp.gravy, gravy_min, gravy_max)
-        aliphatic_gap = _normalized_lower_bound_gap(
-            pp.aliphatic_index, aliphatic_min,
-        )
-        boman_gap = _normalized_upper_bound_gap(pp.boman_index, boman_max)
+        # Backfill "distance to passing" gaps. A deselected filter (--filters)
+        # contributes 0 so it can't influence backfill ordering either. At
+        # --filters all every _on() is True => identical gaps.
+        length_gap = (abs(len(seq) - wt_length) / max(1, wt_length)
+                      if _on("length") else 0.0)
+        charge_high_gap = (_normalized_upper_bound_gap(
+            pp.charge_at_pH_full_HH, net_charge_max) if _on("net_charge") else 0.0)
+        charge_low_gap = (_normalized_lower_bound_gap(
+            pp.charge_at_pH_full_HH, net_charge_min) if _on("net_charge") else 0.0)
+        pi_gap = (_normalized_interval_gap(pp.pi, pi_min, pi_max)
+                  if _on("pi") else 0.0)
+        instability_gap = (_normalized_upper_bound_gap(
+            pp.instability_index, instability_max) if _on("instability") else 0.0)
+        gravy_gap = (_normalized_interval_gap(pp.gravy, gravy_min, gravy_max)
+                     if _on("gravy") else 0.0)
+        aliphatic_gap = (_normalized_lower_bound_gap(
+            pp.aliphatic_index, aliphatic_min) if _on("aliphatic") else 0.0)
+        boman_gap = (_normalized_upper_bound_gap(pp.boman_index, boman_max)
+                     if _on("boman") else 0.0)
         seq_filter_numeric_gap = float(
             length_gap
             + charge_high_gap
@@ -1535,8 +1570,9 @@ def stage_struct_filter(
         cid = row["id"]
         wrow, hbonds_, reasons = by_cid.get(cid, ({}, [], ["worker_missing"]))
         hbond_rows.extend(hbonds_)
-        # Apply severe-clash filter (worker doesn't have clash_filter flag)
-        if clash_filter and wrow.get("clash__has_severe"):
+        # Apply severe-clash filter (worker doesn't have clash_filter flag).
+        # Gated by --filters via _filter_active("clash"); all on => identical.
+        if clash_filter and _filter_active("clash") and wrow.get("clash__has_severe"):
             reasons = list(reasons) + [
                 f"severe clash (n_cat={wrow.get('clash__n_to_catalytic',0)}, "
                 f"n_lig={wrow.get('clash__n_to_ligand',0)}, "
@@ -1686,7 +1722,7 @@ def stage_tunnel_metrics(
     # metrics but NOT as hard gates — n_openings > 0 is too permissive
     # and depth_max=0 too aggressive for blanket rejection. Designs
     # with bad pkvf signals get RANKED DOWN, not killed.
-    if hard_gate:
+    if hard_gate and _filter_active("tunnel"):
         before = len(merged)
         bad_verdict = merged["tunnel__verdict"].astype(str).isin(
             ["buried", "ligand_too_big"]
@@ -2269,11 +2305,11 @@ def _struct_filter_worker(args: tuple) -> tuple:
             "preorg__n_first_shell": 0, "preorg__n_second_shell": 0,
         }
 
-    # Filter reasons
+    # Filter reasons (gated by --filters via _filter_active; all on => identical).
     reasons: list[str] = []
-    if len(hbonds) < 1:
+    if _filter_active("cat_his_hbonds") and len(hbonds) < 1:
         reasons.append("no h-bonds to catalytic HIS")
-    if sap_max == sap_max and sap_max > sap_max_thr:
+    if _filter_active("sap") and sap_max == sap_max and sap_max > sap_max_thr:
         reasons.append(f"sap_max={sap_max:.2f} > {sap_max_thr}")
     # Severe-clash filter applied by caller (it has the boolean flag).
 
@@ -2957,35 +2993,38 @@ def _build_input_reference_row(
     pp = protparam_metrics(
         wt_seq, ph=design_ph, n_term_pad=n_term_pad, c_term_pad=c_term_pad,
     )
+    # --filters gating mirrors stage_seq_filter so the input-reference row's
+    # pass/fail flags reflect the same selection (all on => byte-identical).
     seq_reasons: list[str] = []
-    if pp.charge_at_pH_full_HH >= net_charge_max:
+    if _filter_active("net_charge") and pp.charge_at_pH_full_HH >= net_charge_max:
         seq_reasons.append(
             f"net_charge_full_HH={pp.charge_at_pH_full_HH:.2f} >= {net_charge_max}",
         )
-    if pp.charge_at_pH_full_HH <= net_charge_min:
+    if _filter_active("net_charge") and pp.charge_at_pH_full_HH <= net_charge_min:
         seq_reasons.append(
             f"net_charge_full_HH={pp.charge_at_pH_full_HH:.2f} <= {net_charge_min}",
         )
-    if not (pi_min <= pp.pi <= pi_max):
+    if _filter_active("pi") and not (pi_min <= pp.pi <= pi_max):
         seq_reasons.append(f"pI={pp.pi:.2f} outside [{pi_min}, {pi_max}]")
-    if pp.instability_index >= instability_max:
+    if _filter_active("instability") and pp.instability_index >= instability_max:
         seq_reasons.append(
             f"instability_index={pp.instability_index:.1f} >= {instability_max}",
         )
-    if not (gravy_min <= pp.gravy <= gravy_max):
+    if _filter_active("gravy") and not (gravy_min <= pp.gravy <= gravy_max):
         seq_reasons.append(
             f"GRAVY={pp.gravy:+.3f} outside [{gravy_min}, {gravy_max}]",
         )
-    if pp.aliphatic_index < aliphatic_min:
+    if _filter_active("aliphatic") and pp.aliphatic_index < aliphatic_min:
         seq_reasons.append(
             f"aliphatic_index={pp.aliphatic_index:.1f} < {aliphatic_min}",
         )
-    if pp.boman_index >= boman_max:
+    if _filter_active("boman") and pp.boman_index >= boman_max:
         seq_reasons.append(
             f"boman_index={pp.boman_index:.2f} >= {boman_max}",
         )
-    for hit in getattr(expression_result, "hard_filter_hits", []):
-        seq_reasons.append(f"{hit.rule_name}: {hit.reason}")
+    if _filter_active("expression"):
+        for hit in getattr(expression_result, "hard_filter_hits", []):
+            seq_reasons.append(f"{hit.rule_name}: {hit.reason}")
 
     row.update({
         "id": seed_id,
@@ -3040,7 +3079,7 @@ def _build_input_reference_row(
         clash_severe_distance, sap_max_threshold, seed_dfi_metrics,
     ))
     struct_reasons = list(struct_reasons)
-    if clash_filter and struct_row.get("clash__has_severe"):
+    if clash_filter and _filter_active("clash") and struct_row.get("clash__has_severe"):
         struct_reasons.append(
             "severe clash "
             f"(n_cat={struct_row.get('clash__n_to_catalytic', 0)}, "
@@ -3103,7 +3142,7 @@ def _build_input_reference_row(
         chain=CHAIN,
     )
     row.update(_fpocket_metrics_from_info(fpocket_info))
-    if fpocket_druggability_min > 0:
+    if fpocket_druggability_min > 0 and _filter_active("fpocket"):
         druggability = row.get("fpocket__druggability", float("nan"))
         if isinstance(druggability, (int, float)) and druggability == druggability:
             row["selection__hard_final_filter_passed"] = (
@@ -3181,6 +3220,7 @@ def _build_seq_stage_backfill_pool(
     )
     from protein_chisel.scoring.multi_objective import (
         DEFAULT_METRIC_SPECS, apply_cli_overrides, compute_topsis_scores_v2,
+        select_specs_by_label,
     )
 
     pool = pd.concat(seq_stage_rows, ignore_index=True)
@@ -3247,6 +3287,7 @@ def _build_seq_stage_backfill_pool(
     active_specs = apply_cli_overrides(
         DEFAULT_METRIC_SPECS, rank_weights, rank_targets,
     )
+    active_specs = select_specs_by_label(active_specs, _RANKING_LABEL_FILTER)
     scores, used_specs, _debug = compute_topsis_scores_v2(pool, active_specs)
     pool["mo_topsis"] = scores
     pool["legacy_rank_score"] = pool["fitness__logp_fused_mean"].rank(
@@ -3476,10 +3517,12 @@ def _deferred_rescue_score_candidates(
 
     from protein_chisel.scoring.multi_objective import (
         DEFAULT_METRIC_SPECS, apply_cli_overrides, compute_topsis_scores_v2,
+        select_specs_by_label,
     )
     active_specs = apply_cli_overrides(
         DEFAULT_METRIC_SPECS, rank_weights, rank_targets,
     )
+    active_specs = select_specs_by_label(active_specs, _RANKING_LABEL_FILTER)
     rescue_scores, _used_specs, _debug = compute_topsis_scores_v2(
         rescued, active_specs,
     )
@@ -3490,7 +3533,10 @@ def _deferred_rescue_score_candidates(
         "passed_struct_filter",
         pd.Series([False] * len(rescued), index=rescued.index),
     ).fillna(False).astype(bool)
-    if tunnel_metrics_enabled:
+    # tunnel/fpocket gating also applies to the rescue bucketing, so a deselected
+    # filter can't push designs down via bucket priority. At the defaults
+    # (_filter_active True) these are exactly the original branches.
+    if tunnel_metrics_enabled and _filter_active("tunnel"):
         tunnel_failed = rescued.get(
             "tunnel__verdict",
             pd.Series(["not_run"] * len(rescued), index=rescued.index),
@@ -3509,7 +3555,7 @@ def _deferred_rescue_score_candidates(
         ),
         errors="coerce",
     )
-    if fpocket_druggability_min > 0:
+    if fpocket_druggability_min > 0 and _filter_active("fpocket"):
         fpocket_pass = fpocket_status.eq("ok") & (fpocket_druggability >= fpocket_druggability_min)
         fpocket_near = fpocket_status.eq("ok") & fpocket_druggability.notna() & ~fpocket_pass
         rescued["selection__fpocket_gap"] = np.where(
@@ -3518,6 +3564,8 @@ def _deferred_rescue_score_candidates(
             np.inf,
         )
     else:
+        # fpocket filter deselected (or no cutoff): treat any computed pocket as
+        # passing and apply no druggability gap in bucketing.
         fpocket_pass = fpocket_status.eq("ok")
         fpocket_near = pd.Series([False] * len(rescued), index=rescued.index)
         rescued["selection__fpocket_gap"] = 0.0
@@ -4899,6 +4947,28 @@ def main() -> None:
         raise SystemExit("metric selection error(s): " + "; ".join(_errs)
                          + f". Available metrics: {_avail_metrics()}")
     active_metric_names = _metrics_sel.names()
+    # Gating handles (None at the default 'all' so gating is a literal no-op =>
+    # byte-identical). selected_obj_labels filters the ranking basket; active_filters
+    # gates which filters may drop designs.
+    _selected_obj_labels = (None if _metrics_is_all
+                            else frozenset(_metrics_sel.objective_labels()))
+    _active_filters = (None if _filters_is_all
+                       else frozenset(_filters_sel.names()))
+    # Publish the gating selections as module globals for the stage/worker/helper
+    # functions (None at the defaults => byte-identical).
+    global _RANKING_LABEL_FILTER, _ACTIVE_FILTERS
+    _RANKING_LABEL_FILTER = _selected_obj_labels
+    _ACTIVE_FILTERS = _active_filters
+    # Optional-stage gating: skip the whole tunnel stage only if NEITHER 'tunnel'
+    # nor 'pkvf' is selected (they share stage_tunnel_metrics; we can't partially
+    # skip within the stage). At --metrics all both are selected, so this is exactly
+    # args.tunnel_metrics (byte-identical). Deselecting only 'pkvf' still computes it
+    # but drops it from ranking; to skip the stage, deselect both.
+    _tunnel_selected = ("tunnel" in active_metric_names) or ("pkvf" in active_metric_names)
+    _tunnel_metrics_enabled = bool(args.tunnel_metrics) and _tunnel_selected
+    if args.tunnel_metrics and not _tunnel_metrics_enabled:
+        LOGGER.info("metric selection: tunnel stage SKIPPED (neither 'tunnel' nor "
+                    "'pkvf' selected)")
     LOGGER.info(
         "metric selection: metrics=%r -> %d active %s | filters=%r -> %d gating %s",
         args.metrics, len(active_metric_names), active_metric_names,
@@ -5294,7 +5364,7 @@ def main() -> None:
             n_term_pad=args.n_term_pad,
             c_term_pad=args.c_term_pad,
             omit_M_at_pos1=not args.no_omit_M_at_pos1,
-            tunnel_metrics_enabled=args.tunnel_metrics,
+            tunnel_metrics_enabled=_tunnel_metrics_enabled,
             tunnel_hard_gate=args.tunnel_hard_gate,
             ligand_min_radius=ligand_geometry_summary.get("min_projected_radius"),
             ligand_resname=ligand_geometry_summary.get("ligand_resname"),
@@ -5325,6 +5395,7 @@ def main() -> None:
                 from protein_chisel.scoring.multi_objective import (
                     DEFAULT_METRIC_SPECS, apply_cli_overrides,
                     compute_topsis_scores_v2, parse_kv_string,
+                    select_specs_by_label,
                 )
                 cycle_specs = apply_cli_overrides(
                     DEFAULT_METRIC_SPECS,
@@ -5332,6 +5403,7 @@ def main() -> None:
                      **cyc.topsis_weight_overrides},
                     parse_kv_string(args.rank_targets),
                 )
+                cycle_specs = select_specs_by_label(cycle_specs, _selected_obj_labels)
                 cyc_scores, _used, _dbg = compute_topsis_scores_v2(
                     ranked_df, cycle_specs,
                 )
@@ -5475,7 +5547,8 @@ def main() -> None:
             else pd.Series([float("nan")] * len(pool_prefilter), index=pool_prefilter.index)
         )
         pass_mask = pd.Series([True] * len(pool_prefilter), index=pool_prefilter.index)
-        if "fpocket__druggability" in pool_prefilter.columns and druggability_min > 0:
+        if ("fpocket__druggability" in pool_prefilter.columns and druggability_min > 0
+                and _filter_active("fpocket")):
             pass_mask = fpocket_druggability >= druggability_min
             LOGGER.info(
                 "fpocket-druggability filter: %d -> %d (cutoff=%.2f)",
@@ -5488,11 +5561,12 @@ def main() -> None:
         # written as `legacy_rank_score` for back-compat / debugging.
         from protein_chisel.scoring.multi_objective import (
             DEFAULT_METRIC_SPECS, apply_cli_overrides, compute_topsis_scores_v2,
-            parse_kv_string, select_diverse_topk_two_axis,
+            parse_kv_string, select_diverse_topk_two_axis, select_specs_by_label,
         )
         active_specs = apply_cli_overrides(
             DEFAULT_METRIC_SPECS, rank_weights, rank_targets,
         )
+        active_specs = select_specs_by_label(active_specs, _selected_obj_labels)
         scores, used_specs, _debug = compute_topsis_scores_v2(
             pool_prefilter, active_specs,
         )
@@ -5504,11 +5578,16 @@ def main() -> None:
         )
         pool_prefilter["selection__hard_final_filter_passed"] = pass_mask.astype(bool)
         if druggability_min > 0 and "fpocket__druggability" in pool_prefilter.columns:
-            pool_prefilter["selection__fpocket_gap"] = np.where(
-                fpocket_druggability.notna(),
-                np.maximum(0.0, float(druggability_min) - fpocket_druggability),
-                np.inf,
-            )
+            if _filter_active("fpocket"):
+                pool_prefilter["selection__fpocket_gap"] = np.where(
+                    fpocket_druggability.notna(),
+                    np.maximum(0.0, float(druggability_min) - fpocket_druggability),
+                    np.inf,
+                )
+            else:
+                # fpocket filter deselected (--filters): no druggability penalty
+                # in the backfill ordering either.
+                pool_prefilter["selection__fpocket_gap"] = 0.0
         else:
             pool_prefilter["selection__fpocket_gap"] = 0.0
 
@@ -5615,7 +5694,7 @@ def main() -> None:
                     clash_filter=final_cycle_cfg.clash_filter,
                     clash_severe_distance=final_cycle_cfg.clash_severe_distance,
                     seed_dfi_metrics=seed_dfi_metrics,
-                    tunnel_metrics_enabled=args.tunnel_metrics,
+                    tunnel_metrics_enabled=_tunnel_metrics_enabled,
                     ligand_min_radius=ligand_geometry_summary.get("min_projected_radius"),
                     ligand_resname=ligand_geometry_summary.get("ligand_resname"),
                     log_probs_esmc=log_probs_esmc,
@@ -5803,7 +5882,7 @@ def main() -> None:
                 clash_filter=final_cycle_cfg.clash_filter,
                 clash_severe_distance=final_cycle_cfg.clash_severe_distance,
                 seed_dfi_metrics=seed_dfi_metrics,
-                tunnel_metrics_enabled=args.tunnel_metrics,
+                tunnel_metrics_enabled=_tunnel_metrics_enabled,
                 ligand_min_radius=ligand_geometry_summary.get("min_projected_radius"),
                 ligand_resname=ligand_geometry_summary.get("ligand_resname"),
                 log_probs_esmc=log_probs_esmc,
@@ -5892,7 +5971,7 @@ def main() -> None:
                 clash_severe_distance=final_cycle_cfg.clash_severe_distance,
                 sap_max_threshold=final_cycle_cfg.sap_max_threshold,
                 seed_dfi_metrics=seed_dfi_metrics,
-                tunnel_metrics_enabled=args.tunnel_metrics,
+                tunnel_metrics_enabled=_tunnel_metrics_enabled,
                 ligand_min_radius=ligand_geometry_summary.get("min_projected_radius"),
                 ligand_resname=ligand_geometry_summary.get("ligand_resname"),
                 log_probs_esmc=log_probs_esmc,
@@ -5989,7 +6068,7 @@ def main() -> None:
                 clash_filter=final_cycle_cfg.clash_filter,
                 clash_severe_distance=final_cycle_cfg.clash_severe_distance,
                 seed_dfi_metrics=seed_dfi_metrics,
-                tunnel_metrics_enabled=args.tunnel_metrics,
+                tunnel_metrics_enabled=_tunnel_metrics_enabled,
                 ligand_min_radius=ligand_geometry_summary.get("min_projected_radius"),
                 ligand_resname=ligand_geometry_summary.get("ligand_resname"),
                 log_probs_esmc=log_probs_esmc,
@@ -6128,7 +6207,7 @@ def main() -> None:
                     clash_filter=final_cycle_cfg.clash_filter,
                     clash_severe_distance=final_cycle_cfg.clash_severe_distance,
                     seed_dfi_metrics=seed_dfi_metrics,
-                    tunnel_metrics_enabled=args.tunnel_metrics,
+                    tunnel_metrics_enabled=_tunnel_metrics_enabled,
                     ligand_min_radius=ligand_geometry_summary.get("min_projected_radius"),
                     ligand_resname=ligand_geometry_summary.get("ligand_resname"),
                     log_probs_esmc=log_probs_esmc,
@@ -6199,7 +6278,7 @@ def main() -> None:
                     clash_severe_distance=final_cycle_cfg.clash_severe_distance,
                     sap_max_threshold=final_cycle_cfg.sap_max_threshold,
                     seed_dfi_metrics=seed_dfi_metrics,
-                    tunnel_metrics_enabled=args.tunnel_metrics,
+                    tunnel_metrics_enabled=_tunnel_metrics_enabled,
                     ligand_min_radius=ligand_geometry_summary.get("min_projected_radius"),
                     ligand_resname=ligand_geometry_summary.get("ligand_resname"),
                     log_probs_esmc=log_probs_esmc,

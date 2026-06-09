@@ -102,3 +102,40 @@ def test_rejects_bad_direction_and_missing_column():
         topsis_pareto_rank(df, [Objective("fitness", "sideways")])
     with pytest.raises(ValueError):
         topsis_pareto_rank(df, [])
+
+
+# ---- select_specs_by_label (--metrics objective gating) ------------------
+def test_select_specs_by_label_none_is_identity():
+    from protein_chisel.scoring.multi_objective import (
+        DEFAULT_METRIC_SPECS, select_specs_by_label,
+    )
+    out = select_specs_by_label(DEFAULT_METRIC_SPECS, None)
+    assert [s.label for s in out] == [s.label for s in DEFAULT_METRIC_SPECS]
+
+
+def test_select_specs_by_label_all_labels_is_identity_with_order():
+    from protein_chisel.scoring.multi_objective import (
+        DEFAULT_METRIC_SPECS, select_specs_by_label,
+    )
+    labels = [s.label for s in DEFAULT_METRIC_SPECS]
+    out = select_specs_by_label(DEFAULT_METRIC_SPECS, labels)
+    assert [s.label for s in out] == labels   # default --metrics all => byte-identical
+
+
+def test_select_specs_by_label_subset_and_empty():
+    from protein_chisel.scoring.multi_objective import (
+        DEFAULT_METRIC_SPECS, select_specs_by_label,
+    )
+    out = select_specs_by_label(DEFAULT_METRIC_SPECS, {"fitness", "druggability"})
+    assert [s.label for s in out] == ["fitness", "druggability"]   # canonical order
+    assert select_specs_by_label(DEFAULT_METRIC_SPECS, set()) == []
+
+
+def test_select_specs_by_label_matches_column_too():
+    from protein_chisel.scoring.multi_objective import (
+        MetricSpec, select_specs_by_label,
+    )
+    # a spec whose label defaults to its column should match by column name
+    specs = [MetricSpec("foo__x", "max", 1.0)]   # label == column
+    assert select_specs_by_label(specs, {"foo__x"}) == specs
+    assert select_specs_by_label(specs, {"other"}) == []
