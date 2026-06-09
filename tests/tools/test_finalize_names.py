@@ -63,15 +63,16 @@ def test_rank_order_and_keep_stem(tmp_path):
                      ["pte_FS014_chisel_154", "pte_FS014_chisel_28", "pte_FS014_chisel_7"],
                      ["pte_FS014_chisel_28", "pte_FS014_chisel_154", "pte_FS014_chisel_7"])
     out = finalize_design_names(root)
-    assert out["status"] == "ok" and out["renamed"] == 3 and out["width"] == 2
+    # 3 designs -> indices 0..2 -> single digit (max index 2, never chisel_10).
+    assert out["status"] == "ok" and out["renamed"] == 3 and out["width"] == 1
     names = sorted(p.name for p in root.glob("*.pdb"))
-    assert names == ["input.pdb", "pte_FS014_chisel_00.pdb",
-                     "pte_FS014_chisel_01.pdb", "pte_FS014_chisel_02.pdb"]
+    assert names == ["input.pdb", "pte_FS014_chisel_0.pdb",
+                     "pte_FS014_chisel_1.pdb", "pte_FS014_chisel_2.pdb"]
     # rank 0 (best) == the design that was ranked first in the TSV (lmpnn 28)
     rows = _ids_in_tsv(root)
     design = [r for r in rows if r["is_input"] != "True"]
-    assert design[0]["id"] == "pte_FS014_chisel_00"
-    assert Path(design[0]["pdb_path"]).name == "pte_FS014_chisel_00.pdb"
+    assert design[0]["id"] == "pte_FS014_chisel_0"
+    assert Path(design[0]["pdb_path"]).name == "pte_FS014_chisel_0.pdb"
 
 
 def test_input_reference_untouched(tmp_path):
@@ -85,32 +86,32 @@ def test_input_reference_untouched(tmp_path):
 
 
 def test_collision_safe_swap(tmp_path):
-    # Source names collide with target ranks: 'a_chisel_01' is ranked best (->00),
-    # 'a_chisel_00' is ranked worst (->01). In-place rename would clash; fresh-dir
-    # swap must not lose/clobber either.
-    root = _make_run(tmp_path, ["a_chisel_00", "a_chisel_01"],
-                     ["a_chisel_01", "a_chisel_00"])
+    # 2 designs -> width 1, targets a_chisel_0 / a_chisel_1. Source names collide
+    # with the ranks: 'a_chisel_1' is ranked best (->0), 'a_chisel_0' is ranked
+    # worst (->1). In-place rename would clash; fresh-dir swap must not lose/clobber.
+    root = _make_run(tmp_path, ["a_chisel_0", "a_chisel_1"],
+                     ["a_chisel_1", "a_chisel_0"])
     # tag bodies so we can verify content didn't get clobbered/swapped wrongly
-    (root / "a_chisel_01.pdb").write_text(_pdb_text() + "REMARK TAG best\n")
-    (root / "a_chisel_00.pdb").write_text(_pdb_text() + "REMARK TAG worst\n")
+    (root / "a_chisel_1.pdb").write_text(_pdb_text() + "REMARK TAG best\n")
+    (root / "a_chisel_0.pdb").write_text(_pdb_text() + "REMARK TAG worst\n")
     finalize_design_names(root)
     names = sorted(p.name for p in root.glob("*.pdb"))
-    assert names == ["a_chisel_00.pdb", "a_chisel_01.pdb", "input.pdb"]
-    # rank0 file (a_chisel_00) must carry the 'best' tag (was source a_chisel_01)
-    assert "REMARK TAG best" in (root / "a_chisel_00.pdb").read_text()
-    assert "REMARK TAG worst" in (root / "a_chisel_01.pdb").read_text()
+    assert names == ["a_chisel_0.pdb", "a_chisel_1.pdb", "input.pdb"]
+    # rank0 file (a_chisel_0) must carry the 'best' tag (was source a_chisel_1)
+    assert "REMARK TAG best" in (root / "a_chisel_0.pdb").read_text()
+    assert "REMARK TAG worst" in (root / "a_chisel_1.pdb").read_text()
 
 
 def test_design_path_collapsed(tmp_path):
     root = _make_run(tmp_path, ["x_chisel_5"], ["x_chisel_5"])
     finalize_design_names(root)
-    txt = (root / "x_chisel_00.pdb").read_text()
+    txt = (root / "x_chisel_0.pdb").read_text()   # 1 design -> width 1
     assert "DESIGN_PATH iterative_design" not in txt
     assert "DESIGN_PATH protonate_topk" not in txt
     import os
     dp = [l for l in txt.splitlines() if l.startswith("REMARK DESIGN_PATH chisel_iterative_design output")]
     assert len(dp) == 1
-    assert dp[0].endswith(os.path.abspath(str(root / "x_chisel_00.pdb")))
+    assert dp[0].endswith(os.path.abspath(str(root / "x_chisel_0.pdb")))
     # upstream chain + other REMARKs preserved
     for keep in ("DESIGN_PATH rfd3 input", "DESIGN_PATH predesign_cart_relax",
                  "DESIGN_PATH chisel_ligandmpnn", "REMARK 665", "REMARK 666",
@@ -121,7 +122,7 @@ def test_design_path_collapsed(tmp_path):
 def test_keep_intermediate_flag(tmp_path):
     root = _make_run(tmp_path, ["x_chisel_5"], ["x_chisel_5"])
     finalize_design_names(root, keep_intermediate=True)
-    txt = (root / "x_chisel_00.pdb").read_text()
+    txt = (root / "x_chisel_0.pdb").read_text()   # 1 design -> width 1
     assert "DESIGN_PATH iterative_design" in txt
     assert "DESIGN_PATH protonate_topk" in txt
     assert "DESIGN_PATH chisel_iterative_design output" in txt
@@ -153,12 +154,44 @@ def test_width_two_digits(tmp_path):
     assert (root / "y_chisel_00.pdb").exists() and (root / "y_chisel_11.pdb").exists()
 
 
-def test_width_three_digits_at_100(tmp_path):
-    names = [f"y_chisel_{i}" for i in range(100)]  # 100 designs -> count-width 3
+def test_width_one_digit_at_ten(tmp_path):
+    # 10 designs -> indices 0..9; max index is 9 so a single digit suffices. We
+    # never emit chisel_10, so the count crossing 10 must NOT bump the padding.
+    names = [f"z_chisel_{i}" for i in range(10)]
+    root = _make_run(tmp_path, names, names)
+    out = finalize_design_names(root)
+    assert out["width"] == 1
+    assert (root / "z_chisel_0.pdb").exists() and (root / "z_chisel_9.pdb").exists()
+    assert not (root / "z_chisel_00.pdb").exists()
+
+
+def test_width_bumps_to_two_at_eleven(tmp_path):
+    # 11 designs -> indices 0..10; chisel_10 needs 2 digits, so all become 2.
+    names = [f"z_chisel_{i}" for i in range(11)]
+    root = _make_run(tmp_path, names, names)
+    out = finalize_design_names(root)
+    assert out["width"] == 2
+    assert (root / "z_chisel_00.pdb").exists() and (root / "z_chisel_10.pdb").exists()
+
+
+def test_width_no_bump_at_100(tmp_path):
+    # 100 designs -> indices 0..99, all 2-digit. Count is 3-digit but the largest
+    # index is only 99, so padding must stay at 2 (no over-pad to chisel_099).
+    names = [f"y_chisel_{i}" for i in range(100)]
+    root = _make_run(tmp_path, names, names)
+    out = finalize_design_names(root)
+    assert out["width"] == 2
+    assert (root / "y_chisel_00.pdb").exists() and (root / "y_chisel_99.pdb").exists()
+    assert not (root / "y_chisel_000.pdb").exists()
+
+
+def test_width_bumps_to_three_at_101(tmp_path):
+    # 101 designs -> indices 0..100; chisel_100 needs 3 digits, so all become 3.
+    names = [f"y_chisel_{i}" for i in range(101)]
     root = _make_run(tmp_path, names, names)
     out = finalize_design_names(root)
     assert out["width"] == 3
-    assert (root / "y_chisel_000.pdb").exists() and (root / "y_chisel_099.pdb").exists()
+    assert (root / "y_chisel_000.pdb").exists() and (root / "y_chisel_100.pdb").exists()
 
 
 def test_partial_swap_failure_no_data_loss(tmp_path, monkeypatch):

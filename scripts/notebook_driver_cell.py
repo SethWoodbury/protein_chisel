@@ -8,9 +8,10 @@ section 1 + the ligand .params file in section 2 for your scaffold.
 After all jobs land, every output dir contains EXACTLY:
 
     <output_base>/<seed_stem>/
-        ├── <seed_stem>_chisel_001.pdb       (50 PDBs, fully hydrogenated,
-        ├── <seed_stem>_chisel_005.pdb        REMARK 666 + REMARK 668)
-        ├── ... (~48-50 .pdb files)
+        ├── <seed_stem>_chisel_00.pdb        (50 PDBs, fully hydrogenated,
+        ├── <seed_stem>_chisel_01.pdb         REMARK 666 + REMARK 668; rank 0 =
+        ├── ... (~48-50 .pdb files)            best, 0-indexed, padded to the
+                                               widest index — 50 PDBs -> 2 digits)
         └── chiseled_design_metrics.tsv      (50 rows × ~150 cols, with
                                               embedded RUN_META JSON
                                               as first comment line)

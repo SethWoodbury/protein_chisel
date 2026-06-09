@@ -115,7 +115,11 @@ def finalize_design_names(
             f"finalize: design PDB for id={df.loc[design_idx[0]].get('id')!r} not found")
     designs_dir = first.parent                       # logical (keeps /net vs /mnt)
     designs_real = os.path.realpath(str(designs_dir))
-    width = max(2, len(str(n)))                       # pad to the count's digit width
+    # Pad to the digit width of the LARGEST 0-based index (n-1), not the count.
+    # Indices run 0..n-1, so the width grows only when an index itself crosses a
+    # power of ten: 10 designs -> chisel_0..9 (1 digit, never chisel_10),
+    # 11 -> chisel_00..10 (2), 100 -> chisel_00..99 (2), 101 -> chisel_000..100 (3).
+    width = len(str(n - 1))                           # n >= 1 here (early-return at 0)
 
     # ---- Preflight: build + validate the full plan BEFORE touching any file ----
     plan: list[tuple[int, Path, str, str]] = []      # (df_index, old, new_name, new_id)
