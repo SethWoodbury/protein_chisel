@@ -77,6 +77,10 @@ def test_build_command_core_flags():
     assert "--bias_AA_per_residue_multi /tmp/bias.json" in s
     assert "--omit_AA_per_residue_multi /tmp/omit.json" in s
     assert "--fixed_residues_multi /tmp/fixed.json" in s
+    # packing defaults match the in-driver sampler (PDBs out, catalytic rotamers kept)
+    assert "--pack_side_chains 1" in s
+    assert "--repack_everything 0" in s
+    assert "--packed_suffix _packed" in s
 
 
 def test_build_command_multi_expert_joins_with_commas():

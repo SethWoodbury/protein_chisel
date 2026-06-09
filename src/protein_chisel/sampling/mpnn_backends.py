@@ -102,6 +102,10 @@ def build_poe_command(
     seed: int = 0,
     use_atom_context: int = 1,
     use_side_chain_context: int = 0,
+    pack_side_chains: int = 1,
+    repack_everything: int = 0,
+    number_of_packs_per_design: int = 1,
+    packed_suffix: str = "_packed",
     hermes_probs: Optional[Union[str, Path]] = None,
     file_ending: str = "",
     sif: Union[str, Path] = paths.POE_MPNN_SIF,
@@ -132,6 +136,13 @@ def build_poe_command(
         "--seed", str(int(seed)),
         "--ligand_mpnn_use_atom_context", str(int(use_atom_context)),
         "--ligand_mpnn_use_side_chain_context", str(int(use_side_chain_context)),
+        # Pack side chains so the PoE stage emits scoreable PDBs; repack_everything=0
+        # keeps catalytic/fixed rotamers intact (matches the in-driver sampler, which
+        # uses pack_side_chains=1, repack_everything=0 — critical for enzyme actives).
+        "--pack_side_chains", str(int(pack_side_chains)),
+        "--repack_everything", str(int(repack_everything)),
+        "--number_of_packs_per_design", str(int(number_of_packs_per_design)),
+        "--packed_suffix", str(packed_suffix),
     ]
     if experts:
         cmd += ["--additional_experts", ",".join(experts),
