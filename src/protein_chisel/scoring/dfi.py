@@ -163,7 +163,11 @@ def compute_dfi(
                 class_per_row = []
             else:
                 class_per_row = list(classes)
-        for cls in set(c for c in class_per_row if c and c != "?"):
+        # sorted() — iterating a raw set of class-name strings makes the
+        # per-class key insertion order (and hence the dfi__mean__<class> /
+        # dfi__std__<class> TSV column order) depend on PYTHONHASHSEED, i.e.
+        # nondeterministic run-to-run. Sort so the schema is reproducible.
+        for cls in sorted(set(c for c in class_per_row if c and c != "?")):
             mask = np.array([c == cls for c in class_per_row])
             if mask.sum() == 0:
                 continue

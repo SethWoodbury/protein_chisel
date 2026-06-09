@@ -4,6 +4,10 @@
 # Used by test_catalog_covers_real_columns to keep the metric catalog faithful
 # to the pipeline's actual output. Regenerate from a fresh baseline if the
 # default TSV schema legitimately changes.
+# NOTE: the dfi__mean__<class> / dfi__std__<class> per-class columns are listed in
+# SORTED class order (distal_buried, distal_surface, nearby_surface, primary_sphere,
+# secondary_sphere) — scoring/dfi.py now sorts the classes so this order is
+# deterministic (previously it varied with PYTHONHASHSEED).
 id
 sequence
 parent_design_id
@@ -104,15 +108,15 @@ dfi__max
 dfi__min
 dfi__elapsed_ms
 dfi__mean__distal_buried
-dfi__mean__secondary_sphere
-dfi__mean__primary_sphere
 dfi__mean__distal_surface
 dfi__mean__nearby_surface
+dfi__mean__primary_sphere
+dfi__mean__secondary_sphere
 dfi__std__distal_buried
-dfi__std__secondary_sphere
-dfi__std__primary_sphere
 dfi__std__distal_surface
 dfi__std__nearby_surface
+dfi__std__primary_sphere
+dfi__std__secondary_sphere
 passed_struct_filter
 struct_fail
 tunnel__best_cone_mean_path
