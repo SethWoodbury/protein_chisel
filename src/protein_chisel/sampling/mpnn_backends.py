@@ -178,9 +178,76 @@ def load_poe_candidates(fasta_path: Union[str, Path]) -> List[Tuple[str, str, di
     return _parse_output_fasta(Path(fasta_path))
 
 
+def poe_sampler_params_hash(
+    experts: Sequence[str], lambdas: Sequence[float], *,
+    checkpoint: str = DEFAULT_POE_LIGAND_CHECKPOINT, temperature: float = 0.1,
+) -> str:
+    """Stable 12-char hash of the PoE sampling config, for the candidate
+    ``sampler_params_hash`` provenance column."""
+    import hashlib
+    import json
+    payload = {
+        "backend": "poe", "experts": list(experts),
+        "lambdas": [float(x) for x in lambdas],
+        "checkpoint": str(checkpoint), "temperature": float(temperature),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:12]
+
+
+def candidate_set_from_poe_dir(
+    poe_out_dir: Union[str, Path],
+    pdb_stem: str,
+    *,
+    parent_design_id: Optional[str] = None,
+    experts: Sequence[str] = (),
+    lambdas: Sequence[float] = (),
+    checkpoint: str = DEFAULT_POE_LIGAND_CHECKPOINT,
+    temperature: float = 0.1,
+    file_ending: str = "",
+):
+    """Build a :class:`CandidateSet` from a PoE output dir, identical in shape to
+    ``sample_with_ligand_mpnn``'s — so the driver's restore/filter/score/rank
+    stages consume it UNCHANGED.
+
+    The PoE output (``seqs/<stem>.fa`` + ``packed/<stem>_packed_<idx>_1.pdb``) is
+    structurally identical to our in-driver sampler's output, including the packed
+    PDB naming that ``pdb_restoration.restore_sample_dir`` expects. Candidate ids
+    keep the ``<stem>_lmpnn_<NNN>`` form (idx 0 = the WT input header) so that
+    restoration maps ``_lmpnn_<idx>`` → ``_packed_<idx>_1.pdb`` and the final
+    ``_lmpnn_``→``_chisel_`` rename both work. The ``sampler`` column records
+    ``"fused_mpnn_poe"`` for provenance.
+
+    Raises ``RuntimeError`` if the PoE FASTA is missing/empty.
+    """
+    import pandas as pd
+    from protein_chisel.tools.ligand_mpnn import CandidateSet
+
+    fasta = poe_output_fasta(poe_out_dir, pdb_stem, file_ending=file_ending)
+    parsed = load_poe_candidates(fasta)
+    if not parsed:
+        raise RuntimeError(
+            f"PoE produced no sequences. Expected {fasta} (did the host PoE stage "
+            "run + write seqs/?).")
+    phash = poe_sampler_params_hash(experts, lambdas, checkpoint=checkpoint,
+                                    temperature=temperature)
+    rows: List[dict] = []
+    for i, (header, seq, meta) in enumerate(parsed):
+        rows.append({
+            "id": f"{pdb_stem}_lmpnn_{i:03d}",          # keep _lmpnn_ for restore+rename
+            "sequence": seq.replace("/", ""),
+            "parent_design_id": parent_design_id or pdb_stem,
+            "sampler": "fused_mpnn_poe",
+            "sampler_params_hash": phash,
+            "is_input": (i == 0),
+            "header": header,
+            **{f"mpnn_{k}": v for k, v in meta.items()},
+        })
+    return CandidateSet(df=pd.DataFrame(rows))
+
+
 __all__ = [
     "SUPPORTED_POE_EXPERTS", "DEFAULT_POE_LIGAND_CHECKPOINT",
     "BACKEND_BIAS", "BACKEND_POE", "MPNN_BACKENDS",
     "validate_expert_lambdas", "build_poe_command", "poe_output_fasta",
-    "load_poe_candidates",
+    "load_poe_candidates", "poe_sampler_params_hash", "candidate_set_from_poe_dir",
 ]

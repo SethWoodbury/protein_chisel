@@ -147,3 +147,52 @@ def test_load_poe_candidates_missing_file(tmp_path):
 
 def test_backend_constants():
     assert BACKEND_BIAS == "bias" and BACKEND_POE == "poe"
+
+
+# ---- candidate_set_from_poe_dir + sampler hash --------------------------
+def _make_poe_dir(tmp_path, stem):
+    seqs = tmp_path / "seqs"
+    seqs.mkdir(parents=True)
+    (seqs / f"{stem}.fa").write_text(
+        f">{stem}, T=0.1, seed=42, num_res=5, num_ligand_res=3\nMKLVA\n"
+        f">{stem}, id=1, T=0.1, seed=42, overall_confidence=0.5, seq_rec=0.7\nMKLVC\n"
+        f">{stem}, id=2, T=0.1, seed=42, overall_confidence=0.4, seq_rec=0.6\nMKLVD\n"
+    )
+    return tmp_path
+
+
+def test_candidate_set_from_poe_dir_shape(tmp_path):
+    from protein_chisel.sampling.mpnn_backends import candidate_set_from_poe_dir
+    stem = "pte_seed"
+    _make_poe_dir(tmp_path, stem)
+    cset = candidate_set_from_poe_dir(
+        tmp_path, stem, parent_design_id="run0", experts=["esm"], lambdas=[0.2])
+    df = cset.df
+    assert len(df) == 3                                    # WT input + 2 designs
+    # ids keep the _lmpnn_ form (so restore_sample_dir + rename work)
+    assert list(df["id"]) == [f"{stem}_lmpnn_000", f"{stem}_lmpnn_001",
+                              f"{stem}_lmpnn_002"]
+    assert bool(df.iloc[0]["is_input"]) is True
+    assert bool(df.iloc[1]["is_input"]) is False
+    assert list(df["sampler"]) == ["fused_mpnn_poe"] * 3   # provenance tag
+    assert df.iloc[1]["sequence"] == "MKLVC"
+    # parsed header fields surfaced as mpnn_* columns
+    assert "mpnn_seq_rec" in df.columns and df.iloc[1]["mpnn_seq_rec"] == 0.7
+    # restore mapping: _lmpnn_001 -> packed _packed_1_1.pdb (idx parity), checked by
+    # construction (idx 1 design). All rows share one sampler_params_hash.
+    assert df["sampler_params_hash"].nunique() == 1
+
+
+def test_candidate_set_from_poe_dir_missing_fasta_raises(tmp_path):
+    from protein_chisel.sampling.mpnn_backends import candidate_set_from_poe_dir
+    (tmp_path / "seqs").mkdir()
+    with pytest.raises(RuntimeError, match="no sequences"):
+        candidate_set_from_poe_dir(tmp_path, "nope", experts=["esm"], lambdas=[0.2])
+
+
+def test_poe_sampler_params_hash_stable_and_sensitive():
+    from protein_chisel.sampling.mpnn_backends import poe_sampler_params_hash
+    h1 = poe_sampler_params_hash(["esm"], [0.2])
+    h2 = poe_sampler_params_hash(["esm"], [0.2])
+    h3 = poe_sampler_params_hash(["esm"], [0.3])         # different lambda
+    assert h1 == h2 and h1 != h3 and len(h1) == 12
