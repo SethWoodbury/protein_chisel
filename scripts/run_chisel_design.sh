@@ -427,6 +427,18 @@ if [[ "$EXPERTS" != "esmc,saprot" ]]; then
     EXPERTS_CLI+=( --experts "$EXPERTS" )
 fi
 
+# Metric/filter registry selection (Phase 7). Default 'all' = today's full metric
+# set (byte-identical). Set e.g. METRICS=fitness,fpocket,sap to compute/report a
+# subset, FILTERS=instability,sap to restrict which filters may drop designs
+# (FILTERS must be a subset of METRICS). Only emitted as --metrics/--filters when
+# NON-default, so the default driver command is byte-identical. Driver-only (not
+# precompute).
+METRICS="${METRICS:-all}"
+FILTERS="${FILTERS:-all}"
+METRICS_CLI=()
+[[ "$METRICS" != "all" ]] && METRICS_CLI+=( --metrics "$METRICS" )
+[[ "$FILTERS" != "all" ]] && METRICS_CLI+=( --filters "$FILTERS" )
+
 # === Output base ====================================================
 # OUTPUT_DIR | WORK_ROOT (caller picks; WORK_ROOT remains the internal
 # variable). Top-level directory under which work_dir/ and run_dir/ get
@@ -679,6 +691,7 @@ apptainer exec "${NV_FLAGS[@]}" \
         ${ENHANCE:+--enhance "$ENHANCE"} \
         "${CONSERVE_CLI[@]}" \
         "${EXPERTS_CLI[@]}" \
+        "${METRICS_CLI[@]}" \
         ${EXTRA_DRIVER_FLAGS:-}
 
 # Stage 3 wrote run_dir's path into $WORK_DIR/run_dir.txt as soon as
