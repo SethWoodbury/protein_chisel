@@ -452,6 +452,10 @@ ADDITIONAL_EXPERTS="${ADDITIONAL_EXPERTS:-}"
 EXPERT_LAMBDAS="${EXPERT_LAMBDAS:-}"
 POE_NUM_DESIGNS="${POE_NUM_DESIGNS:-200}"
 POE_TEMPERATURE="${POE_TEMPERATURE:-0.1}"
+# Optional precomputed HERMES probabilities CSV (for ADDITIONAL_EXPERTS=hermes). If
+# unset, hermes runs on-the-fly from the in-container /hermes/trained_models weights
+# (Visani et al., Nourmohammad lab). Only used when 'hermes' is among the experts.
+POE_HERMES_PROBS="${POE_HERMES_PROBS:-}"
 if [[ "$MPNN_BACKEND" == "poe" ]]; then
     if [[ -z "$ADDITIONAL_EXPERTS" || -z "$EXPERT_LAMBDAS" ]]; then
         echo "ERROR: MPNN_BACKEND=poe requires ADDITIONAL_EXPERTS and EXPERT_LAMBDAS" >&2
@@ -758,6 +762,7 @@ if [[ "$MPNN_BACKEND" == "poe" ]]; then
             --fixed_json "$POE_INPUTS_DIR/fixed.json" \
             --omit_AA "$OMIT_AA" \
             --use_side_chain_context "$USE_SIDE_CHAIN_CONTEXT" \
+            ${POE_HERMES_PROBS:+--hermes_probs "$POE_HERMES_PROBS"} \
             --batch_size 1 --number_of_batches "$POE_NUM_DESIGNS" \
             --temperature "$POE_TEMPERATURE" > "$POE_CMD_FILE" || {
         echo "ERROR: PoE command build failed (poe_emit_command.py)" >&2; exit 3; }
