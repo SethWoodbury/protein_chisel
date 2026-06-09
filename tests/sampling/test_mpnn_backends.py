@@ -115,6 +115,18 @@ def test_build_command_length_mismatch_raises():
                           experts=["a", "b"], lambdas=[0.2])
 
 
+def test_build_command_forwards_global_omit_and_sc_context():
+    cmd = build_poe_command(pdb_path="x.pdb", out_folder="o", experts=["esm"],
+                            lambdas=[0.2], omit_AA="CX", use_side_chain_context=1)
+    s = " ".join(cmd)
+    assert "--omit_AA CX" in s                       # global composition constraint
+    assert "--ligand_mpnn_use_side_chain_context 1" in s
+    # default: no --omit_AA emitted (empty)
+    s0 = " ".join(build_poe_command(pdb_path="x.pdb", out_folder="o",
+                                    experts=["esm"], lambdas=[0.2]))
+    assert "--omit_AA" not in s0
+
+
 # ---- output path + FASTA loading ---------------------------------------
 def test_poe_output_fasta_path():
     p = poe_output_fasta("/out", "myseed", file_ending="")

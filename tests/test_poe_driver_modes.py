@@ -111,12 +111,38 @@ def test_emit_inputs_writes_jsons_and_exits(driver, tmp_path):
         bias = json.loads((emit / "bias.json").read_text())
         fixed = json.loads((emit / "fixed.json").read_text())
         omit = json.loads((emit / "omit.json").read_text())
-        # multi-format keyed by the resolved seed path
-        key = str((tmp_path / "seed.pdb").resolve())
+        # CRITICAL: keyed by the LITERAL seed path (what run.py gets as --pdb_path),
+        # NOT Path.resolve() — else symlinked /net->/mnt scratch KeyErrors run.py.
+        key = str(tmp_path / "seed.pdb")
         assert key in bias and key in fixed and key in omit
         # fixed residues -> ['A1','A3'] (sorted, chain-labeled)
         assert sorted(fixed[key]) == ["A1", "A3"]
         assert omit[key] == {"A2": "C"}
+    finally:
+        _reset(driver)
+
+
+def test_emit_inputs_keys_by_literal_not_resolved_path(driver, tmp_path):
+    # Regression for the 1b4606e bug class: on symlinked scratch the JSON key must be
+    # the literal --pdb_path the shell passes (un-resolved), NOT Path.resolve().
+    real = tmp_path / "real"; real.mkdir()
+    link = tmp_path / "net_scratch"; link.symlink_to(real)   # link != resolve(link)
+    seed = link / "seed.pdb"                                  # literal uses the symlink
+    emit = tmp_path / "poe_inputs"
+    L = 4
+    try:
+        driver._POE_EMIT_INPUTS_DIR = str(emit)
+        with pytest.raises(SystemExit):
+            driver.stage_sample(
+                cycle_cfg=driver.CycleConfig(cycle_idx=0), seed_pdb=seed,
+                bias=np.zeros((L, 20)), protein_resnos=list(range(1, L + 1)),
+                fixed_resnos={2}, out_dir=tmp_path / "01_sample")
+        import json
+        fixed = json.loads((emit / "fixed.json").read_text())
+        literal = str(seed)                  # contains 'net_scratch' (the symlink)
+        resolved = str(seed.resolve())       # contains 'real' (the target)
+        assert literal in fixed, "emit must key by the literal --pdb_path"
+        assert resolved not in fixed, "emit must NOT key by the resolved path"
     finally:
         _reset(driver)
 

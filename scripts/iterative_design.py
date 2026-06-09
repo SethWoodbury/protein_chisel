@@ -119,6 +119,7 @@ _POE_EMIT_INPUTS_DIR = None
 _POE_SAMPLE_DIR = None
 _POE_EXPERTS: tuple = ()
 _POE_LAMBDAS: tuple = ()
+_POE_TEMPERATURE = 0.1   # temperature the host PoE stage sampled at (provenance only)
 
 
 # Probabilistic conserved-sidechain-H-bond fixing (Feature 1) + canonical REMARK
@@ -823,7 +824,7 @@ def stage_sample(
             _POE_SAMPLE_DIR, seed_pdb.stem,
             parent_design_id=f"PTE_i1_poe_c{cycle_cfg.cycle_idx}",
             experts=_POE_EXPERTS, lambdas=_POE_LAMBDAS,
-            temperature=cycle_cfg.sampling_temperature,
+            temperature=_POE_TEMPERATURE,   # the temp PoE actually sampled at
         )
         cand_fasta = out_dir / "candidates.fasta"
         cand_tsv = out_dir / "candidates.tsv"
@@ -941,17 +942,28 @@ def stage_sample(
         )
         emit = Path(_POE_EMIT_INPUTS_DIR)
         emit.mkdir(parents=True, exist_ok=True)
+        # CRITICAL: key the JSONs by the LITERAL seed path that the host PoE run.py
+        # receives as --pdb_path (str(seed_pdb), NOT .resolve()). The shell passes the
+        # same raw $SEED_PDB to both the driver (--seed_pdb) and run.py (--pdb_path),
+        # and run.py looks up bias/fixed/omit by that verbatim string. On symlinked
+        # /net/scratch -> /mnt/net/scratch compute nodes, .resolve() rewrites the
+        # prefix => fixed_residues_multi[pdb] KeyErrors (crash) and bias/omit silently
+        # fall back to empty (PoE samples WITHOUT our calibrated bias). Same defect +
+        # fix as chisel_ligandMPNN @1b4606e. The _build_* helpers key by .resolve(), so
+        # re-key their single-entry dicts to the literal path here.
+        literal_key = str(seed_pdb)
+        _bias = _build_bias_per_residue_multi(seed_pdb, bias, chain, protein_resnos)
+        _fixed = _build_fixed_residues_multi(seed_pdb, sorted(set(fixed_resnos)), chain)
         (emit / "bias.json").write_text(json.dumps(
-            _build_bias_per_residue_multi(seed_pdb, bias, chain, protein_resnos),
-            indent=2))
+            {literal_key: next(iter(_bias.values()), {})}, indent=2))
         (emit / "fixed.json").write_text(json.dumps(
-            _build_fixed_residues_multi(seed_pdb, sorted(set(fixed_resnos)), chain),
-            indent=2))
+            {literal_key: next(iter(_fixed.values()), [])}, indent=2))
         (emit / "omit.json").write_text(json.dumps(
-            {str(Path(seed_pdb).resolve()): (omit_AA_per_residue or {})}, indent=2))
+            {literal_key: (omit_AA_per_residue or {})}, indent=2))
         LOGGER.info("PoE emit-inputs: wrote bias/fixed/omit JSONs -> %s "
-                    "(fixed=%d residues, omit=%d) — exiting (host PoE stage next)",
-                    emit, len(set(fixed_resnos)), len(omit_AA_per_residue or {}))
+                    "(key=%s, fixed=%d residues, omit=%d) — exiting (host PoE next)",
+                    emit, literal_key, len(set(fixed_resnos)),
+                    len(omit_AA_per_residue or {}))
         sys.exit(0)
 
     res = sample_with_ligand_mpnn(
@@ -4483,6 +4495,9 @@ def main() -> None:
     p.add_argument("--poe_output_dir", type=Path, default=None,
                    help="PoE internal: a finished host PoE output dir (seqs/+packed/) "
                         "to use as the candidate pool (score-only). Set by the shell.")
+    p.add_argument("--poe_temperature", type=float, default=0.1,
+                   help="PoE internal: the temperature the host PoE stage sampled at "
+                        "(recorded in the candidate sampler_params_hash). Set by shell.")
     p.add_argument("--position_table", type=Path, required=True)
     p.add_argument("--out_root", type=Path, default=DEFAULT_OUT_ROOT)
     p.add_argument("--run_dir_marker", type=Path, default=None,
@@ -5046,9 +5061,20 @@ def main() -> None:
     _ACTIVE_FILTERS = _active_filters
 
     # ---- PoE backend wiring (opt-in; default 'bias' leaves these inert) -------
-    global _POE_EMIT_INPUTS_DIR, _POE_SAMPLE_DIR, _POE_EXPERTS, _POE_LAMBDAS
+    global _POE_EMIT_INPUTS_DIR, _POE_SAMPLE_DIR, _POE_EXPERTS, _POE_LAMBDAS, _POE_TEMPERATURE
     _POE_EMIT_INPUTS_DIR = args.poe_emit_inputs
     _POE_SAMPLE_DIR = args.poe_output_dir
+    _POE_TEMPERATURE = args.poe_temperature
+    # Backend / mode must agree (avoid sampling with the wrong backend or mislabeling
+    # provenance): --poe_output_dir (score-only) <=> --mpnn_backend poe; and a poe run
+    # must be either emit-inputs or score-only.
+    if (args.poe_output_dir is not None) != (args.mpnn_backend == "poe"):
+        raise SystemExit("PoE: --poe_output_dir (score-only) and --mpnn_backend poe "
+                         "must be used together")
+    if args.mpnn_backend == "poe" and args.poe_output_dir is None \
+            and args.poe_emit_inputs is None:
+        raise SystemExit("--mpnn_backend poe needs --poe_output_dir (score-only) or "
+                         "--poe_emit_inputs (emit); the shell wrapper sets these")
     if args.additional_experts:
         from protein_chisel.sampling.mpnn_backends import validate_expert_lambdas
         _exp, _lam = validate_expert_lambdas(
@@ -5063,8 +5089,9 @@ def main() -> None:
                     "host PoE stage and exit at the first stage_sample.")
     if args.poe_output_dir is not None:
         LOGGER.info("PoE score-only mode: candidate pool from %s "
-                    "(experts=%s lambdas=%s); forcing a single cycle.",
-                    args.poe_output_dir, list(_POE_EXPERTS), list(_POE_LAMBDAS))
+                    "(experts=%s lambdas=%s temp=%.3f); forcing a single cycle.",
+                    args.poe_output_dir, list(_POE_EXPERTS), list(_POE_LAMBDAS),
+                    _POE_TEMPERATURE)
     # Optional-stage gating: skip the whole tunnel stage only if NEITHER 'tunnel'
     # nor 'pkvf' is selected (they share stage_tunnel_metrics; we can't partially
     # skip within the stage). At --metrics all both are selected, so this is exactly

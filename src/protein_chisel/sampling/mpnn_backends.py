@@ -102,6 +102,7 @@ def build_poe_command(
     seed: int = 0,
     use_atom_context: int = 1,
     use_side_chain_context: int = 0,
+    omit_AA: str = "",
     pack_side_chains: int = 1,
     repack_everything: int = 0,
     number_of_packs_per_design: int = 1,
@@ -144,6 +145,10 @@ def build_poe_command(
         "--number_of_packs_per_design", str(int(number_of_packs_per_design)),
         "--packed_suffix", str(packed_suffix),
     ]
+    if omit_AA:
+        # Global AAs MPNN never samples (e.g. "CX" = no Cys/unknown) — forward the
+        # pipeline's OMIT_AA so PoE enforces the same composition constraint.
+        cmd += ["--omit_AA", str(omit_AA)]
     if experts:
         cmd += ["--additional_experts", ",".join(experts),
                 "--additional_expert_lambdas", ",".join(str(x) for x in lambdas)]

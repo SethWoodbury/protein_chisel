@@ -39,6 +39,7 @@ def main() -> None:
     ap.add_argument("--seed_int", type=int, default=0)
     ap.add_argument("--use_atom_context", type=int, default=1)
     ap.add_argument("--use_side_chain_context", type=int, default=0)
+    ap.add_argument("--omit_AA", default="", help="global omit AAs, e.g. 'CX'")
     ap.add_argument("--hermes_probs", default=None)
     a = ap.parse_args()
 
@@ -50,7 +51,7 @@ def main() -> None:
         checkpoint=a.checkpoint, batch_size=a.batch_size,
         number_of_batches=a.number_of_batches, temperature=a.temperature,
         seed=a.seed_int, use_atom_context=a.use_atom_context,
-        use_side_chain_context=a.use_side_chain_context,
+        use_side_chain_context=a.use_side_chain_context, omit_AA=a.omit_AA,
         hermes_probs=a.hermes_probs,
     )
     # NUL-terminate each token so the shell can `mapfile -d ''` it safely

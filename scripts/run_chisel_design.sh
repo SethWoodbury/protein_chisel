@@ -735,11 +735,14 @@ if [[ "$MPNN_BACKEND" == "poe" ]]; then
     mkdir -p "$POE_INPUTS_DIR" "$POE_OUT_DIR"
     echo "###  PoE 3a: emit cycle-0 bias/fixed/omit JSONs (driver, in $STAGE3_SIF) ###"
     run_stage3_driver --poe_emit_inputs "$POE_INPUTS_DIR"
-    echo "###  PoE 3b: host PoE sampling (poe_mpnn.sif) experts=$ADDITIONAL_EXPERTS lambdas=$EXPERT_LAMBDAS pool=$POE_NUM_DESIGNS ###"
-    POE_NBATCH=$(( (POE_NUM_DESIGNS + 9) / 10 ))
+    POE_NBATCH=$(( (POE_NUM_DESIGNS + 9) / 10 ))   # batch_size 10; rounds UP to a
+    POE_ACTUAL=$(( POE_NBATCH * 10 ))              # multiple of 10 (over-provisions)
+    echo "###  PoE 3b: host PoE sampling (poe_mpnn.sif) experts=$ADDITIONAL_EXPERTS lambdas=$EXPERT_LAMBDAS pool=$POE_NUM_DESIGNS->$POE_ACTUAL omit_AA=$OMIT_AA ###"
     # Build the host PoE command from the single source (build_poe_command) INSIDE
     # the stage-3 container, then exec it at HOST level (nested apptainer is blocked).
-    mapfile -d '' POE_CMD < <(apptainer exec \
+    # Capture status explicitly: mapfile via process-substitution would otherwise
+    # swallow a builder failure, leaving POE_CMD empty (a silent no-op).
+    POE_CMD_RAW="$(apptainer exec \
         --bind "$REPO:/code" --bind /net/software --bind /net/databases \
         --bind /net/scratch --bind "$HOME" \
         --env "PYTHONPATH=/code/src:/cifutils/src" \
@@ -750,13 +753,21 @@ if [[ "$MPNN_BACKEND" == "poe" ]]; then
             --bias_json "$POE_INPUTS_DIR/bias.json" \
             --omit_json "$POE_INPUTS_DIR/omit.json" \
             --fixed_json "$POE_INPUTS_DIR/fixed.json" \
+            --omit_AA "$OMIT_AA" \
+            --use_side_chain_context "$USE_SIDE_CHAIN_CONTEXT" \
             --batch_size 10 --number_of_batches "$POE_NBATCH" \
-            --temperature "$POE_TEMPERATURE")
+            --temperature "$POE_TEMPERATURE")" || {
+        echo "ERROR: PoE command build failed (poe_emit_command.py)" >&2; exit 3; }
+    mapfile -d '' POE_CMD < <(printf '%s' "$POE_CMD_RAW")
+    if [[ ${#POE_CMD[@]} -eq 0 || "${POE_CMD[0]}" != "apptainer" ]]; then
+        echo "ERROR: empty/invalid PoE command (got ${#POE_CMD[@]} tokens)" >&2; exit 3
+    fi
     echo "###  PoE host command: ${POE_CMD[*]}"
     "${POE_CMD[@]}"
     POE_SCORE_CLI=( --mpnn_backend poe --poe_output_dir "$POE_OUT_DIR"
                     --additional_experts "$ADDITIONAL_EXPERTS"
-                    --additional_expert_lambdas "$EXPERT_LAMBDAS" )
+                    --additional_expert_lambdas "$EXPERT_LAMBDAS"
+                    --poe_temperature "$POE_TEMPERATURE" )
     echo "###  PoE 3c: driver score-only on the PoE pool ###"
 fi
 
