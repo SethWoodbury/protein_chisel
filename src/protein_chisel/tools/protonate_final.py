@@ -163,6 +163,23 @@ _VARIANT_TO_STANDARD: dict[str, str] = {
     "TYM": "TYR",
 }
 
+# Translate our per-residue tautomer labels to the residue-type names PyRosetta's
+# ResidueTypeSet actually recognizes. Rosetta names the epsilon tautomer (proton
+# on NE2) "HIS" (its default) and the delta tautomer (proton on ND1) "HIS_D".
+# The Amber-style codes HIE/HID/HIP coming from the seed REMARK 668 /
+# pdb_restoration are NOT Rosetta type names, so without this translation
+# rts.has_name("HIE") is False and the catalytic His silently reverts to the
+# default tautomer (observed: "residue type 'HIE' unknown; leaving ... as
+# default tautomer"). HIP (doubly protonated) -> HIS_P when the RTS supports it,
+# else falls back to default HIS (handled at the call site).
+_TAUTOMER_TO_ROSETTA_RESTYPE: dict[str, str] = {
+    "HIE": "HIS",      # epsilon (NE2) == Rosetta default HIS
+    "HIS_E": "HIS",
+    "HID": "HIS_D",    # delta (ND1)
+    "HIP": "HIS_P",    # cation; call-site falls back to HIS if unsupported
+    # "HIS" / "HIS_D" / "HIS_P" pass through unchanged.
+}
+
 # ----------------------------------------------------------------------------
 # Post-translational-modification (PTM) registry
 # ----------------------------------------------------------------------------
@@ -1515,17 +1532,29 @@ def protonate_pdb_with_pyrosetta(
                         chain, resno,
                     )
                     continue
-                # Map our 5-char label -> Rosetta residue type name. For
-                # canonical AAs Rosetta uses the same labels (HIS_D, KCX,
-                # ASN_p ...) but mostly "HIS_D" works directly.
-                target_name = variant_label  # e.g. "HIS_D"
+                # Map our label -> the Rosetta residue-type name. Most variants
+                # (HIS_D, KCX, ...) are already Rosetta names; the Amber-style
+                # His tautomer codes HIE/HID/HIP are not, so translate them
+                # (HIE->HIS, HID->HIS_D, HIP->HIS_P) — otherwise the catalytic
+                # His tautomer would silently revert to default.
+                target_name = _TAUTOMER_TO_ROSETTA_RESTYPE.get(
+                    variant_label, variant_label)
                 if not rts.has_name(target_name):
-                    LOGGER.warning(
-                        "variant remap: residue type %r unknown; "
-                        "leaving %s%d as default tautomer",
-                        target_name, chain, resno,
-                    )
-                    continue
+                    # HIS_P (doubly protonated) isn't in every RTS; fall back to
+                    # the default epsilon HIS rather than dropping the residue.
+                    if target_name == "HIS_P" and rts.has_name("HIS"):
+                        LOGGER.info(
+                            "variant remap: HIS_P unsupported in this RTS; "
+                            "using default HIS for %s%d", chain, resno,
+                        )
+                        target_name = "HIS"
+                    else:
+                        LOGGER.warning(
+                            "variant remap: residue type %r (from label %r) "
+                            "unknown; leaving %s%d as default tautomer",
+                            target_name, variant_label, chain, resno,
+                        )
+                        continue
                 new_rt = rts.name_map(target_name)
                 replace_pose_residue_copying_existing_coordinates(
                     pose, pose_resno, new_rt,
