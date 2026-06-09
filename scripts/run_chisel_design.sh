@@ -439,6 +439,29 @@ METRICS_CLI=()
 [[ "$METRICS" != "all" ]] && METRICS_CLI+=( --metrics "$METRICS" )
 [[ "$FILTERS" != "all" ]] && METRICS_CLI+=( --filters "$FILTERS" )
 
+# Decode-time Product-of-Experts backend (Phase: PoE; opt-in). Default 'bias' = the
+# in-process LigandMPNN sampler with our calibrated fusion bias (byte-identical).
+# MPNN_BACKEND=poe runs a SEPARATE HOST stage (nested apptainer is blocked) that
+# samples ONCE via poe_mpnn.sif with our bias + context-aware experts, then the
+# driver scores/ranks that pool. Borrowed from Sebastian (sebols)/Joe Mi fused_mpnn_poe.
+#   ADDITIONAL_EXPERTS  e.g. 'esm' or 'hermes,e1' (required for poe)
+#   EXPERT_LAMBDAS      e.g. '0.2' or '0.2,0.3'   (one per expert; sum < 1)
+#   POE_NUM_DESIGNS     pool size to sample (default 200); POE_TEMPERATURE (default 0.1)
+MPNN_BACKEND="${MPNN_BACKEND:-bias}"
+ADDITIONAL_EXPERTS="${ADDITIONAL_EXPERTS:-}"
+EXPERT_LAMBDAS="${EXPERT_LAMBDAS:-}"
+POE_NUM_DESIGNS="${POE_NUM_DESIGNS:-200}"
+POE_TEMPERATURE="${POE_TEMPERATURE:-0.1}"
+if [[ "$MPNN_BACKEND" == "poe" ]]; then
+    if [[ -z "$ADDITIONAL_EXPERTS" || -z "$EXPERT_LAMBDAS" ]]; then
+        echo "ERROR: MPNN_BACKEND=poe requires ADDITIONAL_EXPERTS and EXPERT_LAMBDAS" >&2
+        exit 2
+    fi
+elif [[ "$MPNN_BACKEND" != "bias" ]]; then
+    echo "ERROR: MPNN_BACKEND must be 'bias' or 'poe' (got '$MPNN_BACKEND')" >&2
+    exit 2
+fi
+
 # === Output base ====================================================
 # OUTPUT_DIR | WORK_ROOT (caller picks; WORK_ROOT remains the internal
 # variable). Top-level directory under which work_dir/ and run_dir/ get
@@ -664,35 +687,80 @@ echo "################################################################"
 echo "###  STAGE 3: iterative driver (sample / filter / score)     ###"
 echo "###  sif: $STAGE3_SIF"
 echo "################################################################"
-apptainer exec "${NV_FLAGS[@]}" \
-    --bind "$REPO:/code" \
-    --bind "$PIPELINE_ROOT" \
-    --bind /net/software \
-    --bind /net/databases \
-    --bind /net/scratch \
-    --bind "$HOME" \
-    --env "PYTHONPATH=/code/src:/cifutils/src" \
-    "$STAGE3_SIF" \
-    python "$REPO/scripts/iterative_design.py" \
-        --seed_pdb "$SEED_PDB" \
-        --ligand_params "$LIG_PARAMS" \
-        --plm_artifacts_dir "$PLM_DIR" \
-        --position_table "$CLASSIFY_DIR/positions.tsv" \
-        --out_root "$PIPELINE_OUT_ROOT" \
-        --target_k "$TARGET_K" \
-        --min_hamming "$MIN_HAMMING" \
-        --cycles "$N_CYCLES" \
-        --omit_AA "$OMIT_AA" \
-        --use_side_chain_context "$USE_SIDE_CHAIN_CONTEXT" \
-        --copy_input_structure_into_out_dir "$COPY_INPUT_STRUCTURE_INTO_OUT_DIR_BOOL" \
-        --run_dir_marker "$WORK_DIR/run_dir.txt" \
-        "${DRIVER_CLI_ARGS[@]}" \
-        ${PTM:+--ptm "$PTM"} \
-        ${ENHANCE:+--enhance "$ENHANCE"} \
-        "${CONSERVE_CLI[@]}" \
-        "${EXPERTS_CLI[@]}" \
-        "${METRICS_CLI[@]}" \
-        ${EXTRA_DRIVER_FLAGS:-}
+
+# The stage-3 driver invocation, factored so it can be reused verbatim for: the
+# normal run, the PoE emit-inputs pre-pass, and the PoE score-only pass. Extra args
+# are appended via "$@", so the DEFAULT call (no extra args, MPNN_BACKEND=bias) is
+# byte-identical to the previous inline command.
+run_stage3_driver() {
+    apptainer exec "${NV_FLAGS[@]}" \
+        --bind "$REPO:/code" \
+        --bind "$PIPELINE_ROOT" \
+        --bind /net/software \
+        --bind /net/databases \
+        --bind /net/scratch \
+        --bind "$HOME" \
+        --env "PYTHONPATH=/code/src:/cifutils/src" \
+        "$STAGE3_SIF" \
+        python "$REPO/scripts/iterative_design.py" \
+            --seed_pdb "$SEED_PDB" \
+            --ligand_params "$LIG_PARAMS" \
+            --plm_artifacts_dir "$PLM_DIR" \
+            --position_table "$CLASSIFY_DIR/positions.tsv" \
+            --out_root "$PIPELINE_OUT_ROOT" \
+            --target_k "$TARGET_K" \
+            --min_hamming "$MIN_HAMMING" \
+            --cycles "$N_CYCLES" \
+            --omit_AA "$OMIT_AA" \
+            --use_side_chain_context "$USE_SIDE_CHAIN_CONTEXT" \
+            --copy_input_structure_into_out_dir "$COPY_INPUT_STRUCTURE_INTO_OUT_DIR_BOOL" \
+            --run_dir_marker "$WORK_DIR/run_dir.txt" \
+            "${DRIVER_CLI_ARGS[@]}" \
+            ${PTM:+--ptm "$PTM"} \
+            ${ENHANCE:+--enhance "$ENHANCE"} \
+            "${CONSERVE_CLI[@]}" \
+            "${EXPERTS_CLI[@]}" \
+            "${METRICS_CLI[@]}" \
+            "$@" \
+            ${EXTRA_DRIVER_FLAGS:-}
+}
+
+# PoE backend (opt-in): pre-sample once on the host via poe_mpnn.sif, then have the
+# driver score/rank that pool (score-only). Default 'bias' skips this entirely and
+# the driver call below is byte-identical to before.
+POE_SCORE_CLI=()
+if [[ "$MPNN_BACKEND" == "poe" ]]; then
+    POE_INPUTS_DIR="$WORK_DIR/poe_inputs"
+    POE_OUT_DIR="$WORK_DIR/poe_sample"
+    mkdir -p "$POE_INPUTS_DIR" "$POE_OUT_DIR"
+    echo "###  PoE 3a: emit cycle-0 bias/fixed/omit JSONs (driver, in $STAGE3_SIF) ###"
+    run_stage3_driver --poe_emit_inputs "$POE_INPUTS_DIR"
+    echo "###  PoE 3b: host PoE sampling (poe_mpnn.sif) experts=$ADDITIONAL_EXPERTS lambdas=$EXPERT_LAMBDAS pool=$POE_NUM_DESIGNS ###"
+    POE_NBATCH=$(( (POE_NUM_DESIGNS + 9) / 10 ))
+    # Build the host PoE command from the single source (build_poe_command) INSIDE
+    # the stage-3 container, then exec it at HOST level (nested apptainer is blocked).
+    mapfile -d '' POE_CMD < <(apptainer exec \
+        --bind "$REPO:/code" --bind /net/software --bind /net/databases \
+        --bind /net/scratch --bind "$HOME" \
+        --env "PYTHONPATH=/code/src:/cifutils/src" \
+        "$STAGE3_SIF" \
+        python "$REPO/scripts/poe_emit_command.py" \
+            --seed "$SEED_PDB" --out "$POE_OUT_DIR" \
+            --experts "$ADDITIONAL_EXPERTS" --lambdas "$EXPERT_LAMBDAS" \
+            --bias_json "$POE_INPUTS_DIR/bias.json" \
+            --omit_json "$POE_INPUTS_DIR/omit.json" \
+            --fixed_json "$POE_INPUTS_DIR/fixed.json" \
+            --batch_size 10 --number_of_batches "$POE_NBATCH" \
+            --temperature "$POE_TEMPERATURE")
+    echo "###  PoE host command: ${POE_CMD[*]}"
+    "${POE_CMD[@]}"
+    POE_SCORE_CLI=( --mpnn_backend poe --poe_output_dir "$POE_OUT_DIR"
+                    --additional_experts "$ADDITIONAL_EXPERTS"
+                    --additional_expert_lambdas "$EXPERT_LAMBDAS" )
+    echo "###  PoE 3c: driver score-only on the PoE pool ###"
+fi
+
+run_stage3_driver "${POE_SCORE_CLI[@]}"
 
 # Stage 3 wrote run_dir's path into $WORK_DIR/run_dir.txt as soon as
 # it knew the timestamped run_dir name. Read it for stage 4. This is
