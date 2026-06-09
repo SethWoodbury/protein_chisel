@@ -735,9 +735,10 @@ if [[ "$MPNN_BACKEND" == "poe" ]]; then
     mkdir -p "$POE_INPUTS_DIR" "$POE_OUT_DIR"
     echo "###  PoE 3a: emit cycle-0 bias/fixed/omit JSONs (driver, in $STAGE3_SIF) ###"
     run_stage3_driver --poe_emit_inputs "$POE_INPUTS_DIR"
-    POE_NBATCH=$(( (POE_NUM_DESIGNS + 9) / 10 ))   # batch_size 10; rounds UP to a
-    POE_ACTUAL=$(( POE_NBATCH * 10 ))              # multiple of 10 (over-provisions)
-    echo "###  PoE 3b: host PoE sampling (poe_mpnn.sif) experts=$ADDITIONAL_EXPERTS lambdas=$EXPERT_LAMBDAS pool=$POE_NUM_DESIGNS->$POE_ACTUAL omit_AA=$OMIT_AA ###"
+    # batch_size 1 (poe_mpnn.sif's sampler raises "Tensor with N elements cannot be
+    # converted to Scalar" for batch_size>1 with experts+packing — the working smoke
+    # used 1). number_of_batches = POE_NUM_DESIGNS => exactly that many designs.
+    echo "###  PoE 3b: host PoE sampling (poe_mpnn.sif) experts=$ADDITIONAL_EXPERTS lambdas=$EXPERT_LAMBDAS pool=$POE_NUM_DESIGNS omit_AA=$OMIT_AA ###"
     # Build the host PoE command from the single source (build_poe_command) INSIDE
     # the stage-3 container, then exec it at HOST level (nested apptainer is blocked).
     # The command is emitted NUL-separated; write it to a FILE (NOT $(...), which
@@ -757,7 +758,7 @@ if [[ "$MPNN_BACKEND" == "poe" ]]; then
             --fixed_json "$POE_INPUTS_DIR/fixed.json" \
             --omit_AA "$OMIT_AA" \
             --use_side_chain_context "$USE_SIDE_CHAIN_CONTEXT" \
-            --batch_size 10 --number_of_batches "$POE_NBATCH" \
+            --batch_size 1 --number_of_batches "$POE_NUM_DESIGNS" \
             --temperature "$POE_TEMPERATURE" > "$POE_CMD_FILE" || {
         echo "ERROR: PoE command build failed (poe_emit_command.py)" >&2; exit 3; }
     mapfile -d '' POE_CMD < "$POE_CMD_FILE"
