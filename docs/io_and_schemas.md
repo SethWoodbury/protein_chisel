@@ -73,7 +73,7 @@ if manifest_matches(expected, "out/_manifest.json"):
       "fold_source": "designed"
     }
   },
-  "tool_versions": {"protein_chisel": "0.0.1"},
+  "tool_versions": {"protein_chisel": "1.0.0"},
   "package_versions": {
     "numpy": "1.26.4", "pandas": "2.2.0", "pyrosetta": "2024.39"
   },
