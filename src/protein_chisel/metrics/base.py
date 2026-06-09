@@ -29,7 +29,7 @@ selectable units with dependency-aware resolution). Registry mechanics live in
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import FrozenSet, Tuple
 
 # --- Roles ---------------------------------------------------------------
@@ -54,9 +54,10 @@ DEP_FPOCKET = "fpocket"        # needs the fpocket binary
 DEP_ARPEGGIO = "arpeggio"      # needs pdbe-arpeggio (esmc.sif)
 DEP_ROSETTA = "rosetta"        # needs PyRosetta + ligand .params (ddG panel)
 DEP_FREESASA = "freesasa"      # needs the freesasa python package (SAP proxy)
+DEP_CONTACT_MS = "contact_ms"  # needs py_contact_ms (esmc.sif) for the CMS panel
 KNOWN_DEPS: FrozenSet[str] = frozenset(
     {DEP_LIGAND, DEP_TUNNEL_SIF, DEP_PYROSETTA, DEP_FPOCKET,
-     DEP_ARPEGGIO, DEP_ROSETTA, DEP_FREESASA}
+     DEP_ARPEGGIO, DEP_ROSETTA, DEP_FREESASA, DEP_CONTACT_MS}
 )
 
 # --- Cost classes (nominal per-design wall-clock; used for logging/ordering) ---
@@ -170,7 +171,7 @@ __all__ = [
     "MetricDescriptor",
     "ROLE_FILTER", "ROLE_OBJECTIVE", "ROLE_DIAGNOSTIC", "ROLE_TRANSFORM", "ROLES",
     "DEP_LIGAND", "DEP_TUNNEL_SIF", "DEP_PYROSETTA", "DEP_FPOCKET",
-    "DEP_ARPEGGIO", "DEP_ROSETTA", "DEP_FREESASA", "KNOWN_DEPS",
+    "DEP_ARPEGGIO", "DEP_ROSETTA", "DEP_FREESASA", "DEP_CONTACT_MS", "KNOWN_DEPS",
     "COST_TRIVIAL", "COST_CHEAP", "COST_MODERATE", "COST_EXPENSIVE", "COSTS",
     "STAGE_SEQ_FILTER", "STAGE_STRUCT_FILTER", "STAGE_TUNNEL", "STAGE_FITNESS",
     "STAGE_FPOCKET", "STAGE_ARPEGGIO", "STAGE_CMS", "STAGE_ROSETTA",

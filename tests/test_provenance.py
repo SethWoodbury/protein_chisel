@@ -25,6 +25,20 @@ def test_defaults_record_addons_off():
     assert d["conserve_depth"] == 1
     assert d["conserve_interaction_types"] == ["hbond"]
     assert d["hermes_model_version"] is None
+    # metric/filter registry selection defaults to the full set
+    assert d["metrics_selection"] == "all"
+    assert d["filters_selection"] == "all"
+    assert d["active_metrics"] == []
+
+
+def test_metric_selection_recorded():
+    p = _prov(metrics_selection="fitness,fpocket",
+              filters_selection="instability",
+              active_metrics=["fitness", "fpocket"])
+    d = p.to_manifest_dict()
+    assert d["metrics_selection"] == "fitness,fpocket"
+    assert d["filters_selection"] == "instability"
+    assert d["active_metrics"] == ["fitness", "fpocket"]
 
 
 def test_manifest_dict_is_json_serializable():

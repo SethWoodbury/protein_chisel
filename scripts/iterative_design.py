@@ -4339,6 +4339,17 @@ def main() -> None:
                         "<name>_log_probs.npy artifacts to load + fuse. Default "
                         "'esmc,saprot' = the legacy two-PLM fusion (byte-identical). "
                         "Must match the --experts used in precompute.")
+    p.add_argument("--metrics", default="all",
+                   help="Comma list of metric names (protein_chisel.metrics catalog) "
+                        "to compute/report, or 'all' (default = today's full set, "
+                        "byte-identical). Recorded in provenance + logged; with the "
+                        "default 'all' nothing is gated. Unknown names with an "
+                        "explicit (non-'all') selection are an error.")
+    p.add_argument("--filters", default="all",
+                   help="Comma list of FILTER metric names (subset of --metrics) "
+                        "allowed to drop designs, or 'all' (default). Recorded in "
+                        "provenance + logged; gating wiring is additive and a no-op "
+                        "at 'all'.")
     p.add_argument("--position_table", type=Path, required=True)
     p.add_argument("--out_root", type=Path, default=DEFAULT_OUT_ROOT)
     p.add_argument("--run_dir_marker", type=Path, default=None,
@@ -4849,6 +4860,52 @@ def main() -> None:
     LOGGER.info("loaded raw PLM log-probs for experts %s: L=%d",
                  expert_names, log_probs_esmc.shape[0])
 
+    # ---- Metric/filter selection (add-on #7 — registry) -------------
+    # Resolve the requested --metrics / --filters into the active catalog set.
+    # This increment only RECORDS + LOGS the selection (default "all" =
+    # today's full set); computation still flows through the stage_* chain, so
+    # the default run is byte-identical. Capability-aware gating is additive.
+    from protein_chisel.metrics import (
+        available_metrics as _avail_metrics, resolve_metrics as _resolve_metrics,
+    )
+    from protein_chisel.metrics.base import ROLE_FILTER as _ROLE_FILTER
+    _metrics_sel = _resolve_metrics(args.metrics)
+    _filters_sel = _resolve_metrics(args.filters, role=_ROLE_FILTER)
+    _metrics_is_all = args.metrics.strip().lower() in ("", "all", "*")
+    _filters_is_all = args.filters.strip().lower() in ("", "all", "*")
+    # Fail fast on a malformed EXPLICIT selection so a typo / wrong-role / empty
+    # selection can't silently no-op. The default "all" can never hit any of these.
+    _errs: list[str] = []
+    _unknown = sorted(set(_metrics_sel.skipped_unknown + _filters_sel.skipped_unknown))
+    if _unknown:
+        _errs.append(f"unknown metric name(s) {_unknown}")
+    if _filters_sel.skipped_wrong_role:
+        _errs.append("--filters name(s) that are not filter metrics: "
+                     f"{sorted(set(_filters_sel.skipped_wrong_role))}")
+    if not _metrics_is_all and not _metrics_sel.selected:
+        _errs.append(f"--metrics {args.metrics!r} selects no known metrics")
+    if not _filters_is_all and not _filters_sel.selected:
+        _errs.append(f"--filters {args.filters!r} selects no filter metrics")
+    if not _metrics_is_all and _metrics_sel.selected and not _unknown:
+        # A selected filter must also be computed (can't gate on a deselected
+        # metric). Skipped when --metrics is itself empty/typo'd (its own error
+        # already fires) to avoid a noisy orphan cascade.
+        _m_names = set(_metrics_sel.names())
+        _orphan = [n for n in _filters_sel.names() if n not in _m_names]
+        if _orphan:
+            _errs.append(f"--filters {sorted(_orphan)} not in the --metrics "
+                         "selection (can't gate on a metric that isn't computed)")
+    if _errs:
+        raise SystemExit("metric selection error(s): " + "; ".join(_errs)
+                         + f". Available metrics: {_avail_metrics()}")
+    active_metric_names = _metrics_sel.names()
+    LOGGER.info(
+        "metric selection: metrics=%r -> %d active %s | filters=%r -> %d gating %s",
+        args.metrics, len(active_metric_names), active_metric_names,
+        args.filters, len(_filters_sel.selected), _filters_sel.names())
+    LOGGER.info("metric selection: stages=%s | ranking objectives=%s",
+                _metrics_sel.stages(), _metrics_sel.objective_labels())
+
     # ---- Load PositionTable -----------------------------------------
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
     from protein_chisel.io.schemas import PositionTable
@@ -4956,6 +5013,9 @@ def main() -> None:
         conserve_interaction_types=list(CONSERVE_INTERACTION_TYPES),
         conserve_grow_network=CONSERVE_GROW_NETWORK,
         conserve_seed_base=(CONSERVE_SEED_BASE if CONSERVE_HBONDS else None),
+        metrics_selection=args.metrics,
+        filters_selection=args.filters,
+        active_metrics=active_metric_names,
     )
     run_provenance.write_json(run_dir / "provenance.json")
     LOGGER.info("provenance -> %s (experts=%s, fusion=%s)",

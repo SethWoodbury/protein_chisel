@@ -152,3 +152,36 @@ def test_get_metric_roundtrip_and_unknown():
     assert d.stage == STAGE_FPOCKET and DEP_FPOCKET in d.deps
     with pytest.raises(KeyError):
         get_metric("nope")
+
+
+def test_fpocket_is_a_filter():
+    # fpocket druggability is a real final-topk survivor gate, so it must be
+    # selectable via --filters (role=filter, gates_survivors).
+    d = get_metric("fpocket")
+    assert d.role == ROLE_FILTER and d.gates_survivors
+    res = resolve_metrics("all", role=ROLE_FILTER, capabilities=None)
+    assert "fpocket" in res.names()
+
+
+def test_explicit_wrong_role_is_reported_not_silent():
+    # A valid metric named under --filters but with the wrong role must be
+    # reported (so the driver can fail fast), not silently dropped.
+    res = resolve_metrics("fitness", role=ROLE_FILTER)
+    assert res.names() == []
+    assert res.skipped_wrong_role == ["fitness"]
+    assert res.skipped_unknown == []
+
+
+def test_all_with_role_does_not_report_wrong_role():
+    # "all" + a role filter just narrows the catalog — non-matching roles are
+    # expected, not user errors, so skipped_wrong_role stays empty.
+    res = resolve_metrics("all", role=ROLE_FILTER)
+    assert res.skipped_wrong_role == []
+    assert res.selected and all(d.role == ROLE_FILTER for d in res.selected)
+
+
+def test_empty_explicit_selection_resolves_empty():
+    # ",,," is an explicit (non-"all") selection of nothing — no unknowns, but
+    # an empty selected set the driver treats as an error.
+    res = resolve_metrics(",,,")
+    assert res.selected == [] and res.skipped_unknown == []

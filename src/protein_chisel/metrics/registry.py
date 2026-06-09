@@ -24,8 +24,8 @@ from typing import FrozenSet, List, Optional, Sequence, Tuple, Union
 
 from protein_chisel.metrics.base import (
     COST_CHEAP, COST_EXPENSIVE, COST_MODERATE, COST_TRIVIAL,
-    DEP_ARPEGGIO, DEP_FPOCKET, DEP_FREESASA, DEP_LIGAND, DEP_PYROSETTA,
-    DEP_ROSETTA, DEP_TUNNEL_SIF,
+    DEP_ARPEGGIO, DEP_CONTACT_MS, DEP_FPOCKET, DEP_FREESASA, DEP_LIGAND,
+    DEP_PYROSETTA, DEP_ROSETTA, DEP_TUNNEL_SIF,
     MetricDescriptor,
     ROLE_DIAGNOSTIC, ROLE_FILTER, ROLE_OBJECTIVE,
     STAGE_ARPEGGIO, STAGE_CMS, STAGE_FITNESS, STAGE_FPOCKET, STAGE_ROSETTA,
@@ -217,9 +217,10 @@ _CATALOG_LIST: List[MetricDescriptor] = [
 
     # ---- stage_fpocket_rank (fpocket binary) -------------------------
     MetricDescriptor(
-        name="fpocket", role=ROLE_OBJECTIVE, stage=STAGE_FPOCKET,
+        name="fpocket", role=ROLE_FILTER, stage=STAGE_FPOCKET,
         description="fpocket active-site pocket panel; druggability is a max-"
-                    "objective AND the final hard filter (>= druggability_min).",
+                    "objective AND the final-topk hard filter (>= druggability_min). "
+                    "Gates survivors only at the final selection, not per-cycle.",
         columns=("fpocket__status", "fpocket__druggability", "fpocket__volume",
                  "fpocket__mean_alpha_sphere_radius", "fpocket__alpha_sphere_density",
                  "fpocket__n_alpha_spheres_near_catalytic",
@@ -240,8 +241,7 @@ _CATALOG_LIST: List[MetricDescriptor] = [
         deps=frozenset({DEP_FPOCKET}), cost=COST_EXPENSIVE,
         objective_labels=("druggability", "bottleneck", "pocket_hydrophobicity"),
         filter_predicates=("fpocket__druggability >= druggability_min (final)",),
-        # NB: the druggability gate fires only at the final-topk hard filter, not
-        # per-cycle, so this descriptor is classed objective (its per-cycle role).
+        gates_survivors=True,
     ),
 
     # ---- final-only enrichments (opt-in stages) ----------------------
@@ -249,8 +249,8 @@ _CATALOG_LIST: List[MetricDescriptor] = [
         name="cms", role=ROLE_DIAGNOSTIC, stage=STAGE_CMS,
         description="Coventry contact-molecular-surface of the protein-ligand "
                     "interface (final top-K only; --cms_final).",
-        columns=("cms__total",), deps=frozenset(), cost=COST_EXPENSIVE,
-        default_on=False,
+        columns=("cms__total",), deps=frozenset({DEP_CONTACT_MS}),
+        cost=COST_EXPENSIVE, default_on=False,
     ),
     MetricDescriptor(
         name="rosetta", role=ROLE_DIAGNOSTIC, stage=STAGE_ROSETTA,
@@ -311,11 +311,16 @@ class ResolvedSelection:
     Attributes:
         selected: descriptors that are active (in canonical order).
         skipped_unknown: requested names not found in the catalog.
+        skipped_wrong_role: *explicitly* requested names that exist but whose role
+            doesn't match the ``role`` filter (e.g. a ``--filters`` name that is an
+            objective, not a filter). Empty for the ``"all"`` selection, where a
+            role filter naturally narrows the full catalog (not a user error).
         skipped_missing_dep: (descriptor, missing-capabilities) for metrics that
             were requested/default-on but whose dependency is unavailable.
     """
     selected: List[MetricDescriptor] = field(default_factory=list)
     skipped_unknown: List[str] = field(default_factory=list)
+    skipped_wrong_role: List[str] = field(default_factory=list)
     skipped_missing_dep: List[Tuple[MetricDescriptor, FrozenSet[str]]] = \
         field(default_factory=list)
 
@@ -382,6 +387,7 @@ def resolve_metrics(
         independent of the order names were requested in, so output is stable.
     """
     wanted = _parse_selection(selection)
+    explicit = wanted is not None
     res = ResolvedSelection()
 
     if wanted is None:
@@ -400,6 +406,13 @@ def resolve_metrics(
 
     for d in chosen:
         if role is not None and d.role != role:
+            # Only a user error when the name was explicitly requested; for "all"
+            # a role filter just narrows the catalog (expected, not reported).
+            if explicit:
+                res.skipped_wrong_role.append(d.name)
+                LOGGER.warning(
+                    "metrics: %r is not a %s metric (role=%s) — ignoring for this "
+                    "selection", d.name, role, d.role)
             continue
         if capabilities is not None:
             missing = frozenset(d.deps) - frozenset(capabilities)

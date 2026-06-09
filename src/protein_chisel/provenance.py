@@ -38,6 +38,11 @@ class RunProvenance:
     conserve_seed_base: Optional[int] = None
     # HERMES expert (Phase: HERMES).
     hermes_model_version: Optional[str] = None
+    # Metric/filter registry selection (add-on #7). "all" = today's full set;
+    # active_metrics is the resolved catalog name list actually in effect.
+    metrics_selection: str = "all"
+    filters_selection: str = "all"
+    active_metrics: list[str] = field(default_factory=list)
     # Any extra run-specific tags.
     extra: dict = field(default_factory=dict)
 
