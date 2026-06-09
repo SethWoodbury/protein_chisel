@@ -205,3 +205,56 @@ def test_is_intermediate():
     assert remarks.is_intermediate("d.protonated.pdb")
     assert remarks.is_intermediate("d.rosetta.pdb")
     assert not remarks.is_intermediate("d.pdb")
+
+
+_CHAIN_PDB = (
+    "REMARK 665 legend\n"
+    "REMARK 666 MATCH TEMPLATE B LIG  200 MATCH MOTIF A HIS   16  1  1\n"
+    "REMARK 667 legend\n"
+    "REMARK 668   1   A HIS     16   HID -   HD1                     HIS\n"
+    "REMARK QCB TOTAL_CHARGE +1\n"
+    "REMARK DESIGN_PATH rfd3 input /home/x/theo.pdb\n"
+    "REMARK DESIGN_PATH predesign_cart_relax output /scratch/pre/x.pdb\n"
+    "REMARK DESIGN_PATH chisel_ligandmpnn output /scratch/mpnn/x.pdb\n"
+    "REMARK DESIGN_PATH iterative_design output /scratch/run/topk/x_lmpnn_9.pdb\n"
+    "REMARK DESIGN_PATH protonate_topk output /scratch/run/prot/x_lmpnn_9.protonated.pdb\n"
+    "ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00  0.00           C\n"
+    "TER\nEND\n"
+)
+
+
+def test_finalize_design_path_collapse(tmp_path):
+    p = _write(tmp_path / "d.pdb", _CHAIN_PDB)
+    remarks.finalize_design_path(p, final_path="/net/final/x_chisel_00.pdb")
+    txt = Path(p).read_text()
+    assert "DESIGN_PATH iterative_design" not in txt
+    assert "DESIGN_PATH protonate_topk" not in txt
+    dp = [l for l in txt.splitlines()
+          if l.startswith("REMARK DESIGN_PATH chisel_iterative_design output")]
+    assert len(dp) == 1 and dp[0].endswith("/net/final/x_chisel_00.pdb")
+    # upstream chain + numbered/QCB preserved
+    for keep in ("DESIGN_PATH rfd3 input", "DESIGN_PATH predesign_cart_relax",
+                 "DESIGN_PATH chisel_ligandmpnn", "REMARK 665", "REMARK 666",
+                 "REMARK 667", "REMARK 668", "REMARK QCB"):
+        assert keep in txt
+    assert "ATOM" in txt and "END" in txt   # body preserved
+
+
+def test_finalize_design_path_keep_intermediate(tmp_path):
+    p = _write(tmp_path / "d.pdb", _CHAIN_PDB)
+    remarks.finalize_design_path(p, final_path="/net/final/x_chisel_00.pdb",
+                                 keep_intermediate=True)
+    txt = Path(p).read_text()
+    assert "DESIGN_PATH iterative_design" in txt
+    assert "DESIGN_PATH protonate_topk" in txt
+    assert "DESIGN_PATH chisel_iterative_design output" in txt
+
+
+def test_finalize_design_path_idempotent(tmp_path):
+    p = _write(tmp_path / "d.pdb", _CHAIN_PDB)
+    remarks.finalize_design_path(p, final_path="/net/final/x_chisel_00.pdb")
+    once = Path(p).read_text()
+    remarks.finalize_design_path(p, final_path="/net/final/x_chisel_00.pdb")
+    assert Path(p).read_text() == once   # byte-identical second run
+    n = once.count("REMARK DESIGN_PATH chisel_iterative_design output")
+    assert n == 1

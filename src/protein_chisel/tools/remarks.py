@@ -210,6 +210,60 @@ def reorganize_pdb_remarks(
         fh.writelines(new_lines)
 
 
+def finalize_design_path(
+    pdb_path: str | Path,
+    *,
+    final_path: str,
+    drop_stages: Iterable[str] = ("iterative_design", "protonate_topk"),
+    final_stage: str = "chisel_iterative_design",
+    final_kind: str = "output",
+    keep_intermediate: bool = False,
+) -> None:
+    """Collapse the post-design DESIGN_PATH provenance to a single final line.
+
+    By default drops the intermediate-scratch DESIGN_PATH lines whose ``<stage>``
+    is in ``drop_stages`` (the per-cycle ``iterative_design`` + ``protonate_topk``
+    stamps that point at deleted node-local scratch) and appends exactly one
+    ``REMARK DESIGN_PATH <final_stage> <final_kind> <normpath(final_path)>``
+    pointing at the absolute final published file. The UPSTREAM chain (rfd3,
+    predesign_cart_relax, chisel_ligandmpnn) and ALL other REMARKs
+    (665/666/667/668/QCB/rfd3_property/misc) are preserved verbatim.
+
+    Idempotent: re-running drops any pre-existing ``final_stage`` line before
+    re-appending, so a second call yields byte-identical output. With
+    ``keep_intermediate=True`` the intermediate lines are retained (the final line
+    is still added).
+    """
+    pdb_path = str(pdb_path)
+    with open(pdb_path) as fh:
+        lines = fh.readlines()
+    numbered, grouped, header_kept, body_lines = _parse(
+        lines, capture_body=True, include_all_header_lines=True)
+
+    drop = set(drop_stages)
+
+    def _stage_of(line: str) -> Optional[str]:
+        toks = line.split(None, 4)  # REMARK DESIGN_PATH <stage> <kind> <path>
+        return toks[2] if len(toks) >= 3 else None
+
+    dp = grouped["DESIGN_PATH"]
+    if not keep_intermediate:
+        dp = [l for l in dp if _stage_of(l) not in drop]
+    # Idempotency: strip any prior final_stage line, then append a fresh one.
+    dp = [l for l in dp if _stage_of(l) != final_stage]
+    dp.append(design_path_line(final_stage, final_kind, final_path))
+    grouped["DESIGN_PATH"] = [normalize_design_path_line(l) for l in dp]
+
+    new_lines = list(header_kept)
+    for n in sorted(numbered.keys()):
+        new_lines.extend(_dedupe(numbered[n], fold_prefixes=True))
+    for grp in ("QCB", "rfd3_property", "DESIGN_PATH", "_misc"):
+        new_lines.extend(_dedupe(grouped[grp]))
+    new_lines.extend(body_lines)
+    with open(pdb_path, "w") as fh:
+        fh.writelines(new_lines)
+
+
 def transfer_remarks_to_dir(
     directory: str | Path,
     input_pdb: str | Path,

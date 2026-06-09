@@ -135,6 +135,21 @@ if manifest_path.is_file():
 PY
 }
 
+# Final rank-order rename (<stem>_chisel_NNN by rank) + DESIGN_PATH collapse on the
+# published dir. Runs LAST (after _rewrite_published_paths), in plain python3.
+# Non-fatal: a failure leaves designs as-is (copy-then-swap keeps originals safe).
+FINALIZE_DESIGN_NAMES="${FINALIZE_DESIGN_NAMES:-1}"          # default ON
+KEEP_INTERMEDIATE_DESIGN_PATHS="${KEEP_INTERMEDIATE_DESIGN_PATHS:-0}"  # default OFF
+_finalize_design_names() {
+    local root="$1"
+    [[ "$FINALIZE_DESIGN_NAMES" == "1" ]] || return 0
+    [[ -n "$root" && -d "$root" ]] || return 0
+    local keep=""
+    [[ "$KEEP_INTERMEDIATE_DESIGN_PATHS" == "1" ]] && keep="--keep_intermediate"
+    python3 "$REPO/scripts/finalize_design_names.py" --final_root "$root" $keep \
+        || echo "WARN: finalize_design_names failed on $root (designs left as-is)"
+}
+
 USE_NODE_LOCAL_SCRATCH_RAW="${USE_NODE_LOCAL_SCRATCH:-true}"
 USE_NODE_LOCAL_SCRATCH_CLI=""
 CLOBBER_EXISTING_OUTPUTS_RAW="${CLOBBER_EXISTING_OUTPUTS:-false}"
@@ -787,6 +802,7 @@ if [[ "$NODE_SCRATCH_ACTIVE" == "1" ]]; then
             fi
         fi
         rm -rf "$PIPELINE_ROOT" 2>/dev/null || true
+        _finalize_design_names "$FINAL_ROOT"
         echo "=== DONE -- published flat outputs to $FINAL_ROOT ==="
     else
         FINAL_RUN_DIR="$FINAL_ROOT/$(basename "$RUN_DIR")"
@@ -813,6 +829,7 @@ if [[ "$NODE_SCRATCH_ACTIVE" == "1" ]]; then
             fi
         fi
         rm -rf "$PIPELINE_ROOT" 2>/dev/null || true
+        _finalize_design_names "$FINAL_RUN_DIR"
         echo "=== DONE -- published run dir to $FINAL_RUN_DIR ==="
     fi
 elif (( FLAT_FINAL_LAYOUT )) && [[ -d "${RUN_DIR:-/nonexistent}" ]]; then
@@ -848,10 +865,12 @@ elif (( FLAT_FINAL_LAYOUT )) && [[ -d "${RUN_DIR:-/nonexistent}" ]]; then
             "$FINAL_ROOT/manifest.json" \
             "$RUN_DIR" \
             "$FINAL_ROOT"
+        _finalize_design_names "$FINAL_ROOT"
         echo "=== DONE -- consolidated to $FINAL_ROOT ==="
     else
         echo "WARN: consolidation moved no files; check $RUN_DIR / $WORK_DIR"
     fi
 else
+    _finalize_design_names "$RUN_DIR"
     echo "=== DONE -- $WORK_DIR ==="
 fi
