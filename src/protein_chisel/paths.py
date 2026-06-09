@@ -25,6 +25,17 @@ METAL3D_SIF = Path("/net/software/containers/pipelines/metal3d.sif")
 MLFOLD_SIF = Path("/net/software/containers/mlfold.sif")  # used for LigandMPNN
 MPNN_BINDER_DESIGN_SIF = Path("/net/software/containers/mpnn_binder_design.sif")
 
+# Decode-time Product-of-Experts MPNN (add-on: optional --mpnn_backend poe).
+# Sebastian (sebols) / Joe Mi's fused_mpnn_poe: ProteinMPNN/LigandMPNN with
+# context-aware experts (hermes/esm/e1/vesm/msa/dms) mixed in at decode time.
+# Run as a SEPARATE HOST stage (nested apptainer is blocked inside the stage-3
+# container), feeding sampled candidates into the driver's score/rank.
+POE_MPNN_SIF = Path("/net/software/containers/users/sebols/poe_mpnn.sif")
+POE_MPNN_DIR = Path("/net/software/lab/king/sebols/fused_mpnn_poe")
+POE_MPNN_RUN = POE_MPNN_DIR / "run.py"
+# Pin the repo commit used, recorded in provenance (the repo is under active dev).
+POE_MPNN_COMMIT = "c3f877f"
+
 
 # ---- HuggingFace caches ----------------------------------------------------
 
