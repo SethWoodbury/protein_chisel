@@ -44,8 +44,9 @@ Orchestration in `run_chisel_design.sh` when `MPNN_BACKEND=poe`:
 | `MPNN_BACKEND` | `bias` (default, byte-identical) or `poe` | `bias` |
 | `ADDITIONAL_EXPERTS` | comma list, e.g. `esm` or `hermes,e1` (required for `poe`) | — |
 | `EXPERT_LAMBDAS` | one weight per expert, each in (0,1), `sum < 1` | — |
-| `POE_NUM_DESIGNS` | pool size to sample (rounds up to a multiple of 10) | `200` |
+| `POE_NUM_DESIGNS` | pool size to sample (exact; `batch_size=1`) | `200` |
 | `POE_TEMPERATURE` | PoE sampling temperature | `0.1` |
+| `POE_HERMES_PROBS` | optional precomputed HERMES CSV; unset = on-the-fly | — |
 
 ```bash
 env INPUT_PDB=… LIG_PARAMS=… OUTPUT_DIR=… \
@@ -53,10 +54,13 @@ env INPUT_PDB=… LIG_PARAMS=… OUTPUT_DIR=… \
     bash run_chisel_design.sh
 ```
 
-Supported experts: `hermes, dms, msa, esm, wt_esm, vesm, wt_vesm, e1, wt_e1`.
-HERMES needs in-container weights (PoE-delegated). Our calibrated bias and the pipeline's
-`OMIT_AA` / fixed residues / conserved-hbonds are all passed through, so PoE respects the
-same constraints as the default sampler.
+Supported experts: `hermes, dms, msa, esm, wt_esm, vesm, wt_vesm, e1, wt_e1`. HERMES
+(Visani et al., Nourmohammad lab) runs **on-the-fly** from the in-container
+`/hermes/trained_models` weights — `ADDITIONAL_EXPERTS=hermes` needs no precomputed file
+(cluster-confirmed: a 2-design `hermes` smoke succeeded in ~17 s); pass `POE_HERMES_PROBS`
+only to use a precomputed CSV instead. Our calibrated bias and the pipeline's `OMIT_AA` /
+fixed residues / conserved-hbonds are all passed through, so PoE respects the same
+constraints as the default sampler. `esm` and `hermes` are both cluster-validated end-to-end.
 
 ## Guarantees & provenance
 
