@@ -25,15 +25,36 @@ For the per-column data dictionary (definitions, formulas, ranges, thresholds) s
 | **catalog + selection** | **`metrics/`** (this) | per-driver-metric metadata | `--metrics`/`--filters`, logging, provenance |
 
 The catalog **does not compute anything** — computation stays in the driver's
-`stage_*` functions. So with the default selection (`all`) the pipeline runs the
-exact same code and the default TSV / filter decisions / ranking / PDBs are
-**byte-identical**.
+`stage_*` functions; the selection *gates* what runs (which stages execute, which
+filters may drop designs, which objectives rank). So with the default selection
+(`all`) the pipeline runs the exact same code and the default TSV / filter decisions
+/ ranking / PDBs are **byte-identical** (verified by host-unit goldens + a cluster
+full-pipeline run).
 
 ## Default behavior (unchanged)
 
-`--metrics all --filters all` (the defaults) reproduce today's pipeline exactly.
-The selection is only *recorded* (provenance + logs) at the default; it gates
-nothing. Running with no new flags is identical to before.
+`--metrics all --filters all` (the defaults) reproduce today's pipeline exactly,
+byte-for-byte. At the default every gate is a no-op, so running with no new flags is
+identical to before. Gating only changes behavior when you pass a non-default
+selection.
+
+## What gating does
+
+- **`--metrics <subset>`**
+  - drops any deselected **objective** metric from the `mo_topsis` ranking basket
+    (via `multi_objective.select_specs_by_label`);
+  - **skips the whole tunnel stage** if neither `tunnel` nor `pkvf` is selected
+    (they share `stage_tunnel_metrics`; deselecting only `pkvf` still computes it but
+    drops it from ranking);
+  - the opt-in final stages `cms` / `rosetta` / `arpeggio` stay controlled by their
+    own flags (`--cms_final` etc.), not by `--metrics`, to preserve their default-off
+    semantics.
+  - it does **not** suppress an already-computed diagnostic column whose stage still
+    runs (deselecting `protparam_aux` / `dfi` has no effect today).
+- **`--filters <subset>`** — a deselected **filter** stops dropping designs *and*
+  stops influencing the backfill/rescue ordering (its "distance to passing" gap is
+  zeroed and its rescue bucket is neutralized), so a deselected filter has zero
+  effect on the final top-K.
 
 ## Selecting metrics and filters
 
@@ -119,8 +140,10 @@ design is traceable to the exact metric set that produced it.
 
 ## Roadmap (staged)
 
-This is the **catalog + selection** stage. The optional next stage converts the
-`stage_*` chain into a thin driver that *iterates the selected catalog entries*
-(true plug-and-play scoring), rolled out one stage at a time behind the host-unit +
-cluster byte-identity goldens. Until then, computation delegates to the existing
-stages and the default output is byte-identical.
+Landed: the **catalog + selection + gating** (objective-subset ranking, tunnel
+stage-skip, and `--filters` predicate gating), all byte-identical at the defaults.
+The optional future stage converts the `stage_*` chain into a thin driver that
+*iterates the selected catalog entries* (true plug-and-play scoring, incl. suppressing
+deselected diagnostic columns), rolled out one stage at a time behind the same
+host-unit + cluster byte-identity goldens. Until then, computation delegates to the
+existing stages and the default output is byte-identical.
