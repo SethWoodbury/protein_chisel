@@ -105,6 +105,22 @@ def _filter_active(name: str) -> bool:
     return _ACTIVE_FILTERS is None or name in _ACTIVE_FILTERS
 
 
+# ---- Decode-time PoE backend (add-on, opt-in --mpnn_backend poe) ----------
+# Nested apptainer is blocked inside the stage-3 container, so the PoE sampler runs
+# as a SEPARATE HOST stage and its candidates feed the driver's score/rank one-shot.
+# stage_sample handles two PoE modes via these module globals (both None by default
+# => the default `bias` backend is the in-process sampler, byte-identical):
+#   * _POE_EMIT_INPUTS_DIR: write the cycle-0 bias/fixed/omit JSONs (the exact ones
+#     this run computed, incl. conserved-hbond rolls) for the host PoE stage, then
+#     exit. Reuses the driver's prep (no duplication / drift).
+#   * _POE_SAMPLE_DIR: build the candidate pool from a finished PoE output dir
+#     (candidate_set_from_poe_dir) instead of sampling; PoE forces a single cycle.
+_POE_EMIT_INPUTS_DIR = None
+_POE_SAMPLE_DIR = None
+_POE_EXPERTS: tuple = ()
+_POE_LAMBDAS: tuple = ()
+
+
 # Probabilistic conserved-sidechain-H-bond fixing (Feature 1) + canonical REMARK
 # transfer (Feature 2). Set in main() from argparse; kept as module globals (like
 # DEFAULT_CATRES above) so stage_sample/stage_restore_pdbs read them without
@@ -796,6 +812,31 @@ def stage_sample(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+    # ---- PoE score-only mode: candidates come from a finished host PoE stage,
+    # NOT from in-process sampling. Build the CandidateSet from the PoE output dir
+    # and link its packed/ PDBs into out_dir so stage_restore_pdbs finds them
+    # unchanged (the PoE output is structurally identical to our sampler's). ----
+    if _POE_SAMPLE_DIR is not None:
+        from protein_chisel.sampling.mpnn_backends import candidate_set_from_poe_dir
+        cset = candidate_set_from_poe_dir(
+            _POE_SAMPLE_DIR, seed_pdb.stem,
+            parent_design_id=f"PTE_i1_poe_c{cycle_cfg.cycle_idx}",
+            experts=_POE_EXPERTS, lambdas=_POE_LAMBDAS,
+            temperature=cycle_cfg.sampling_temperature,
+        )
+        cand_fasta = out_dir / "candidates.fasta"
+        cand_tsv = out_dir / "candidates.tsv"
+        cset.to_disk(cand_fasta, cand_tsv)
+        packed_link = out_dir / "packed"
+        if not packed_link.exists():
+            os.symlink(Path(_POE_SAMPLE_DIR).resolve() / "packed", packed_link)
+        LOGGER.info("stage_sample[cycle=%d]: PoE score-only — %d candidates from %s "
+                    "(experts=%s lambdas=%s)", cycle_cfg.cycle_idx,
+                    len(cset.df), _POE_SAMPLE_DIR, list(_POE_EXPERTS),
+                    list(_POE_LAMBDAS))
+        return cand_tsv
+
     from protein_chisel.tools.ligand_mpnn import (
         LigandMPNNConfig, sample_with_ligand_mpnn,
     )
@@ -889,6 +930,29 @@ def stage_sample(
         cycle_cfg.sampling_temperature, sorted(set(fixed_resnos)),
         float(np.abs(bias).mean()), bias_AA or "(none)",
     )
+
+    # ---- PoE emit-inputs mode: write the exact cycle-0 bias/fixed/omit JSONs this
+    # run computed (incl. conserved-hbond rolls just applied above) for the host PoE
+    # stage to consume, then exit. Reuses the shared _build_* helpers — the JSON
+    # layout is identical to what sample_with_ligand_mpnn passes to the sampler. ----
+    if _POE_EMIT_INPUTS_DIR is not None:
+        from protein_chisel.tools.ligand_mpnn import (
+            _build_bias_per_residue_multi, _build_fixed_residues_multi,
+        )
+        emit = Path(_POE_EMIT_INPUTS_DIR)
+        emit.mkdir(parents=True, exist_ok=True)
+        (emit / "bias.json").write_text(json.dumps(
+            _build_bias_per_residue_multi(seed_pdb, bias, chain, protein_resnos),
+            indent=2))
+        (emit / "fixed.json").write_text(json.dumps(
+            _build_fixed_residues_multi(seed_pdb, sorted(set(fixed_resnos)), chain),
+            indent=2))
+        (emit / "omit.json").write_text(json.dumps(
+            {str(Path(seed_pdb).resolve()): (omit_AA_per_residue or {})}, indent=2))
+        LOGGER.info("PoE emit-inputs: wrote bias/fixed/omit JSONs -> %s "
+                    "(fixed=%d residues, omit=%d) — exiting (host PoE stage next)",
+                    emit, len(set(fixed_resnos)), len(omit_AA_per_residue or {}))
+        sys.exit(0)
 
     res = sample_with_ligand_mpnn(
         pdb_path=seed_pdb,
@@ -4398,6 +4462,27 @@ def main() -> None:
                         "allowed to drop designs, or 'all' (default). Recorded in "
                         "provenance + logged; gating wiring is additive and a no-op "
                         "at 'all'.")
+    # ---- Decode-time PoE backend (opt-in; default 'bias' = in-process sampler) ----
+    p.add_argument("--mpnn_backend", choices=["bias", "poe"], default="bias",
+                   help="Sampling backend. 'bias' (default) = in-process LigandMPNN "
+                        "with our calibrated static fusion bias (byte-identical to "
+                        "before). 'poe' = decode-time Product-of-Experts (Sebastian/"
+                        "Joe Mi fused_mpnn_poe) run as a separate HOST stage, one-shot, "
+                        "feeding the driver's score/rank. Orchestrated by "
+                        "run_chisel_design.sh (MPNN_BACKEND=poe).")
+    p.add_argument("--additional_experts", default="",
+                   help="PoE only: comma list of context-aware experts mixed in at "
+                        "decode time (hermes,dms,msa,esm,wt_esm,vesm,wt_vesm,e1,wt_e1).")
+    p.add_argument("--additional_expert_lambdas", default="",
+                   help="PoE only: comma list of mixing weights (one per expert; each "
+                        "in (0,1); sum < 1 so lambda_mpnn = 1 - sum).")
+    p.add_argument("--poe_emit_inputs", type=Path, default=None,
+                   help="PoE internal: write this run's cycle-0 bias/fixed/omit JSONs "
+                        "to this dir (for the host PoE stage) and exit. Set by the "
+                        "shell wrapper; not for direct use.")
+    p.add_argument("--poe_output_dir", type=Path, default=None,
+                   help="PoE internal: a finished host PoE output dir (seqs/+packed/) "
+                        "to use as the candidate pool (score-only). Set by the shell.")
     p.add_argument("--position_table", type=Path, required=True)
     p.add_argument("--out_root", type=Path, default=DEFAULT_OUT_ROOT)
     p.add_argument("--run_dir_marker", type=Path, default=None,
@@ -4959,6 +5044,27 @@ def main() -> None:
     global _RANKING_LABEL_FILTER, _ACTIVE_FILTERS
     _RANKING_LABEL_FILTER = _selected_obj_labels
     _ACTIVE_FILTERS = _active_filters
+
+    # ---- PoE backend wiring (opt-in; default 'bias' leaves these inert) -------
+    global _POE_EMIT_INPUTS_DIR, _POE_SAMPLE_DIR, _POE_EXPERTS, _POE_LAMBDAS
+    _POE_EMIT_INPUTS_DIR = args.poe_emit_inputs
+    _POE_SAMPLE_DIR = args.poe_output_dir
+    if args.additional_experts:
+        from protein_chisel.sampling.mpnn_backends import validate_expert_lambdas
+        _exp, _lam = validate_expert_lambdas(
+            args.additional_experts, args.additional_expert_lambdas)
+        _POE_EXPERTS, _POE_LAMBDAS = tuple(_exp), tuple(_lam)
+    elif args.mpnn_backend == "poe" and args.poe_output_dir is not None:
+        # score-only PoE invocation must know which experts produced the pool
+        raise SystemExit("--mpnn_backend poe (score-only) requires "
+                         "--additional_experts/--additional_expert_lambdas")
+    if args.poe_emit_inputs is not None:
+        LOGGER.info("PoE emit-inputs mode: will write bias/fixed/omit JSONs for the "
+                    "host PoE stage and exit at the first stage_sample.")
+    if args.poe_output_dir is not None:
+        LOGGER.info("PoE score-only mode: candidate pool from %s "
+                    "(experts=%s lambdas=%s); forcing a single cycle.",
+                    args.poe_output_dir, list(_POE_EXPERTS), list(_POE_LAMBDAS))
     # Optional-stage gating: skip the whole tunnel stage only if NEITHER 'tunnel'
     # nor 'pkvf' is selected (they share stage_tunnel_metrics; we can't partially
     # skip within the stage). At --metrics all both are selected, so this is exactly
@@ -5068,6 +5174,7 @@ def main() -> None:
     # settings so this run is reproducible/auditable. expert_versions come from
     # the precompute manifest when available. Additive artifact (no PDB change).
     from protein_chisel.provenance import RunProvenance
+    from protein_chisel.paths import POE_MPNN_COMMIT
     _expert_versions = {}
     try:
         _pre_manifest = json.loads((art / "manifest.json").read_text())
@@ -5086,6 +5193,11 @@ def main() -> None:
         metrics_selection=args.metrics,
         filters_selection=args.filters,
         active_metrics=active_metric_names,
+        mpnn_backend=args.mpnn_backend,
+        extra=({"poe_experts": list(_POE_EXPERTS),
+                "poe_expert_lambdas": list(_POE_LAMBDAS),
+                "poe_commit": POE_MPNN_COMMIT}
+               if args.mpnn_backend == "poe" else {}),
     )
     run_provenance.write_json(run_dir / "provenance.json")
     LOGGER.info("provenance -> %s (experts=%s, fusion=%s)",
@@ -5260,6 +5372,11 @@ def main() -> None:
     elif args.cycles != 3:
         # Honor any positive int by truncating / extending the default schedule.
         cycles = cycles[: max(1, args.cycles)]
+    if args.poe_output_dir is not None:
+        # PoE one-shot: the candidate pool is pre-sampled by the host PoE stage, so
+        # there is no per-cycle resampling/bias-refinement to iterate — one cycle.
+        cycles = cycles[:1]
+        LOGGER.info("PoE score-only: forcing a single cycle (one-shot pool).")
     LOGGER.info("cycle schedule: %d cycles, omit_AA=%r", len(cycles), args.omit_AA)
 
     # ---- Pre-compute seed DFI once (design-invariant for fixed-backbone) --
