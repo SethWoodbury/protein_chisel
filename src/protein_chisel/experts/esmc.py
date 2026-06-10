@@ -27,4 +27,5 @@ class ESMCExpert(Expert):
 
         return esmc_logits(
             ctx.seq, model_name=self.model_name, device=ctx.device, masked=True,
+            dtype=ctx.plm_dtype,
         ).log_probs

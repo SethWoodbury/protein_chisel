@@ -26,5 +26,5 @@ class SaProtExpert(Expert):
 
         return saprot_logits(
             ctx.pdb_path, chain=ctx.chain, model_name=self.model_name,
-            device=ctx.device, masked=True,
+            device=ctx.device, masked=True, dtype=ctx.plm_dtype,
         ).log_probs

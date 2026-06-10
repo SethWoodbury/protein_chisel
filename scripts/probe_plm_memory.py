@@ -103,6 +103,8 @@ def main() -> None:
     p.add_argument("--length", type=int, default=275)
     p.add_argument("--esmc_model", default="esmc_600m")
     p.add_argument("--saprot_model", default="saprot_1.3b")
+    p.add_argument("--plm_dtype", default="fp32", choices=["fp32", "fp16", "bf16"],
+                   help="PLM inference precision (fp16/bf16 ~halve memory).")
     p.add_argument("--device", default="cpu")
     p.add_argument("--out_dir", type=Path,
                    default=Path("/net/scratch/woodbuse/probe_275aa"))
@@ -127,6 +129,7 @@ def main() -> None:
     t0 = time.time()
     esmc_lp = esmc_logits(
         seq, model_name=args.esmc_model, device=args.device, masked=True,
+        dtype=args.plm_dtype,
     ).log_probs
     print(f"[time] esmc_logits L={args.length} {args.esmc_model}: {time.time()-t0:.1f}s",
           flush=True)
@@ -139,6 +142,7 @@ def main() -> None:
         pdb_path, chain=None,  # synthetic single-chain PDB; foldseek
                                # emits basename without _A suffix
         model_name=args.saprot_model, device=args.device, masked=True,
+        dtype=args.plm_dtype,
     ).log_probs
     print(f"[time] saprot_logits L={args.length} {args.saprot_model}: {time.time()-t0:.1f}s",
           flush=True)

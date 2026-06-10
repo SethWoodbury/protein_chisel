@@ -109,6 +109,49 @@ def test_cache_roundtrip(tmp_path):
     assert np.array_equal(a, b)
 
 
+class _DtypeFakeExpert(Expert):
+    """Fake whose output is tagged by ctx.plm_dtype, so a wrong-cache reuse shows up."""
+    name = "dfake"
+    modality = "sequence"
+
+    def __init__(self):
+        self.calls = 0
+
+    def compute_log_probs(self, ctx):
+        self.calls += 1
+        tag = {"fp32": 0.0, "fp16": 1.0, "bf16": 2.0}.get(ctx.plm_dtype, 9.0)
+        return np.full((4, 20), tag, dtype=float)
+
+
+def test_cache_filename_dtype_aware():
+    exp = _FakeExpert()
+    assert exp.cache_filename_for("fp32") == "fake_log_probs.npy"        # legacy name
+    assert exp.cache_filename_for("fp16") == "fake_log_probs.fp16.npy"
+    assert exp.cache_filename_for("bf16") == "fake_log_probs.bf16.npy"
+
+
+def test_default_context_dtype_is_fp32():
+    assert ExpertContext(seq="A", pdb_path="x").plm_dtype == "fp32"
+
+
+def test_no_cross_dtype_cache_reuse(tmp_path):
+    exp = _DtypeFakeExpert()
+    c32 = ExpertContext(seq="ACDE", pdb_path="x.pdb", out_dir=tmp_path, plm_dtype="fp32")
+    c16 = ExpertContext(seq="ACDE", pdb_path="x.pdb", out_dir=tmp_path, plm_dtype="fp16")
+    a32 = exp.log_probs(c32)
+    assert exp.calls == 1 and (tmp_path / "dfake_log_probs.npy").exists()
+    # fp16 in the SAME dir must NOT reuse the fp32 cache -> recompute + distinct file
+    a16 = exp.log_probs(c16)
+    assert exp.calls == 2 and (tmp_path / "dfake_log_probs.fp16.npy").exists()
+    assert not np.array_equal(a32, a16)                  # dtype-tagged values differ
+    # each dtype re-run hits its OWN cache (no further recompute)
+    exp.log_probs(c16)
+    exp.log_probs(c32)
+    assert exp.calls == 2
+    assert np.array_equal(exp.log_probs(c32), a32)
+    assert np.array_equal(exp.log_probs(c16), a16)
+
+
 def test_bad_shape_raises():
     class _BadExpert(_FakeExpert):
         name = "bad"

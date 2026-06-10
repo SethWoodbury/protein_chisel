@@ -104,13 +104,18 @@ SAPROT_MODELS = {
 }
 
 
-def _load_saprot(model_name: str = "saprot_35m", device: str = "auto"):
+_TORCH_DTYPE = {"fp32": "float32", "fp16": "float16", "bf16": "bfloat16"}
+
+
+def _load_saprot(model_name: str = "saprot_35m", device: str = "auto",
+                 dtype: str = "fp32"):
     import torch
     from transformers import AutoTokenizer, EsmForMaskedLM
 
     repo = SAPROT_MODELS.get(model_name, model_name)
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch_dtype = getattr(torch, _TORCH_DTYPE.get(dtype, "float32"))
 
     # SaProt's HF cache lives at /net/databases/huggingface/saprot/hub/.
     # When this code is invoked from a pipeline that set HF_HUB_CACHE
@@ -130,7 +135,7 @@ def _load_saprot(model_name: str = "saprot_35m", device: str = "auto"):
     # host-RAM win for saprot_1.3b (the weights + float32 dtype are unchanged, so
     # the logits are byte-identical). ESM-C's loader has no equivalent kwarg.
     model = EsmForMaskedLM.from_pretrained(
-        repo, torch_dtype=torch.float32, low_cpu_mem_usage=True, **kwargs,
+        repo, torch_dtype=torch_dtype, low_cpu_mem_usage=True, **kwargs,
     ).to(device).eval()
     return tokenizer, model, device
 
@@ -154,6 +159,7 @@ def saprot_logits(
     model_name: str = "saprot_35m",
     device: str = "auto",
     masked: bool = True,
+    dtype: str = "fp32",
 ) -> SaProtLogitsResult:
     """Per-position log-probs over the 20-AA marginal.
 
@@ -171,7 +177,7 @@ def saprot_logits(
     """
     sa_str = sa_tokens_from_pdb(pdb_path, chain=chain)
     return _saprot_logits_from_sa_string(
-        sa_str, model_name=model_name, device=device, masked=masked,
+        sa_str, model_name=model_name, device=device, masked=masked, dtype=dtype,
     )
 
 
@@ -180,13 +186,14 @@ def _saprot_logits_from_sa_string(
     model_name: str = "saprot_35m",
     device: str = "auto",
     masked: bool = True,
+    dtype: str = "fp32",
 ) -> SaProtLogitsResult:
     import torch
 
     if len(sa_str) % 2 != 0:
         raise ValueError(f"odd-length SA-token string: {len(sa_str)}")
 
-    tokenizer, model, dev = _load_saprot(model_name=model_name, device=device)
+    tokenizer, model, dev = _load_saprot(model_name=model_name, device=device, dtype=dtype)
     sa_tokens = [sa_str[i:i + 2] for i in range(0, len(sa_str), 2)]
     L = len(sa_tokens)
 

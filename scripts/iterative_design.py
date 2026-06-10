@@ -4463,6 +4463,11 @@ def main() -> None:
                         "<name>_log_probs.npy artifacts to load + fuse. Default "
                         "'esmc,saprot' = the legacy two-PLM fusion (byte-identical). "
                         "Must match the --experts used in precompute.")
+    p.add_argument("--plm_dtype", default="fp32", choices=["fp32", "fp16", "bf16"],
+                   help="Precision the PLM artifacts were precomputed at. Selects the "
+                        "per-expert artifact filenames to load (fp32=<name>_log_probs.npy "
+                        "legacy; fp16/bf16=<name>_log_probs.<dtype>.npy). MUST match the "
+                        "--plm_dtype used in precompute. Default fp32 = byte-identical.")
     p.add_argument("--metrics", default="all",
                    help="Comma list of metric names (protein_chisel.metrics catalog) "
                         "to compute/report, or 'all' (default = today's full set, "
@@ -4995,7 +5000,11 @@ def main() -> None:
     # ---- Load PLM artifacts -----------------------------------------
     art = args.plm_artifacts_dir
     expert_names = [n.strip() for n in args.experts.split(",") if n.strip()]
-    expert_logprobs = [np.load(art / f"{n}_log_probs.npy") for n in expert_names]
+    # Load the per-expert log-probs at the precompute dtype (fp32 = legacy name,
+    # byte-identical; fp16/bf16 = the dtype-suffixed artifacts).
+    _plm_suffix = "" if args.plm_dtype == "fp32" else f".{args.plm_dtype}"
+    expert_logprobs = [np.load(art / f"{n}_log_probs{_plm_suffix}.npy")
+                       for n in expert_names]
     # Back-compat bindings: downstream fitness/refresh code references the two
     # PLMs by name. For the default ["esmc","saprot"] these ARE the two experts;
     # with a custom set they bind to the first two so existing paths still run.

@@ -58,14 +58,22 @@ def _get_aa_token_ids(model) -> np.ndarray:
     return np.array(ids, dtype=np.int64)
 
 
-def _load_esmc(model_name: str = "esmc_300m", device: str = "auto"):
-    """Load an ESMC model (cached in HF_HOME)."""
+_TORCH_DTYPE = {"fp16": "float16", "bf16": "bfloat16"}
+
+
+def _load_esmc(model_name: str = "esmc_300m", device: str = "auto",
+               dtype: str = "fp32"):
+    """Load an ESMC model (cached in HF_HOME). ``dtype`` "fp32" (default) leaves the
+    model in its loaded precision (byte-identical); "fp16"/"bf16" cast it down to
+    ~halve memory (the logits-gather upcasts back to float for the math)."""
     import torch
     from esm.models.esmc import ESMC
 
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
     model = ESMC.from_pretrained(model_name).to(device).eval()
+    if dtype != "fp32":
+        model = model.to(getattr(torch, _TORCH_DTYPE[dtype]))
     return model, device
 
 
@@ -74,6 +82,7 @@ def esmc_logits(
     model_name: str = "esmc_300m",
     device: str = "auto",
     masked: bool = True,
+    dtype: str = "fp32",
 ) -> ESMCLogitsResult:
     """Per-position log-probs over the 20-AA alphabet for one sequence.
 
@@ -93,7 +102,7 @@ def esmc_logits(
     import torch
     from esm.sdk.api import ESMProtein, LogitsConfig, ESMProteinTensor
 
-    model, dev = _load_esmc(model_name=model_name, device=device)
+    model, dev = _load_esmc(model_name=model_name, device=device, dtype=dtype)
     aa_ids = _get_aa_token_ids(model)
 
     protein = ESMProtein(sequence=sequence)

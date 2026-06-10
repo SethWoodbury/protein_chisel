@@ -31,12 +31,18 @@ class ExpertContext:
         device: "auto" | "cpu" | "gpu" — passed through to the model loader.
         out_dir: Optional directory for per-expert ``.npy`` caching; when set, an
             expert may read/write ``<out_dir>/<cache_filename>`` to skip recompute.
+        plm_dtype: model inference precision — "fp32" (default; byte-identical) |
+            "fp16" | "bf16". Half precision (opt-in) roughly halves PLM memory but
+            changes the logits, so it is keyed into the cache filename (see
+            :meth:`Expert.cache_filename_for`) — an fp16 run never reuses an fp32
+            cache or vice-versa.
     """
     seq: str
     pdb_path: str | Path
     chain: str = "A"
     device: str = "auto"
     out_dir: Optional[Path] = None
+    plm_dtype: str = "fp32"
 
 
 class Expert(abc.ABC):
@@ -58,9 +64,18 @@ class Expert(abc.ABC):
 
     @property
     def cache_filename(self) -> str:
-        """Per-artifact cache filename (kept identical to the legacy names for
-        the default experts, so default artifacts are byte-for-byte unchanged)."""
+        """The legacy (fp32) per-artifact cache filename. Kept byte-for-byte for the
+        default experts (precompute's manifest/outputs reference this name)."""
         return f"{self.name}_log_probs.npy"
+
+    def cache_filename_for(self, plm_dtype: str = "fp32") -> str:
+        """Dtype-aware cache filename. ``fp32`` returns the legacy
+        ``<name>_log_probs.npy`` (byte-identical default); any other dtype returns
+        ``<name>_log_probs.<dtype>.npy`` so half-precision artifacts never collide
+        with — or get silently reused as — the fp32 ones."""
+        if plm_dtype == "fp32":
+            return self.cache_filename
+        return f"{self.name}_log_probs.{plm_dtype}.npy"
 
     @abc.abstractmethod
     def compute_log_probs(self, ctx: ExpertContext) -> np.ndarray:
@@ -79,7 +94,7 @@ class Expert(abc.ABC):
         logger = logging.getLogger(f"protein_chisel.experts.{self.name}")
         cache = None
         if use_cache and ctx.out_dir is not None:
-            cache = Path(ctx.out_dir) / self.cache_filename
+            cache = Path(ctx.out_dir) / self.cache_filename_for(ctx.plm_dtype)
             if cache.exists():
                 logger.info("%s cache hit -> %s", self.name, cache)
                 return np.load(cache)

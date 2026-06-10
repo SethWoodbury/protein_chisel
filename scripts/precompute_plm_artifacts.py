@@ -72,6 +72,11 @@ def main() -> None:
     p.add_argument("--device", default="auto",
                    help="'auto' picks cuda if available else cpu. Pass "
                         "'cpu' to force CPU even on a GPU node.")
+    p.add_argument("--plm_dtype", default="fp32", choices=["fp32", "fp16", "bf16"],
+                   help="PLM inference precision. 'fp32' (default) is byte-identical; "
+                        "'fp16'/'bf16' ~halve PLM memory but change the logits, so "
+                        "their artifacts are written to dtype-suffixed cache files "
+                        "(e.g. saprot_log_probs.fp16.npy) and never reuse the fp32 cache.")
     p.add_argument(
         "--experts", default="esmc,saprot",
         help="Comma list of fusion experts (registry names). Default "
@@ -133,7 +138,8 @@ def main() -> None:
     expert_names = [e.name for e in experts]
     LOGGER.info("experts: %s", [e.version for e in experts])
     ctx = ExpertContext(seq=seq, pdb_path=args.seed_pdb, chain=args.chain,
-                        device=args.device, out_dir=args.out_dir)
+                        device=args.device, out_dir=args.out_dir,
+                        plm_dtype=args.plm_dtype)
     expert_lps = []
     for exp in experts:
         t0 = time.perf_counter()
@@ -202,7 +208,8 @@ def main() -> None:
 
     # ---- Manifest --------------------------------------------------------
     outputs = {
-        f"{e.name}_log_probs": str(args.out_dir / e.cache_filename)
+        # dtype-aware: fp32 -> legacy <name>_log_probs.npy; fp16/bf16 -> suffixed.
+        f"{e.name}_log_probs": str(args.out_dir / e.cache_filename_for(args.plm_dtype))
         for e in experts
     }
     outputs["fusion_bias"] = str(bias_path)
@@ -218,6 +225,7 @@ def main() -> None:
         "wt_length": L,
         "esmc_model": args.esmc_model,
         "saprot_model": args.saprot_model,
+        "plm_dtype": args.plm_dtype,
         # Provenance: which experts (+ versions) and fusion math produced the bias.
         "experts": expert_names,
         "expert_versions": {e.name: e.version for e in experts},

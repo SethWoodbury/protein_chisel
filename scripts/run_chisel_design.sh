@@ -427,6 +427,14 @@ if [[ "$EXPERTS" != "esmc,saprot" ]]; then
     EXPERTS_CLI+=( --experts "$EXPERTS" )
 fi
 
+# Opt-in PLM inference precision (memory). 'fp32' (default) = byte-identical;
+# 'fp16'/'bf16' ~halve PLM memory but change the logits, so the artifacts go to
+# dtype-suffixed cache files. Passed to BOTH stage 2 (precompute, writes them) and
+# stage 3 (driver, loads them) so they agree. Only emitted when non-default.
+PLM_DTYPE="${PLM_DTYPE:-fp32}"
+PLM_DTYPE_CLI=()
+[[ "$PLM_DTYPE" != "fp32" ]] && PLM_DTYPE_CLI+=( --plm_dtype "$PLM_DTYPE" )
+
 # Metric/filter registry selection (Phase 7). Default 'all' = today's full metric
 # set (byte-identical). Set e.g. METRICS=fitness,fpocket,sap to compute/report a
 # subset, FILTERS=instability,sap to restrict which filters may drop designs
@@ -663,7 +671,8 @@ apptainer exec "${NV_FLAGS[@]}" \
         --out_dir "$PLM_DIR" \
         --esmc_model "$ESMC_MODEL" \
         --saprot_model "$SAPROT_MODEL" \
-        "${EXPERTS_CLI[@]}"
+        "${EXPERTS_CLI[@]}" \
+        "${PLM_DTYPE_CLI[@]}"
 
 # Stage 3 sif selection. The protein_chisel suite at the canonical
 # user-shared dir uses friendly names:
@@ -724,6 +733,7 @@ run_stage3_driver() {
             ${ENHANCE:+--enhance "$ENHANCE"} \
             "${CONSERVE_CLI[@]}" \
             "${EXPERTS_CLI[@]}" \
+            "${PLM_DTYPE_CLI[@]}" \
             "${METRICS_CLI[@]}" \
             "$@" \
             ${EXTRA_DRIVER_FLAGS:-}
