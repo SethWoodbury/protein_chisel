@@ -130,12 +130,19 @@ def _load_saprot(model_name: str = "saprot_35m", device: str = "auto",
     if os.path.isdir(saprot_cache):
         kwargs["cache_dir"] = saprot_cache
     tokenizer = AutoTokenizer.from_pretrained(repo, **kwargs)
-    # low_cpu_mem_usage streams the checkpoint into pre-allocated tensors instead
-    # of materializing a second full CPU copy during from_pretrained — a pure
-    # host-RAM win for saprot_1.3b (the weights + float32 dtype are unchanged, so
-    # the logits are byte-identical). ESM-C's loader has no equivalent kwarg.
+    # low_cpu_mem_usage streams the checkpoint into pre-allocated tensors instead of
+    # materializing a second full CPU copy during from_pretrained — a pure host-RAM win
+    # for saprot_1.3b (weights + dtype unchanged => logits byte-identical). It needs the
+    # `accelerate` package, which is NOT in every container (e.g. esmc.sif); when absent,
+    # fall back to the standard load (the original behavior — still byte-identical, just
+    # without the load-time RAM saving). ESM-C's loader has no equivalent kwarg.
+    try:
+        import accelerate  # noqa: F401  (low_cpu_mem_usage requires accelerate>=0.26)
+        kwargs["low_cpu_mem_usage"] = True
+    except ImportError:
+        pass   # no accelerate -> standard load (original behavior, byte-identical)
     model = EsmForMaskedLM.from_pretrained(
-        repo, torch_dtype=torch_dtype, low_cpu_mem_usage=True, **kwargs,
+        repo, torch_dtype=torch_dtype, **kwargs,
     ).to(device).eval()
     return tokenizer, model, device
 
