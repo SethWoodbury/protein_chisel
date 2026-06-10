@@ -5000,6 +5000,17 @@ def main() -> None:
     # ---- Load PLM artifacts -----------------------------------------
     art = args.plm_artifacts_dir
     expert_names = [n.strip() for n in args.experts.split(",") if n.strip()]
+    # Defensive: --plm_dtype must agree with the precompute manifest, else we'd load a
+    # dtype-mismatched (or missing) artifact set. Fail fast with a clear message.
+    try:
+        _mf_dtype = json.loads((art / "manifest.json").read_text()).get("plm_dtype", "fp32")
+    except Exception:
+        _mf_dtype = "fp32"            # legacy artifacts w/o a manifest plm_dtype = fp32
+    if _mf_dtype != args.plm_dtype:
+        raise SystemExit(
+            f"--plm_dtype {args.plm_dtype!r} != precompute manifest plm_dtype "
+            f"{_mf_dtype!r} ({art}/manifest.json). Re-run precompute at the same dtype "
+            f"or pass --plm_dtype {_mf_dtype}.")
     # Load the per-expert log-probs at the precompute dtype (fp32 = legacy name,
     # byte-identical; fp16/bf16 = the dtype-suffixed artifacts).
     _plm_suffix = "" if args.plm_dtype == "fp32" else f".{args.plm_dtype}"
@@ -5011,8 +5022,8 @@ def main() -> None:
     log_probs_esmc = expert_logprobs[0]
     log_probs_saprot = (expert_logprobs[1] if len(expert_logprobs) > 1
                         else expert_logprobs[0])
-    cached_base_bias = np.load(art / "fusion_bias.npy")
-    _weights_npy = art / "fusion_weights.npy"
+    cached_base_bias = np.load(art / f"fusion_bias{_plm_suffix}.npy")
+    _weights_npy = art / f"fusion_weights{_plm_suffix}.npy"
     cached_weights = np.load(_weights_npy) if _weights_npy.exists() else None
     LOGGER.info("loaded raw PLM log-probs for experts %s: L=%d",
                  expert_names, log_probs_esmc.shape[0])

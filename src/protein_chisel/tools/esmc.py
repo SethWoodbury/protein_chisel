@@ -71,9 +71,13 @@ def _load_esmc(model_name: str = "esmc_300m", device: str = "auto",
 
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = ESMC.from_pretrained(model_name).to(device).eval()
+    model = ESMC.from_pretrained(model_name)
+    # Cast to half precision BEFORE moving to the device, so fp16/bf16 only ever
+    # allocates the half-size copy on the GPU (casting after .to(device) would still
+    # peak at the fp32 VRAM and could OOM). fp32 keeps the exact legacy path.
     if dtype != "fp32":
         model = model.to(getattr(torch, _TORCH_DTYPE[dtype]))
+    model = model.to(device).eval()
     return model, device
 
 

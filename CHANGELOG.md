@@ -3,6 +3,24 @@
 All notable changes to **protein_chisel** are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions use semver.
 
+## [Unreleased]
+
+### Added / Changed — Stage-2 (PLM precompute) memory efficiency (default byte-identical)
+- `low_cpu_mem_usage=True` on the SaProt load (no transient 2× CPU weight copy;
+  byte-identical weights). Explicit `gc.collect()` + `torch.cuda.empty_cache()` between
+  experts so the previous model is reclaimed before the next loads.
+- **Opt-in half precision**: `PLM_DTYPE` / `--plm_dtype {fp32,fp16,bf16}` (default `fp32`)
+  roughly halves PLM memory. Changes the logits, so all Stage-2 artifacts are written to
+  **dtype-suffixed** files when non-fp32 (`*_log_probs.fp16.npy`, `fusion_bias.fp16.npy`, …)
+  — fp16 never reuses an fp32 cache; the driver loads the matching dtype and asserts the
+  precompute manifest's `plm_dtype` agrees. ESM-C casts to half *before* the device move
+  (so fp16 only allocates the half-size VRAM). `fp32` is the exact prior behavior.
+- **Memory warning** (`utils/resources.py`): `detect_available_mem_mb` (SLURM / cgroup /
+  /proc, binding cap) + `estimate_plm_footprint_mb` (GPU- vs CPU-aware) + a Stage-2-startup
+  `warn_if_plm_mem_tight` that suggests a smaller `SAPROT_MODEL` / `PLM_DTYPE=fp16` when
+  tight. Logging-only — never changes behavior.
+- Docs: `docs/memory.md`. See for the variant × dtype × memory table.
+
 ## [1.0.0] — 2026-06-09
 
 First tagged release. A suite of **opt-in, modular add-ons** toward plug-and-play

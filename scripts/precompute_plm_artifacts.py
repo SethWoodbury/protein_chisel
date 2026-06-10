@@ -97,8 +97,11 @@ def main() -> None:
     # Logging-only — never changes behavior.
     try:
         from protein_chisel.utils.resources import warn_if_plm_mem_tight
+        # --device cpu forces host-RAM placement (the GPU factor would underestimate);
+        # "auto"/"cuda" -> None lets the estimate auto-detect a visible GPU.
+        _on_gpu = False if args.device == "cpu" else None
         warn_if_plm_mem_tight(args.esmc_model, args.saprot_model,
-                              getattr(args, "plm_dtype", "fp32"))
+                              getattr(args, "plm_dtype", "fp32"), on_gpu=_on_gpu)
     except Exception as _e:        # never let a memory probe break the run
         LOGGER.debug("PLM memory warn skipped: %s", _e)
 
@@ -166,10 +169,15 @@ def main() -> None:
         raise RuntimeError(f"expert log-prob shapes disagree: {shapes}")
 
     # ---- Calibrated fusion -----------------------------------------------
-    bias_path = args.out_dir / "fusion_bias.npy"
-    log_odds_esmc_path = args.out_dir / "fusion_log_odds_esmc.npy"
-    log_odds_saprot_path = args.out_dir / "fusion_log_odds_saprot.npy"
-    weights_path = args.out_dir / "fusion_weights.npy"
+    # Dtype-suffix ALL fusion artifacts too (not just per-expert), so the
+    # existence-based "fusion cache hit" below is dtype-aware: re-running a
+    # different --plm_dtype in the same out_dir never reuses another dtype's bias.
+    # fp32 keeps the legacy names (fusion_bias.npy ...) => byte-identical.
+    _dtsuf = "" if args.plm_dtype == "fp32" else f".{args.plm_dtype}"
+    bias_path = args.out_dir / f"fusion_bias{_dtsuf}.npy"
+    log_odds_esmc_path = args.out_dir / f"fusion_log_odds_esmc{_dtsuf}.npy"
+    log_odds_saprot_path = args.out_dir / f"fusion_log_odds_saprot{_dtsuf}.npy"
+    weights_path = args.out_dir / f"fusion_weights{_dtsuf}.npy"
     fusion_cfg = FusionConfig()
     if bias_path.exists():
         LOGGER.info("fusion cache hit -> %s", bias_path)
@@ -197,9 +205,9 @@ def main() -> None:
         # Generic per-expert artifacts only for non-default expert sets.
         if result.log_odds is not None and len(experts) != 2:
             for nm, lo in zip(expert_names, result.log_odds):
-                np.save(args.out_dir / f"fusion_log_odds_{nm}.npy", lo)
+                np.save(args.out_dir / f"fusion_log_odds_{nm}{_dtsuf}.npy", lo)
             if result.weights_per_expert is not None:
-                np.save(args.out_dir / "fusion_weights_per_expert.npy",
+                np.save(args.out_dir / f"fusion_weights_per_expert{_dtsuf}.npy",
                         result.weights_per_expert)
         bias = result.bias
         LOGGER.info("fusion bias shape=%s, mean_abs=%.4f (%.2fs)",
