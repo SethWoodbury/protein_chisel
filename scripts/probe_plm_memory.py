@@ -148,8 +148,21 @@ def main() -> None:
           flush=True)
     _log(f"after SaProt ({args.saprot_model})")
     print(f"[shape] saprot_lp.shape = {saprot_lp.shape}", flush=True)
+    try:
+        import torch as _t
+        if _t.cuda.is_available():
+            print(f"[vram] peak_allocated={_t.cuda.max_memory_allocated()/1e9:.2f} GB "
+                  f"(dtype={args.plm_dtype})", flush=True)
+    except Exception:
+        pass
 
-    print(f"[done] L={args.length} both PLMs run on CPU", flush=True)
+    import numpy as _np
+    _np.save(args.out_dir / f"esmc_lp_{args.plm_dtype}.npy", esmc_lp)
+    _np.save(args.out_dir / f"saprot_lp_{args.plm_dtype}.npy", saprot_lp)
+    print(f"[saved] {args.out_dir}/esmc_lp_{args.plm_dtype}.npy + "
+          f"saprot_lp_{args.plm_dtype}.npy", flush=True)
+    print(f"[done] L={args.length} both PLMs run dtype={args.plm_dtype} "
+          f"device={args.device}", flush=True)
 
 
 if __name__ == "__main__":
