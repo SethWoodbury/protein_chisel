@@ -88,6 +88,7 @@ def main() -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     # Lazy imports — only available inside esmc.sif
+    import gc
     import time
     from protein_chisel.io.pdb import extract_sequence
     from protein_chisel.io.schemas import PositionTable
@@ -133,6 +134,17 @@ def main() -> None:
         LOGGER.info("expert %s -> shape=%s (%.1fs)", exp.name, lp.shape,
                     time.perf_counter() - t0)
         expert_lps.append(lp)
+        # Memory discipline: the model lives inside compute_log_probs and is already
+        # out of scope, but reclaim its allocations NOW (don't wait for lazy GC) so
+        # the next expert's model never overlaps the previous one's footprint. Frees
+        # only the model/cache — the small (L,20) `lp` is kept in expert_lps.
+        gc.collect()
+        try:
+            import torch as _torch
+            if _torch.cuda.is_available():
+                _torch.cuda.empty_cache()
+        except Exception:
+            pass
     shapes = {tuple(lp.shape) for lp in expert_lps}
     if len(shapes) != 1:
         raise RuntimeError(f"expert log-prob shapes disagree: {shapes}")
