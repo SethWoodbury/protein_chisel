@@ -87,6 +87,16 @@ def main() -> None:
     )
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Memory warning BEFORE the heavy PLM imports/loads, so it lands early in the
+    # Stage-2 log if the configured models risk exceeding the --mem budget.
+    # Logging-only — never changes behavior.
+    try:
+        from protein_chisel.utils.resources import warn_if_plm_mem_tight
+        warn_if_plm_mem_tight(args.esmc_model, args.saprot_model,
+                              getattr(args, "plm_dtype", "fp32"))
+    except Exception as _e:        # never let a memory probe break the run
+        LOGGER.debug("PLM memory warn skipped: %s", _e)
+
     # Lazy imports — only available inside esmc.sif
     import gc
     import time

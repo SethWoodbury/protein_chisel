@@ -199,6 +199,144 @@ def pool_workers(
     return max(1, min(n_jobs, cpu_budget, cap))
 
 
+# ---------------------------------------------------------------------------
+# Memory detection + PLM footprint warning (read-only; logging-only — never
+# changes pipeline behavior). Used by Stage 2 (precompute_plm_artifacts) to warn
+# before the big PLMs (SaProt 1.3B) OOM on a too-small --mem.
+# ---------------------------------------------------------------------------
+
+
+def _read_cgroup_mem_limit_mb() -> Optional[int]:
+    """cgroup memory cap in MB (v2 ``memory.max`` then v1 ``limit_in_bytes``);
+    ``None`` if absent or set to "no limit" (the "max" string / huge sentinels)."""
+    for path in ("/sys/fs/cgroup/memory.max",
+                 "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            raw = open(path).read().strip()
+        except OSError:
+            continue
+        if raw == "max":
+            continue
+        try:
+            b = int(raw)
+        except ValueError:
+            continue
+        if b <= 0 or b >= (1 << 62):   # ignore the "unlimited" sentinels
+            continue
+        return b // (1024 * 1024)
+    return None
+
+
+def _read_proc_mem_available_mb() -> Optional[int]:
+    """Node-wide ``MemAvailable`` (MB) from /proc/meminfo; ``None`` if unreadable."""
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024   # kB -> MB
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def detect_available_mem_mb() -> tuple[int, str]:
+    """Return ``(mem_mb, source)`` — the binding host-memory cap for this process.
+
+    Read-only + fork-safe. Takes the MIN of the SLURM allocation and the cgroup
+    limit when both are present (the smaller is the real cap); falls back to
+    /proc/meminfo MemAvailable (node-wide, weakest). ``(0, "unknown")`` if nothing
+    is detectable.
+    """
+    candidates: list[tuple[int, str]] = []
+    s = os.environ.get("SLURM_MEM_PER_NODE", "").strip()
+    if s.isdigit() and int(s) > 0:
+        candidates.append((int(s), "SLURM_MEM_PER_NODE"))
+    else:
+        pc = os.environ.get("SLURM_MEM_PER_CPU", "").strip()
+        if pc.isdigit() and int(pc) > 0:
+            ncpu, _ = detect_n_cpus()
+            candidates.append((int(pc) * ncpu, "SLURM_MEM_PER_CPU"))
+    cg = _read_cgroup_mem_limit_mb()
+    if cg:
+        candidates.append((cg, "cgroup"))
+    pm = _read_proc_mem_available_mb()
+    if pm:
+        candidates.append((pm, "/proc/meminfo"))
+    if not candidates:
+        return 0, "unknown"
+    return min(candidates, key=lambda t: t[0])
+
+
+# Rough resident-model footprint (MB, float32) per PLM variant. Anchored to the
+# measured datapoint (L=202, esmc_600m+saprot_1.3b: ~8 GB GPU host / ~14 GB CPU
+# MaxRSS) and the saprot_1.3b ~6 GB VRAM recon. Estimates for a WARNING only.
+_PLM_FOOTPRINT_MB = {
+    "esmc_300m": 1200, "esmc_600m": 2600,
+    "saprot_35m": 700, "saprot_650m": 3000, "saprot_650m_af2": 3000,
+    "saprot_1.3b": 6000,
+}
+_DTYPE_SCALE = {"fp32": 1.0, "fp16": 0.5, "bf16": 0.5}
+_PLM_BASE_OVERHEAD_MB = 2000   # torch/python/foldseek + forward activations
+
+
+def estimate_plm_footprint_mb(
+    esmc_model: str, saprot_model: str, dtype: str = "fp32",
+    *, on_gpu: Optional[bool] = None,
+) -> int:
+    """Rough peak HOST-RAM estimate (MB) for Stage-2 precompute.
+
+    Experts run one-at-a-time, so peak ≈ max(expert footprints)×dtype-scale, plus
+    base overhead. On GPU the weights live in VRAM (host holds a load copy +
+    activations); on CPU the model + activations sit in host RAM (~2× the weights).
+    ``on_gpu`` auto-detected when None.
+    """
+    if on_gpu is None:
+        n_gpus, _, _ = detect_n_gpus()
+        on_gpu = n_gpus > 0
+    scale = _DTYPE_SCALE.get(dtype, 1.0)
+    peak_model = max(_PLM_FOOTPRINT_MB.get(esmc_model, 2600),
+                     _PLM_FOOTPRINT_MB.get(saprot_model, 6000)) * scale
+    factor = 1.0 if on_gpu else 2.0
+    return int(peak_model * factor) + _PLM_BASE_OVERHEAD_MB
+
+
+def warn_if_plm_mem_tight(
+    esmc_model: str, saprot_model: str, dtype: str = "fp32",
+    *, margin: float = 0.85, log: bool = True, on_gpu: Optional[bool] = None,
+) -> bool:
+    """LOG a WARNING (never changes behavior) if the configured PLM footprint risks
+    exceeding the detected memory budget. Returns True when tight.
+
+    Suggests a smaller ``SAPROT_MODEL`` variant and/or ``--plm_dtype fp16`` /
+    ``PLM_DTYPE=fp16``. ``on_gpu`` (auto-detected when None) selects the host-RAM
+    factor. Call at Stage-2 startup (before models load).
+    """
+    budget, src = detect_available_mem_mb()
+    est = estimate_plm_footprint_mb(esmc_model, saprot_model, dtype, on_gpu=on_gpu)
+    if budget <= 0:
+        if log:
+            LOGGER.info("PLM memory estimate ~%d MB (esmc=%s saprot=%s dtype=%s); "
+                        "budget undetectable.", est, esmc_model, saprot_model, dtype)
+        return False
+    tight = est > margin * budget
+    if not log:
+        return tight
+    if tight:
+        suggest = []
+        if saprot_model not in ("saprot_35m", "saprot_650m"):
+            suggest.append("a smaller SAPROT_MODEL (e.g. saprot_650m / saprot_35m)")
+        if dtype == "fp32":
+            suggest.append("PLM_DTYPE=fp16 (--plm_dtype fp16; ~halves PLM memory)")
+        LOGGER.warning(
+            "PLM memory may be TIGHT: est ~%d MB (esmc=%s, saprot=%s, dtype=%s) vs "
+            "budget ~%d MB [%s]. Consider %s. (An OOM/SIGKILL in Stage 2 is likely this.)",
+            est, esmc_model, saprot_model, dtype, budget, src,
+            " or ".join(suggest) or "more --mem")
+    else:
+        LOGGER.info("PLM memory OK: est ~%d MB vs budget ~%d MB [%s].", est, budget, src)
+    return tight
+
+
 __all__ = [
     "ResourceInfo",
     "detect_n_cpus",
@@ -206,4 +344,7 @@ __all__ = [
     "detect_resources",
     "configure_torch_threads",
     "pool_workers",
+    "detect_available_mem_mb",
+    "estimate_plm_footprint_mb",
+    "warn_if_plm_mem_tight",
 ]
