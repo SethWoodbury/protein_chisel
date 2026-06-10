@@ -15,18 +15,27 @@ which runs the per-position masked-LM marginals for **ESM-C** and **SaProt**. Sa
   releasing everything. **Stage 3 (the design driver) never loads the PLMs** — it reads
   the small precomputed `.npy` artifacts. So a SaProt OOM can only happen in Stage 2.
 - **`low_cpu_mem_usage=True`** on the SaProt load streams the checkpoint into pre-allocated
-  tensors (no transient 2× CPU copy). Byte-identical weights.
+  tensors (no transient 2× CPU copy), saving load-time host RAM. **It requires the
+  `accelerate` package**; when that's absent (e.g. the current `esmc.sif`) the loader falls
+  back to the standard path automatically — same weights/logits, just without the saving.
 - **Per-artifact cache**: re-running the same scaffold skips model loading entirely.
 
-## Measured peak (L≈200–280, default `esmc_600m` + `saprot_1.3b`)
+## Measured peak (default `esmc_600m` + `saprot_1.3b`, GPU `gpu-bf`)
 
-| Run mode | Host RAM (MaxRSS) | Notes |
+| Metric (L=120 probe) | fp32 | fp16 |
 |---|---|---|
-| GPU (`gpu-bf`) | ~8 GB | models in VRAM; host holds load copy + activations |
-| CPU only | ~14–15 GB | SaProt-1.3B float32 resident in host RAM |
+| peak VRAM (`max_memory_allocated`) | ~5.3 GB | ~4.7 GB |
+| peak host RSS | ~6.9 GB | ~9.3 GB* |
 
-So on a **GPU partition** (recommended), `--mem=22g` is comfortable. CPU-only is where it's
-tight.
+Production-length (L≈200–280) host MaxRSS: ~8 GB on GPU, **~14–15 GB CPU-only** (SaProt-1.3B
+float32 in host RAM). So on a **GPU partition** (recommended) `--mem=22g` is comfortable;
+CPU-only is where host RAM is tight.
+
+> \* **Important:** `fp16`'s benefit is **VRAM**, not host RAM. Without `accelerate`, the
+> `torch_dtype=fp16` load materializes the fp32 checkpoint then casts (double-buffer), so the
+> host-load transient is *higher* than fp32. Use `fp16`/`bf16` when **GPU VRAM** is the binding
+> constraint (smaller GPU / larger model / longer sequence); installing `accelerate` in the
+> container would recover the host-RAM saving via `low_cpu_mem_usage`.
 
 ## Knobs to reduce memory
 
@@ -34,7 +43,8 @@ tight.
 |---|---|---|
 | `SAPROT_MODEL=saprot_650m` (or `saprot_35m`) | smaller model, less memory + faster | No (changes results — a model choice) |
 | `ESMC_MODEL=esmc_300m` | smaller ESM-C | No (model choice) |
-| `PLM_DTYPE=fp16` (`--plm_dtype fp16`) / `bf16` | **~halves PLM memory** (half-precision inference) | **No — opt-in.** Default `fp32` is byte-identical |
+| `PLM_DTYPE=fp16` (`--plm_dtype fp16`) / `bf16` | **lowers GPU VRAM** (half-precision weights); host RAM only drops if `accelerate` is present | **No — opt-in.** Default `fp32` is byte-identical |
+| `SAPROT_MODEL=saprot_650m` is the most reliable **host-RAM** reducer | smaller model in RAM | No (model choice) |
 | run on a GPU partition | model in VRAM, lower host RAM | Yes |
 
 ### `PLM_DTYPE` (opt-in half precision)
