@@ -447,6 +447,27 @@ METRICS_CLI=()
 [[ "$METRICS" != "all" ]] && METRICS_CLI+=( --metrics "$METRICS" )
 [[ "$FILTERS" != "all" ]] && METRICS_CLI+=( --filters "$FILTERS" )
 
+# Adaptive solubility-bias controller (opt-in, default OFF => byte-identical).
+# ADAPTIVE_BIAS=1 turns on the closed-loop controller that steers net charge +
+# surface hydrophobicity toward target across cycles (only when statistically out
+# of target; holds once in-band; reverses on overshoot). Sub-knobs are emitted only
+# when set, so the default driver command is unchanged.
+ADAPTIVE_BIAS="${ADAPTIVE_BIAS:-0}"
+ADAPTIVE_BIAS_CLI=()
+if [[ "$ADAPTIVE_BIAS" != "0" ]]; then
+    ADAPTIVE_BIAS_CLI+=( --adaptive_bias )
+    # ${VAR:-} so an unset sub-knob does not trip `set -u` when ADAPTIVE_BIAS=1.
+    [[ -n "${ADAPTIVE_BIAS_GAIN:-}"      ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_gain "$ADAPTIVE_BIAS_GAIN" )
+    [[ -n "${ADAPTIVE_BIAS_MAX_NATS:-}"  ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_max_nats "$ADAPTIVE_BIAS_MAX_NATS" )
+    [[ -n "${ADAPTIVE_BIAS_CARRY:-}"     ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_carry "$ADAPTIVE_BIAS_CARRY" )
+    [[ -n "${ADAPTIVE_BIAS_DEADBAND:-}"  ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_deadband "$ADAPTIVE_BIAS_DEADBAND" )
+    [[ -n "${ADAPTIVE_BIAS_TMIN:-}"      ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_tmin "$ADAPTIVE_BIAS_TMIN" )
+    [[ -n "${ADAPTIVE_BIAS_FMIN:-}"      ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_fmin "$ADAPTIVE_BIAS_FMIN" )
+    [[ -n "${ADAPTIVE_BIAS_MIN_N:-}"     ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_min_n "$ADAPTIVE_BIAS_MIN_N" )
+    [[ -n "${ADAPTIVE_BIAS_MODE:-}"      ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_mode "$ADAPTIVE_BIAS_MODE" )
+    [[ "${ADAPTIVE_BIAS_SEED_FROM_INPUT:-0}" == "1" ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_seed_from_input )
+fi
+
 # Decode-time Product-of-Experts backend (Phase: PoE; opt-in). Default 'bias' = the
 # in-process LigandMPNN sampler with our calibrated fusion bias (byte-identical).
 # MPNN_BACKEND=poe runs a SEPARATE HOST stage (nested apptainer is blocked) that
@@ -735,6 +756,7 @@ run_stage3_driver() {
             "${EXPERTS_CLI[@]}" \
             "${PLM_DTYPE_CLI[@]}" \
             "${METRICS_CLI[@]}" \
+            "${ADAPTIVE_BIAS_CLI[@]}" \
             "$@" \
             ${EXTRA_DRIVER_FLAGS:-}
 }

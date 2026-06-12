@@ -5,6 +5,28 @@ All notable changes to **protein_chisel** are documented here. Format loosely fo
 
 ## [Unreleased]
 
+### Added — Adaptive solubility-bias controller (opt-in, default OFF, byte-identical)
+- New closed-loop controller (`src/protein_chisel/sampling/adaptive_bias.py`) that, across
+  design cycles, measures the candidate pool's net charge + surface hydrophobicity and steers
+  the next cycle's LigandMPNN biases toward target solubility. **Default OFF** → byte-identical
+  to before; enable with `ADAPTIVE_BIAS=1` (`--adaptive_bias`).
+- **Integral-hold control** that holds the achieved bias once in-band (a near-static plant would
+  revert if the bias were released), **reverses on overshoot** (bidirectional), and fires only
+  when the pool is **statistically out of target** (t-stat + Wald-bounded fail-fraction + min-N
+  gate); per-AA surface down-weight is focused on **way-over-represented** hydrophobics (z>3 vs
+  the hydrolase reference). Online two-point gain estimate + wrong-sign freeze for stability.
+- **Two actuators, partitioned by safety**: charge → global D/E up / K/R down (composed with the
+  existing class-balance `bias_AA`, which wins conflicts); hydrophobicity → per-position
+  down-weight **only at `distal_surface`, non-fixed positions** (never the buried core or
+  catalytic/binding region). Disjoint AA sets → no double-count; all magnitudes clamped below the
+  PLM fusion scale.
+- Opt-in `--adaptive_bias_seed_from_input` warm-starts cycle 0 from the input scaffold's own
+  GRAVY/charge. Tunable knobs: gain / max_nats / carry / deadband / tmin / fmin / min_n / mode
+  (`proportional`|`bangbang`). Env passthrough in `run_chisel_design.sh` (emitted only when set).
+- **Input-hydrophobicity warning** (logging only): a seed `GRAVY > +0.4` logs that designs will
+  likely fail solubility filters and the controller can only steer the surface, not fix the fold.
+- Per-cycle telemetry `cycle_NN/00_bias/adaptive_bias_telemetry.json`. Docs: `docs/adaptive_bias.md`.
+
 ### Added / Changed — Stage-2 (PLM precompute) memory efficiency (default byte-identical)
 - `low_cpu_mem_usage=True` on the SaProt load (no transient 2× CPU weight copy;
   byte-identical weights). Explicit `gc.collect()` + `torch.cuda.empty_cache()` between

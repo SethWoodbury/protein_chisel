@@ -4078,6 +4078,8 @@ def run_cycle(
     ligand_resname: Optional[str] = None,
     throat_bias_prev: Optional[np.ndarray] = None,
     throat_bias_decay: float = 0.5,
+    adaptive_bias_global: Optional[dict] = None,
+    adaptive_bias_delta: Optional[np.ndarray] = None,
 ) -> tuple[Optional[pd.DataFrame], dict[str, Path], dict]:
     """Run ONE iteration cycle. Returns (ranked DataFrame, pdb_map, cycle_telemetry).
 
@@ -4153,6 +4155,21 @@ def run_cycle(
         telem["throat_bias_n_positions"] = 0
         telem["throat_bias_max_penalty"] = 0.0
 
+    # ---- 0a-ter. Adaptive-bias per-position surface delta (opt-in) ----
+    # Carried (already gain-controlled / held) from the previous cycle's adaptive
+    # controller. Added in the SAME additive slot as the throat delta. None unless
+    # --adaptive_bias is set, so the default path is byte-identical.
+    if (adaptive_bias_delta is not None
+            and adaptive_bias_delta.shape == bias_k.shape):
+        bias_k = bias_k + adaptive_bias_delta.astype(bias_k.dtype)
+        n_ab_pos = int((np.abs(adaptive_bias_delta) > 1e-6).any(axis=1).sum())
+        telem["adaptive_bias_n_positions"] = n_ab_pos
+        telem["adaptive_bias_max_penalty"] = float(adaptive_bias_delta.min())
+        LOGGER.info(
+            "cycle %d: applied ADAPTIVE surface bias at %d positions (max %.2f nats)",
+            cycle_cfg.cycle_idx, n_ab_pos, float(adaptive_bias_delta.min()),
+        )
+
     np.save(bias_dir / "bias.npy", bias_k)
     with open(bias_dir / "telemetry.json", "w") as fh:
         json.dump(telem, fh, indent=2)
@@ -4216,6 +4233,16 @@ def run_cycle(
         else:
             LOGGER.info("cycle %d class-balanced bias_AA: (no swaps triggered)",
                          cycle_cfg.cycle_idx)
+
+    # ---- 0c. Adaptive-bias global per-AA term (opt-in) -------------
+    # Carried (raw, unmerged) from the previous cycle's adaptive controller; merge
+    # it with THIS cycle's fresh class-balance bias (class-balance wins conflicts).
+    # None unless --adaptive_bias, so the default path is byte-identical.
+    if adaptive_bias_global:
+        from protein_chisel.sampling.adaptive_bias import merge_bias_AA_strings
+        bias_AA_str, _ab_conflicts = merge_bias_AA_strings(bias_AA_str, adaptive_bias_global)
+        LOGGER.info("cycle %d: merged ADAPTIVE global bias_AA -> %s",
+                    cycle_cfg.cycle_idx, bias_AA_str or "(empty)")
 
     # ---- 1. Sample --------------------------------------------------
     sample_dir = cycle_dir / "01_sample"
@@ -4635,6 +4662,42 @@ def main() -> None:
                         "throat bias at the start of each cycle. 0.5 = halve "
                         "the previous bias before adding new observations. "
                         "Lower values release pressure faster.")
+    # ---- Adaptive solubility bias controller (opt-in, default OFF) ----
+    p.add_argument("--adaptive_bias", action="store_true", default=False,
+                   help="OPT-IN closed-loop controller: after each cycle, measure "
+                        "the candidate pool's net charge and surface hydrophobicity "
+                        "and steer the next cycle's MPNN biases toward target "
+                        "solubility (global D/E up-weight; per-position hydrophobic "
+                        "down-weight at solvent-exposed surface positions). Fires "
+                        "only when the pool is statistically out of target, holds the "
+                        "bias once in-band, and reverses if it overshoots. Default "
+                        "OFF => byte-identical to the legacy pipeline.")
+    p.add_argument("--adaptive_bias_gain", type=float, default=0.6,
+                   help="Initial integral gain (unitless band-normalized error).")
+    p.add_argument("--adaptive_bias_max_nats", type=float, default=0.6,
+                   help="Clamp on the per-AA / per-cell bias magnitude (nats).")
+    p.add_argument("--adaptive_bias_carry", type=float, default=0.9,
+                   help="Integral leak during active correction (1=pure integral). "
+                        "When the pool is in-band the bias is held exactly.")
+    p.add_argument("--adaptive_bias_deadband", type=float, default=0.25,
+                   help="Deadband as a fraction of the band half-width: the "
+                        "controller aims for target but tolerates deviations within "
+                        "this fraction (avoids chasing noise).")
+    p.add_argument("--adaptive_bias_tmin", type=float, default=2.5,
+                   help="|t|-stat threshold (pool mean vs target) for the gate.")
+    p.add_argument("--adaptive_bias_fmin", type=float, default=0.15,
+                   help="Fail-fraction threshold for the gate.")
+    p.add_argument("--adaptive_bias_min_n", type=int, default=30,
+                   help="Minimum pool size to act on an axis.")
+    p.add_argument("--adaptive_bias_mode", choices=["proportional", "bangbang"],
+                   default="proportional",
+                   help="Control law: proportional (integral) or bang-bang "
+                        "(provably non-divergent; only the sign of the plant "
+                        "response matters).")
+    p.add_argument("--adaptive_bias_seed_from_input", action="store_true",
+                   default=False,
+                   help="Warm-start cycle 0 from the INPUT scaffold's hydrophobicity/"
+                        "charge instead of waiting for cycle 0's output.")
     p.add_argument("--protonate_final", action="store_true", default=True,
                    help="After stage_diverse_topk, hydrate every top-K PDB "
                         "via PyRosetta and write a downstream-clean "
@@ -5269,6 +5332,30 @@ def main() -> None:
     if len(wt_seq) != L:
         raise RuntimeError(f"WT seq length {len(wt_seq)} != PositionTable {L}")
 
+    # ---- Input-scaffold hydrophobicity warning (logging only) --------
+    # A scaffold whose whole-sequence GRAVY is already strongly positive folds into
+    # a hydrophobic blob with little polar surface; designs will track the backbone
+    # and tend to fail the solubility filters. --adaptive_bias can steer the surface
+    # but cannot make a hydrophobic FOLD soluble — surface this up front. Reuses the
+    # protparam GRAVY; never changes selection.
+    try:
+        from protein_chisel.filters.protparam import protparam_metrics as _pp_metrics
+        _seed_pp = _pp_metrics(wt_seq, ph=args.design_ph,
+                               n_term_pad=args.n_term_pad, c_term_pad=args.c_term_pad)
+        _seed_gravy = float(_seed_pp.gravy)
+        _seed_charge = float(_seed_pp.charge_at_pH_full_HH)
+        if _seed_gravy > 0.4:
+            LOGGER.warning(
+                "INPUT SCAFFOLD is hydrophobic: seed GRAVY=%+.2f (>+0.4), "
+                "net_charge=%+.1f. Designs will track this backbone and likely fail "
+                "the solubility/SAP filters; %s can steer the exposed surface but "
+                "cannot make a hydrophobic fold soluble. Consider pre-filtering "
+                "inputs by GRAVY upstream.", _seed_gravy, _seed_charge,
+                "--adaptive_bias" if args.adaptive_bias else "the adaptive controller")
+    except Exception:                              # pragma: no cover - advisory only
+        _seed_gravy = None
+        _seed_charge = None
+
     # Compute ligand geometry summary ONCE — scaffold-invariant. The
     # min_projected_radius is the relevant tunnel-fit threshold.
     try:
@@ -5479,6 +5566,60 @@ def main() -> None:
     # cycle 0 (no prior data); populated from cycle k for cycle k+1.
     throat_bias_prev: Optional[np.ndarray] = None
 
+    # ---- Adaptive solubility-bias controller (opt-in) ----------------
+    # The controller LOGIC lives here in the loop (where the full per-cycle
+    # candidate pool is available); run_cycle only APPLIES the carried biases.
+    # All three carried objects are None until the controller produces them, so
+    # when --adaptive_bias is off run_cycle receives None and the path is
+    # byte-identical.
+    adaptive_state: Optional[dict] = None          # {axis: AxisState.to_dict()}
+    adaptive_global: Optional[dict] = None         # raw global per-AA bias to apply next
+    adaptive_delta: Optional[np.ndarray] = None    # (L,20) surface delta to apply next
+    _ab_sasa = None
+    _ab_fixed_idx: set = set()
+    _ab_cfg = None
+    if args.adaptive_bias:
+        from protein_chisel.sampling.adaptive_bias import (
+            AdaptiveBiasConfig, compute_adaptive_bias, default_axes,
+        )
+        _ab_cfg = AdaptiveBiasConfig(
+            gain=args.adaptive_bias_gain, max_nats=args.adaptive_bias_max_nats,
+            carry=args.adaptive_bias_carry, t_min=args.adaptive_bias_tmin,
+            f_min=args.adaptive_bias_fmin, min_n=args.adaptive_bias_min_n,
+            mode=args.adaptive_bias_mode,
+        )
+        try:
+            _ab_r2s = dict(zip(pt.df["resno"].astype(int),
+                               pt.df["sasa_sc_fraction"].astype(float)))
+            _ab_sasa = np.array([_ab_r2s.get(int(r), 0.0) for r in protein_resnos],
+                                dtype=float)
+        except Exception:                          # pragma: no cover - defensive
+            _ab_sasa = None
+        _ab_r2i = {int(r): i for i, r in enumerate(protein_resnos)}
+        _ab_fixed_idx = {_ab_r2i[int(r)] for r in fixed_resnos if int(r) in _ab_r2i}
+        LOGGER.info("adaptive-bias controller ENABLED (gain=%.2f max=%.2f carry=%.2f "
+                    "tmin=%.1f fmin=%.2f min_n=%d mode=%s)",
+                    _ab_cfg.gain, _ab_cfg.max_nats, _ab_cfg.carry, _ab_cfg.t_min,
+                    _ab_cfg.f_min, _ab_cfg.min_n, _ab_cfg.mode)
+        # Optional cycle-0 warm-start from the input scaffold's own properties.
+        if args.adaptive_bias_seed_from_input and _seed_gravy is not None:
+            from protein_chisel.sampling.adaptive_bias import seed_warmstart
+            _ab_seed_axes = default_axes(
+                gravy_band=(args.gravy_min, args.gravy_max),
+                net_charge_band=(cycles[0].net_charge_min, cycles[0].net_charge_max),
+                deadband_frac=args.adaptive_bias_deadband,
+            )
+            adaptive_global, adaptive_delta, adaptive_state, _ab_seed_tele = seed_warmstart(
+                seed_metrics={"gravy": _seed_gravy, "net_charge_full_HH": _seed_charge},
+                axes=_ab_seed_axes, cfg=_ab_cfg, L=base_bias.shape[0],
+                position_classes=position_classes, sasa_fraction=_ab_sasa,
+                fixed_idx=_ab_fixed_idx,
+            )
+            adaptive_global = adaptive_global or None
+            adaptive_delta = adaptive_delta if np.any(adaptive_delta) else None
+            LOGGER.info("adaptive-bias seed warm-start from input: global=%s surface=%s",
+                        adaptive_global or "{}", _ab_seed_tele["seed_warmstart"])
+
     # Per-cycle metrics snapshot — written to run_dir/cycle_metrics.tsv at the
     # end so the user can grep / plot how filter populations and quality
     # change across cycles. Always written; --verbose adds more granular
@@ -5534,6 +5675,8 @@ def main() -> None:
             ligand_resname=ligand_geometry_summary.get("ligand_resname"),
             throat_bias_prev=throat_bias_prev,
             throat_bias_decay=args.throat_feedback_decay,
+            adaptive_bias_global=adaptive_global,
+            adaptive_bias_delta=adaptive_delta,
         )
         # Carry throat-bias forward to next cycle (None if disabled or
         # this cycle didn't produce one).
@@ -5545,6 +5688,43 @@ def main() -> None:
         seq_stage_df = _load_cycle_seq_stage_pool(cycle_dir, cyc.cycle_idx)
         if len(seq_stage_df) > 0:
             all_seq_stage_rows.append(seq_stage_df)
+
+        # ---- Adaptive controller: measure THIS cycle's full candidate pool and
+        # produce the bias to apply NEXT cycle (mirrors the throat carry pattern).
+        if args.adaptive_bias and _ab_cfg is not None:
+            ab_axes = default_axes(
+                gravy_band=(
+                    cyc.gravy_min if args.strategy == "annealing" else args.gravy_min,
+                    cyc.gravy_max if args.strategy == "annealing" else args.gravy_max),
+                net_charge_band=(cyc.net_charge_min, cyc.net_charge_max),
+                deadband_frac=args.adaptive_bias_deadband,
+            )
+            from protein_chisel.sampling.adaptive_bias import hydrophobic_over_rep_mask
+            _ab_overrep = (hydrophobic_over_rep_mask(
+                seq_stage_df["sequence"].astype(str).tolist())
+                if "sequence" in seq_stage_df.columns else None)
+            ab_res = compute_adaptive_bias(
+                pool_df=seq_stage_df, axes=ab_axes, cfg=_ab_cfg, state=adaptive_state,
+                L=base_bias.shape[0], position_classes=position_classes,
+                sasa_fraction=_ab_sasa, fixed_idx=_ab_fixed_idx,
+                over_rep_mask=_ab_overrep,
+            )
+            adaptive_state = ab_res.new_state
+            adaptive_global = ab_res.controller_global or None
+            adaptive_delta = (ab_res.per_position_delta
+                              if np.any(ab_res.per_position_delta) else None)
+            try:
+                ab_bias_dir = cycle_dir / "00_bias"
+                ab_bias_dir.mkdir(parents=True, exist_ok=True)
+                with open(ab_bias_dir / "adaptive_bias_telemetry.json", "w") as fh:
+                    json.dump(ab_res.telemetry, fh, indent=2, default=str)
+            except Exception:                      # pragma: no cover - telemetry only
+                pass
+            _open = [o.name for o in ab_res.outcomes if o.gate_open]
+            LOGGER.info("cycle %d adaptive controller: axes_active=%s global=%s "
+                        "surface_positions=%d", cyc.cycle_idx, _open or "none",
+                        adaptive_global or "{}",
+                        ab_res.telemetry.get("n_surface_positions_touched", 0))
         if ranked_df is not None and len(ranked_df) > 0:
             ranked_df = ranked_df.copy()
             ranked_df["cycle"] = cyc.cycle_idx
