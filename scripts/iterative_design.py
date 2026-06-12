@@ -5691,40 +5691,49 @@ def main() -> None:
 
         # ---- Adaptive controller: measure THIS cycle's full candidate pool and
         # produce the bias to apply NEXT cycle (mirrors the throat carry pattern).
+        # Defensively wrapped: a controller failure must NEVER abort the design run
+        # (degrade to the legacy UNBIASED path and continue). Byte-identical on the
+        # success path; the except only triggers on an unanticipated edge.
         if args.adaptive_bias and _ab_cfg is not None:
-            ab_axes = default_axes(
-                gravy_band=(
-                    cyc.gravy_min if args.strategy == "annealing" else args.gravy_min,
-                    cyc.gravy_max if args.strategy == "annealing" else args.gravy_max),
-                net_charge_band=(cyc.net_charge_min, cyc.net_charge_max),
-                deadband_frac=args.adaptive_bias_deadband,
-            )
-            from protein_chisel.sampling.adaptive_bias import hydrophobic_over_rep_mask
-            _ab_overrep = (hydrophobic_over_rep_mask(
-                seq_stage_df["sequence"].astype(str).tolist())
-                if "sequence" in seq_stage_df.columns else None)
-            ab_res = compute_adaptive_bias(
-                pool_df=seq_stage_df, axes=ab_axes, cfg=_ab_cfg, state=adaptive_state,
-                L=base_bias.shape[0], position_classes=position_classes,
-                sasa_fraction=_ab_sasa, fixed_idx=_ab_fixed_idx,
-                over_rep_mask=_ab_overrep,
-            )
-            adaptive_state = ab_res.new_state
-            adaptive_global = ab_res.controller_global or None
-            adaptive_delta = (ab_res.per_position_delta
-                              if np.any(ab_res.per_position_delta) else None)
             try:
-                ab_bias_dir = cycle_dir / "00_bias"
-                ab_bias_dir.mkdir(parents=True, exist_ok=True)
-                with open(ab_bias_dir / "adaptive_bias_telemetry.json", "w") as fh:
-                    json.dump(ab_res.telemetry, fh, indent=2, default=str)
-            except Exception:                      # pragma: no cover - telemetry only
-                pass
-            _open = [o.name for o in ab_res.outcomes if o.gate_open]
-            LOGGER.info("cycle %d adaptive controller: axes_active=%s global=%s "
-                        "surface_positions=%d", cyc.cycle_idx, _open or "none",
-                        adaptive_global or "{}",
-                        ab_res.telemetry.get("n_surface_positions_touched", 0))
+                ab_axes = default_axes(
+                    gravy_band=(
+                        cyc.gravy_min if args.strategy == "annealing" else args.gravy_min,
+                        cyc.gravy_max if args.strategy == "annealing" else args.gravy_max),
+                    net_charge_band=(cyc.net_charge_min, cyc.net_charge_max),
+                    deadband_frac=args.adaptive_bias_deadband,
+                )
+                from protein_chisel.sampling.adaptive_bias import hydrophobic_over_rep_mask
+                _ab_overrep = (hydrophobic_over_rep_mask(
+                    seq_stage_df["sequence"].astype(str).tolist())
+                    if "sequence" in seq_stage_df.columns else None)
+                ab_res = compute_adaptive_bias(
+                    pool_df=seq_stage_df, axes=ab_axes, cfg=_ab_cfg, state=adaptive_state,
+                    L=base_bias.shape[0], position_classes=position_classes,
+                    sasa_fraction=_ab_sasa, fixed_idx=_ab_fixed_idx,
+                    over_rep_mask=_ab_overrep,
+                )
+                adaptive_state = ab_res.new_state
+                adaptive_global = ab_res.controller_global or None
+                adaptive_delta = (ab_res.per_position_delta
+                                  if np.any(ab_res.per_position_delta) else None)
+                try:
+                    ab_bias_dir = cycle_dir / "00_bias"
+                    ab_bias_dir.mkdir(parents=True, exist_ok=True)
+                    with open(ab_bias_dir / "adaptive_bias_telemetry.json", "w") as fh:
+                        json.dump(ab_res.telemetry, fh, indent=2, default=str)
+                except Exception:                  # pragma: no cover - telemetry only
+                    pass
+                _open = [o.name for o in ab_res.outcomes if o.gate_open]
+                LOGGER.info("cycle %d adaptive controller: axes_active=%s global=%s "
+                            "surface_positions=%d", cyc.cycle_idx, _open or "none",
+                            adaptive_global or "{}",
+                            ab_res.telemetry.get("n_surface_positions_touched", 0))
+            except Exception:
+                LOGGER.exception(
+                    "cycle %d adaptive controller FAILED; continuing UNBIASED "
+                    "(legacy path) for the rest of this run", cyc.cycle_idx)
+                adaptive_global, adaptive_delta = None, None
         if ranked_df is not None and len(ranked_df) > 0:
             ranked_df = ranked_df.copy()
             ranked_df["cycle"] = cyc.cycle_idx
