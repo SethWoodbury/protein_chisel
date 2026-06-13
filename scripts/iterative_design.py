@@ -3060,6 +3060,7 @@ def _build_input_reference_row(
     clash_filter: bool,
     clash_severe_distance: float,
     sap_max_threshold: float,
+    sap_corrected: bool = False,
     seed_dfi_metrics: Optional[dict],
     tunnel_metrics_enabled: bool,
     ligand_min_radius: Optional[float],
@@ -3166,6 +3167,7 @@ def _build_input_reference_row(
     _, struct_row, _, struct_reasons = _struct_filter_worker((
         seed_id, seed_pdb, list(catalytic_resnos), list(fixed_resnos),
         clash_severe_distance, sap_max_threshold, seed_dfi_metrics,
+        sap_corrected,
     ))
     struct_reasons = list(struct_reasons)
     if clash_filter and _filter_active("clash") and struct_row.get("clash__has_severe"):
@@ -6463,6 +6465,7 @@ def main() -> None:
                 clash_filter=final_cycle_cfg.clash_filter,
                 clash_severe_distance=final_cycle_cfg.clash_severe_distance,
                 sap_max_threshold=final_cycle_cfg.sap_max_threshold,
+                sap_corrected=args.sap_corrected,
                 seed_dfi_metrics=seed_dfi_metrics,
                 tunnel_metrics_enabled=_tunnel_metrics_enabled,
                 ligand_min_radius=ligand_geometry_summary.get("min_projected_radius"),
@@ -6783,6 +6786,7 @@ def main() -> None:
                     clash_filter=final_cycle_cfg.clash_filter,
                     clash_severe_distance=final_cycle_cfg.clash_severe_distance,
                     sap_max_threshold=final_cycle_cfg.sap_max_threshold,
+                    sap_corrected=args.sap_corrected,
                     seed_dfi_metrics=seed_dfi_metrics,
                     tunnel_metrics_enabled=_tunnel_metrics_enabled,
                     ligand_min_radius=ligand_geometry_summary.get("min_projected_radius"),

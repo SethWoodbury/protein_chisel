@@ -17,7 +17,11 @@ All notable changes to **protein_chisel** are documented here. Format loosely fo
   surfaces register** (raw KD scores Ala only +1.8; centered +2.29) — the two blind spots that let a
   GRAVY=1.05 / 26%-Ala design read sap_max≈17. Threaded worker → `stage_struct_filter` → `run_cycle`
   → driver → shell. Rescued backfill rows carry NaN `sap_corr_*` (not re-scored). 9 host tests.
-  (Foundation for the planned per-residue SAP ControlAxis; see `docs/plans/solubility_steering_plan.md`.)
+  Independently reviewed (codex): confirmed legacy `sap_*` bit-identical (500-case float-hex match)
+  and caught a worker-tuple arity crash — `_build_input_reference_row` (input-reference scoring, ON
+  by default) still passed the old 7-tuple to the 8-field worker → `ValueError` on every default run;
+  fixed by threading `sap_corrected` to that second producer too. (Foundation for the planned
+  per-residue SAP ControlAxis; see `docs/plans/solubility_steering_plan.md`.)
 
 ### Fixed / Added — Hard solubility veto in final selection (opt-in, default OFF, byte-identical)
 - **Bug:** deferred-rescue/backfill re-scored fallback candidates through struct/tunnel/fpocket
