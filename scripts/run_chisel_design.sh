@@ -488,6 +488,25 @@ SAP_CORRECTED_CLI=()
 [[ "${SAP_CORRECTED:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]] \
     && SAP_CORRECTED_CLI+=( --sap_corrected )
 
+# WS-C composition control (opt-in; default OFF/unset => byte-identical).
+#   COMPOSITION_SUPPRESS_ALL_OVERREP=1  down-weight every over-rep class member
+#                                        (not just the class max) in bias_AA.
+#   AA_FRACTION_CAP=<frac>              hard-omit any AA at/over <frac> of a
+#                                        cycle's survivor pool next cycle.
+#   COMPOSITION_SOFT_BIAS=1             activate the expression SOFT_BIAS tier
+#                                        (per-residue AA down-weights at sampling).
+#   COMPOSITION_SOFT_BIAS_NATS=<nats>   magnitude per SOFT_BIAS cell (default 0.5).
+COMPOSITION_CLI=()
+[[ "${COMPOSITION_SUPPRESS_ALL_OVERREP:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]] \
+    && COMPOSITION_CLI+=( --composition_suppress_all_overrep )
+[[ -n "${AA_FRACTION_CAP:-}" ]] \
+    && COMPOSITION_CLI+=( --aa_fraction_cap "$AA_FRACTION_CAP" )
+if [[ "${COMPOSITION_SOFT_BIAS:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]]; then
+    COMPOSITION_CLI+=( --composition_soft_bias )
+    [[ -n "${COMPOSITION_SOFT_BIAS_NATS:-}" ]] \
+        && COMPOSITION_CLI+=( --composition_soft_bias_nats "$COMPOSITION_SOFT_BIAS_NATS" )
+fi
+
 # Decode-time Product-of-Experts backend (Phase: PoE; opt-in). Default 'bias' = the
 # in-process LigandMPNN sampler with our calibrated fusion bias (byte-identical).
 # MPNN_BACKEND=poe runs a SEPARATE HOST stage (nested apptainer is blocked) that
@@ -779,6 +798,7 @@ run_stage3_driver() {
             "${ADAPTIVE_BIAS_CLI[@]}" \
             "${SHIP_SOLUBILITY_VETO_CLI[@]}" \
             "${SAP_CORRECTED_CLI[@]}" \
+            "${COMPOSITION_CLI[@]}" \
             "$@" \
             ${EXTRA_DRIVER_FLAGS:-}
 }

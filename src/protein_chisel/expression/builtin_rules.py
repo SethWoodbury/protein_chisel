@@ -616,7 +616,10 @@ class AaCompositionOutOfDistributionRule(Rule):
                 start=0, end=ctx.L, matched=aa,
                 suggested_omit_AAs=aa,
                 reason=f"{aa} over-represented (z={z:.2f} vs {reference})",
-                metadata={"aa": aa, "z_score": float(z)},
+                # aggregate: a whole-sequence composition signal (already covered
+                # by the suppress-all / fraction-cap levers) — excluded from the
+                # per-residue soft-bias tier.
+                metadata={"aa": aa, "z_score": float(z), "aggregate": True},
             ))
         return hits
 
@@ -694,7 +697,10 @@ class MethionineOverrepresentedRule(Rule):
             suggested_omit_AAs="M",
             reason=f"Methionine over-represented (z={z:.2f}); risk of "
                    f"internal alt-start codons",
-            metadata={"M_z": float(z), "M_pct": aa_composition_pct(ctx.sequence)["M"]},
+            # aggregate: a whole-sequence Met-fraction signal, not a per-position
+            # liability — excluded from the per-residue soft-bias tier.
+            metadata={"M_z": float(z), "M_pct": aa_composition_pct(ctx.sequence)["M"],
+                      "aggregate": True},
         )]
 
 
@@ -768,7 +774,10 @@ class DibasicMotifCountCapRule(Rule):
             matched=str(len(matches)),
             suggested_omit_AAs="KR",
             reason=f"{len(matches)} dibasic motifs exceeds cap {cap}",
-            metadata={"n_motifs": len(matches), "cap": cap},
+            # aggregate: a whole-sequence count, not a per-position liability — its
+            # span is the motif envelope, so it is excluded from the per-residue
+            # soft-bias tier (handled globally instead).
+            metadata={"n_motifs": len(matches), "cap": cap, "aggregate": True},
         )]
 
 

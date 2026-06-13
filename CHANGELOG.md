@@ -5,6 +5,72 @@ All notable changes to **protein_chisel** are documented here. Format loosely fo
 
 ## [Unreleased]
 
+### Added — WS-C composition control that actually corrects (opt-in, default OFF, byte-identical)
+- Three independent opt-in levers attack the over-/single-AA-representation failure
+  mode (the shipped rank-0 design was 26% Ala / 20% Leu); each defaults to current
+  behavior so a no-new-flag run is byte-for-byte identical.
+- **`--composition_suppress_all_overrep` / `COMPOSITION_SUPPRESS_ALL_OVERREP=1`** —
+  the per-cycle class-balanced `bias_AA` now down-weights **every** over-represented
+  member of an AA class (`z > --balance_z_threshold`), not just the single class
+  maximum. The legacy path touches only the class max, so when Alanine is the
+  hydrophobic-aliphatic max an also-over-represented Leucine **escaped** correction
+  entirely; it no longer does. The property-conserving within-class swap up-weight of
+  the most under-represented partner is preserved (attached to the class-max
+  down-weight). Singleton classes (P, G) are unaffected — their only member already
+  *is* the class max. Lives in `expression/aa_class_balance.py` behind a new
+  `suppress_all_overrep=False` kwarg (off-path is the legacy code verbatim).
+- **`--aa_fraction_cap FRAC` / `AA_FRACTION_CAP`** — hard-omit any amino acid whose
+  fraction in a cycle's survivor pool is `>= FRAC` (e.g. 0.15) at every **non-fixed
+  designable** position the next cycle, bounding runaway single-AA over-representation.
+  Recomputed each cycle from that cycle's survivors, so an AA is re-allowed once it
+  falls back under the cap; catalytic/fixed positions keep their identity. Reference-
+  free (caps on the raw observed fraction, not a per-class z) so it generalises to any
+  scaffold/objective. New pure `expression/aa_composition.over_cap_aas` kernel +
+  testable `_build_fraction_cap_omit` driver helper, merged into the existing
+  per-residue omit (`None` cap / nothing-over-cap → empty dict → byte-identical merge).
+  **Safety (independent-review):** validated as a finite fraction in `(0, 1]`; a cap so
+  low it would leave a position with fewer than 3 sampleable AAs is **skipped** that
+  cycle with an ERROR — never producing an all/most-AA omit, which fused MPNN encodes
+  as equal `-1e8` logits and would then sample *uniformly from the "forbidden" set*.
+- **`--composition_soft_bias` (+ `--composition_soft_bias_nats`, default 0.5) /
+  `COMPOSITION_SOFT_BIAS` / `COMPOSITION_SOFT_BIAS_NATS`** — activate the previously
+  **dead** per-residue SOFT_BIAS tier of the expression engine (long-hydrophobic-
+  stretch, KR-near-catalytic-on-helix, polyproline, repetitive-segment, …) as a
+  negative per-`(position, AA)` bias added to each cycle's sampler bias in the same
+  additive slot as the throat/adaptive deltas. The map is **pool-derived per cycle**
+  (`expression/engine.aggregate_pool_soft_bias`): the engine is re-evaluated on the
+  cycle's survivors and a `(position, AA)` liability is applied only if it recurs in
+  `>= 50%` of survivors (support gate) — so the tier tracks the liabilities the
+  *designs* introduce as the pool drifts (polyproline/repeat/hydrophobic-stretch are
+  sequence-determined; a seed-only map is blind to them), not just the WT's. The seed
+  map bootstraps cycle 0. **Whole-protein composition hits are excluded** via a new
+  `soft_bias_per_residue(max_span_frac=…)` span filter — those are the suppress-all /
+  fraction-cap levers' job, and including them would freeze a whole-protein single-AA
+  ban. Aggregate rules (dibasic-motif-count, composition-out-of-distribution,
+  methionine-overrepresented) additionally self-declare `metadata["aggregate"]`, so
+  their region-envelope hits are dropped from the per-residue tier regardless of span
+  (a dibasic-count hit spans first-to-last motif and would otherwise bias every
+  intervening non-motif position). Pure `soft_bias_to_bias_array` helper translates
+  `{position → AAs}` into an
+  `(L, 20)` downweight in the canonical PLM/LigandMPNN column order (a test locks
+  `AA_ORDER_REF == plm_fusion.AA_ORDER`; repeated AA letters de-dup). **Magnitude
+  (independent-review):** the bias is added in **logit space** (before the softmax
+  temperature divide), so the effective odds penalty is `exp(nats / T)`; at the
+  pipeline's `T≈0.15–0.20` the default **0.5** nats is ~12–28× (a firm nudge near the
+  adaptive controller's ~0.6 clamp), where the initially-chosen 1.5 would have been a
+  ~1800–22000× near-hard ban. Magnitude validated finite `>= 0` (a NaN would poison the
+  sampling softmax).
+- Under the one-shot **PoE** backend (`--mpnn_backend poe`) the suppress-all and
+  fraction-cap levers act on a survivor pool that never exists, so they are explicit
+  no-ops and now log a WARNING (the soft-bias still applies via its cycle-0 seed
+  bootstrap).
+- Reviewed across three rounds by codex + two independent subagents; every P1/P2/P3 is
+  folded in above: the fraction-cap all-omit (incl. the post-merge cap × structural-omit
+  interaction, guarded by `_enforce_min_sampleable_after_cap`, which reverts the cap and
+  re-verifies the structural base), the soft-bias magnitude, seed-vs-pool source, the
+  aggregate-rule over-application, and per-survivor evaluation robustness.
+  51 new host tests (24 unit + 27 integration); full host suite 762 passed.
+
 ### Added — Corrected SAP + shared `scoring/sap.py` module (opt-in, default OFF, byte-identical)
 - New `src/protein_chisel/scoring/sap.py` — single source of truth for the Kyte-Doolittle scale,
   Tien max-SASA, the 3→1 map, and a pure `sap_neighborhood_metrics` reduction. Removes the dicts

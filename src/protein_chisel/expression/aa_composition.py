@@ -193,6 +193,34 @@ def aa_composition_pct(sequence: str) -> dict[str, float]:
     return out
 
 
+def over_cap_aas(
+    sequence: str,
+    cap: float,
+    *,
+    exclude_aas: str = "",
+) -> list[str]:
+    """Amino acids whose fraction in ``sequence`` is at/over ``cap``.
+
+    ``cap`` is a fraction in [0, 1] (e.g. 0.15 = 15%); the comparison is
+    ``fraction >= cap`` (inclusive). Members of ``exclude_aas`` are never
+    returned (they are typically already hard-omitted, so capping them is
+    redundant). Returns a sorted, de-duplicated list of 1-letter codes.
+
+    This is the pure kernel behind the opt-in ``--aa_fraction_cap``: any AA
+    over the cap in a cycle's survivor pool is hard-omitted next cycle,
+    bounding runaway single-AA over-representation. Reference-free by design
+    — it caps on the raw observed fraction, not a z-score, so it generalises
+    to any scaffold/objective without a per-class baseline.
+    """
+    pct = aa_composition_pct(sequence)        # percent per AA (0-100)
+    excl = set(exclude_aas.upper())
+    cap_pct = cap * 100.0
+    return sorted(
+        aa for aa, p in pct.items()
+        if aa not in excl and p >= cap_pct
+    )
+
+
 def aa_z_scores(
     sequence: str,
     reference: str = "swissprot_enzyme_2026_01",
@@ -331,4 +359,5 @@ __all__ = [
     "aa_quality_check",
     "aa_z_scores",
     "out_of_distribution_aas",
+    "over_cap_aas",
 ]

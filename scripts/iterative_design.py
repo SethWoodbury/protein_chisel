@@ -41,6 +41,7 @@ import argparse
 import datetime as _dt
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -159,6 +160,48 @@ def _parse_bool_arg(value: str | bool) -> bool:
     raise argparse.ArgumentTypeError(
         f"expected boolean true/false for this flag, got {value!r}",
     )
+
+
+def _fraction_arg(value: str) -> float:
+    """Parse a CLI fraction, requiring a finite value in (0, 1].
+
+    Used for ``--aa_fraction_cap``: a cap of 0/negative/NaN or an absurdly low
+    value would omit every (or nearly every) amino acid, which fused MPNN encodes
+    as equal ``-1e8`` logits → it then samples *uniformly from the "forbidden"
+    set* rather than respecting the omit. Reject those at the CLI boundary.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"expected a number, got {value!r}")
+    if not math.isfinite(v) or not (0.0 < v <= 1.0):
+        raise argparse.ArgumentTypeError(
+            f"expected a finite fraction in (0, 1], got {value!r}",
+        )
+    return v
+
+
+def _nonneg_finite_arg(value: str, *, max_value: Optional[float] = None) -> float:
+    """Parse a CLI magnitude, requiring a finite value in ``[0, max_value]``.
+
+    Used for nats magnitudes (e.g. ``--composition_soft_bias_nats``): a NaN/inf
+    bias would propagate into the sampling softmax and poison every probability,
+    and an absurd-but-finite value (e.g. ``1e100``) casts to ``-inf`` in the
+    float32 sampler bias — ``max_value`` rejects those at the CLI boundary.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"expected a number, got {value!r}")
+    if not math.isfinite(v) or v < 0.0:
+        raise argparse.ArgumentTypeError(
+            f"expected a finite value >= 0, got {value!r}",
+        )
+    if max_value is not None and v > max_value:
+        raise argparse.ArgumentTypeError(
+            f"expected a value <= {max_value}, got {value!r}",
+        )
+    return v
 
 
 def _derive_catres_from_remark_666(seed_pdb: Path | str) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -777,6 +820,132 @@ def merge_omit_dicts(*dicts: dict[str, str]) -> dict[str, str]:
             cur = set(out.get(k, ""))
             cur.update(aas)
             out[k] = "".join(sorted(cur))
+    return out
+
+
+# The 20 canonical amino acids (set; order-independent membership tests).
+_CANONICAL_AAS = frozenset("ACDEFGHIKLMNPQRSTVWY")
+
+# WS-C fraction cap never leaves a designable position with fewer than this many
+# sampleable AAs (guards the all-AAs-omitted → uniform-from-forbidden MPNN failure).
+_MIN_SAMPLEABLE_AAS_AFTER_CAP = 3
+
+# Upper bound (nats) on --composition_soft_bias_nats: well past a hard ban (the
+# effective odds penalty is exp(nats / T); at T≈0.15 even 0.5 is ~28x), and small
+# enough that the bias never overflows the float32 sampler matrix to -inf.
+_SOFT_BIAS_NATS_MAX = 20.0
+
+# WS-C composition soft-bias (pool-derived per cycle): a per-residue SOFT_BIAS
+# liability is applied only if it appears in >= _SOFT_BIAS_MIN_SUPPORT of the
+# survivor pool (so a one-off survivor can't pollute the bias), and only LOCAL
+# hits (span <= _SOFT_BIAS_MAX_SPAN_FRAC * L) count — whole-protein composition
+# hits are left to the suppress-all / fraction-cap levers.
+_SOFT_BIAS_MIN_SUPPORT = 0.5
+_SOFT_BIAS_MAX_SPAN_FRAC = 0.5
+
+
+def _build_fraction_cap_omit(
+    pool_seq: str,
+    cap: Optional[float],
+    *,
+    protein_resnos: Iterable[int],
+    fixed_resnos: Iterable[int],
+    chain: str = CHAIN,
+    exclude_aas: str = "",
+) -> dict[str, str]:
+    """WS-C per-AA fraction cap → per-residue omit dict (``--aa_fraction_cap``).
+
+    Returns ``{"<chain><resno>": "AAs"}`` forbidding every amino acid whose
+    fraction in ``pool_seq`` is at/over ``cap`` (e.g. 0.15), at every NON-FIXED
+    designable position (``protein_resnos`` minus ``fixed_resnos``). Catalytic /
+    fixed positions keep their identity (they are never redesigned). Members of
+    ``exclude_aas`` (already hard-omitted, e.g. cysteine) are never re-capped.
+
+    ``cap is None`` (the default) or no AA over the cap → ``{}`` (a no-op, so the
+    merged omit — and the whole run — is byte-identical). Pure + reference-free.
+    """
+    if cap is None:
+        return {}
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from protein_chisel.expression.aa_composition import AA_ORDER_REF, over_cap_aas
+    capped = over_cap_aas(pool_seq, cap, exclude_aas=exclude_aas)
+    if not capped:
+        return {}
+    # SAFETY GUARD: never omit so many AAs that the sampler is left with fewer
+    # than _MIN_SAMPLEABLE_AAS_AFTER_CAP choices. Omitting ALL canonical AAs makes
+    # fused MPNN's per-AA omit logits equal (-1e8), so it samples uniformly from
+    # the supposedly-forbidden set — a silent failure worse than a crash. A cap
+    # this aggressive is a misconfiguration (cap too low for a low-diversity
+    # pool); skip it this cycle and surface it loudly.
+    n_sampleable = len(set(AA_ORDER_REF) - {c for c in exclude_aas.upper()})
+    if len(capped) > max(0, n_sampleable - _MIN_SAMPLEABLE_AAS_AFTER_CAP):
+        LOGGER.error(
+            "aa_fraction_cap=%.4f would omit %d of %d sampleable AAs (%s), leaving "
+            "fewer than %d — cap too low for this pool; SKIPPING the cap this cycle.",
+            cap, len(capped), n_sampleable, "".join(capped),
+            _MIN_SAMPLEABLE_AAS_AFTER_CAP,
+        )
+        return {}
+    cap_str = "".join(capped)
+    fixed_set = {int(r) for r in fixed_resnos}
+    return {
+        f"{chain}{int(r)}": cap_str
+        for r in protein_resnos if int(r) not in fixed_set
+    }
+
+
+def _enforce_min_sampleable_after_cap(
+    merged_omit: dict[str, str],
+    base_omit: dict[str, str],
+    global_omit_AA: str,
+    min_keep: int = _MIN_SAMPLEABLE_AAS_AFTER_CAP,
+) -> dict[str, str]:
+    """Post-merge safety net for ``--aa_fraction_cap``.
+
+    The per-position fraction-cap omit is unioned with the structural omits
+    (expression hard-omit, first-shell diversity, position-1 M) *and* the global
+    ``omit_AA``. Even when the cap-set alone left enough AAs, that union can drive
+    an individual position to **zero** sampleable canonical AAs — which fused MPNN
+    encodes as all-equal ``-1e8`` logits and then samples *uniformly from the
+    "forbidden" set*. For any position the merge leaves with fewer than
+    ``min_keep`` sampleable canonical AAs, REVERT that position to its pre-cap
+    (``base_omit``) value — the structural omits never over-omit, so the revert is
+    always safe. Returns a (possibly modified) copy; ``merged_omit`` is unchanged.
+    """
+    g = _CANONICAL_AAS & set(str(global_omit_AA).upper())
+    n_canon = len(_CANONICAL_AAS)
+    out = dict(merged_omit)
+    reverted: list[str] = []
+    structural: list[str] = []                # still degenerate even without the cap
+    for key, aas in list(out.items()):
+        omitted = g | (_CANONICAL_AAS & set(str(aas).upper()))
+        if n_canon - len(omitted) < min_keep:
+            b = base_omit.get(key, "")
+            if b:
+                out[key] = b
+            else:
+                del out[key]
+            reverted.append(key)
+            # Reverting removes the cap; verify the structural base itself (with
+            # the global omit_AA) is safe. If not, the over-omit is NOT cap-induced
+            # — the guard cannot fix it (the cap is already gone), so surface it.
+            base_omitted = g | (_CANONICAL_AAS & set(str(b).upper()))
+            if n_canon - len(base_omitted) < min_keep:
+                structural.append(key)
+    if reverted:
+        LOGGER.error(
+            "aa_fraction_cap: reverted the cap at %d position(s) %s — the merged "
+            "omit (cap + structural + global omit_AA) would have left fewer than "
+            "%d sampleable AAs there.",
+            len(reverted), sorted(reverted)[:10], min_keep,
+        )
+    if structural:
+        LOGGER.error(
+            "aa_fraction_cap guard: position(s) %s remain below %d sampleable AAs "
+            "EVEN WITHOUT THE CAP (structural omit + global omit_AA) — a pre-existing "
+            "over-omit the cap guard cannot repair.",
+            sorted(structural)[:10], min_keep,
+        )
     return out
 
 
@@ -4177,6 +4346,12 @@ def run_cycle(
     aliphatic_min: float = 40.0,
     boman_max: float = 4.5,
     sap_corrected: bool = False,
+    # ---- WS-C composition control (all opt-in; defaults → byte-identical) ----
+    composition_suppress_all_overrep: bool = False,
+    aa_fraction_cap: Optional[float] = None,
+    composition_soft_bias: bool = False,
+    composition_soft_bias_nats: float = 0.5,
+    expression_soft_bias: Optional[dict[int, str]] = None,
     n_term_pad: str = "",
     c_term_pad: str = "",
     omit_M_at_pos1: bool = True,
@@ -4278,6 +4453,64 @@ def run_cycle(
             cycle_cfg.cycle_idx, n_ab_pos, float(adaptive_bias_delta.min()),
         )
 
+    # ---- 0a-quater. Composition soft-bias per-residue delta (opt-in, WS-C) ----
+    # Activate the expression engine's per-residue SOFT_BIAS tier (long-hydrophobic-
+    # stretch, KR-near-catalytic-on-helix, polyproline, repetitive-segment, …) as an
+    # additive bias_k delta in the SAME slot as the throat/adaptive deltas. The map
+    # is POOL-DERIVED per cycle — the liabilities the *designs* introduce as the pool
+    # drifts (a seed-only map is blind to them, since polyproline/repeat/hydrophobic-
+    # stretch are sequence-determined). The seed map bootstraps cycle 0 (no survivors
+    # yet). Whole-protein composition hits are excluded (span filter) — those are
+    # handled globally by the suppress-all / fraction-cap levers. Off unless
+    # --composition_soft_bias, so the default path is byte-identical.
+    # Defensively wrapped (mirrors the adaptive controller, commit 42f2f6b): the
+    # pool path adds N per-survivor engine evaluations, and a soft-bias failure must
+    # NEVER abort the design run — degrade to the unbiased path and continue.
+    if composition_soft_bias:
+        try:
+            from protein_chisel.expression.engine import (
+                aggregate_pool_soft_bias, soft_bias_to_bias_array,
+            )
+            from protein_chisel.sampling.plm_fusion import AA_ORDER
+            if survivors_prev is not None and len(survivors_prev) > 0:
+                soft_map = aggregate_pool_soft_bias(
+                    expression_engine,
+                    survivors_prev["sequence"].astype(str).tolist(),
+                    ss_reduced=seed_ss_reduced, sasa=seed_sasa,
+                    position_class=seed_position_class,
+                    catalytic_resnos=fixed_resnos, fixed_resnos=fixed_resnos,
+                    protein_resnos=seed_protein_resnos,
+                    min_support=_SOFT_BIAS_MIN_SUPPORT,
+                    max_span_frac=_SOFT_BIAS_MAX_SPAN_FRAC,
+                )
+                soft_src = "pool"
+            else:
+                soft_map = expression_soft_bias or {}    # seed bootstrap (cycle 0)
+                soft_src = "seed"
+            if soft_map:
+                soft_delta = soft_bias_to_bias_array(
+                    soft_map, bias_k.shape[0],
+                    magnitude=composition_soft_bias_nats, aa_order=AA_ORDER,
+                )
+                bias_k = bias_k + soft_delta.astype(bias_k.dtype)
+                n_sb_pos = int((np.abs(soft_delta) > 1e-6).any(axis=1).sum())
+                n_sb_cells = int((np.abs(soft_delta) > 1e-6).sum())
+                telem["composition_soft_bias_n_positions"] = n_sb_pos
+                telem["composition_soft_bias_n_cells"] = n_sb_cells
+                telem["composition_soft_bias_source"] = soft_src
+                LOGGER.info(
+                    "cycle %d: applied COMPOSITION soft-bias (%s-derived) at %d "
+                    "positions, %d (pos,AA) cells (%.2f nats each)",
+                    cycle_cfg.cycle_idx, soft_src, n_sb_pos, n_sb_cells,
+                    composition_soft_bias_nats,
+                )
+        except Exception:
+            LOGGER.exception(
+                "cycle %d: composition soft-bias failed; continuing WITHOUT it "
+                "(degrade to unbiased — a soft-bias error never aborts the run)",
+                cycle_cfg.cycle_idx,
+            )
+
     np.save(bias_dir / "bias.npy", bias_k)
     with open(bias_dir / "telemetry.json", "w") as fh:
         json.dump(telem, fh, indent=2)
@@ -4290,6 +4523,7 @@ def run_cycle(
     # cases like "E z=+5, D z=-2": instead of just suppressing E (which
     # only reduces total negative charge), encourage D to take its place.
     bias_AA_str = ""
+    fraction_cap_omit: dict[str, str] = {}
     if survivors_prev is not None and len(survivors_prev) > 0:
         from protein_chisel.expression.aa_class_balance import (
             compute_class_balanced_bias_AA,
@@ -4301,10 +4535,29 @@ def run_cycle(
         # exclude_aas matches cycle_cfg.omit_AA (default "X" or "CX") so
         # we don't try to up-weight an AA the sampler can't pick anyway.
         excl = "".join(c for c in cycle_cfg.omit_AA.upper() if c != "X")
+        # ---- WS-C per-AA fraction cap (opt-in) -------------------------
+        # Any AA whose fraction in the survivor pool is at/over the cap is
+        # hard-omitted at every NON-FIXED designable position next cycle,
+        # bounding runaway single-AA over-representation (the 26%-Ala mode).
+        # Recomputed each cycle from that cycle's survivors, so an AA is
+        # re-allowed once it falls back under the cap. None → no-op (empty dict).
+        fraction_cap_omit = _build_fraction_cap_omit(
+            pool_seq, aa_fraction_cap,
+            protein_resnos=protein_resnos, fixed_resnos=fixed_resnos,
+            chain=CHAIN, exclude_aas=excl,
+        )
+        if fraction_cap_omit:
+            LOGGER.info(
+                "cycle %d: aa_fraction_cap=%.3f -> omit %s at %d non-fixed "
+                "designable positions (pool fractions over cap)",
+                cycle_cfg.cycle_idx, aa_fraction_cap,
+                next(iter(fraction_cap_omit.values())), len(fraction_cap_omit),
+            )
         balance_telem = compute_class_balanced_bias_AA(
             pool_seq,
             reference="swissprot_ec3_hydrolases_2026_01",
             exclude_aas=excl,
+            suppress_all_overrep=composition_suppress_all_overrep,
             # Threshold 2.0: only fire swaps when BOTH ends of the
             # class imbalance are clearly extreme (over-rep > +2σ AND
             # under-rep < −2σ). Keeps the bias_AA quiet under moderate
@@ -4397,6 +4650,19 @@ def run_cycle(
         merged_omit = merge_omit_dicts(merged_omit, m_omit)
         LOGGER.info("cycle %d: pos-1 M omit added (%s)",
                      cycle_cfg.cycle_idx, m_omit)
+    # ---- WS-C fraction cap: layered LAST, then guarded -----------------
+    # Union the cap omit on top of the structural omits (expression/diversity/
+    # pos-1-M), then run the post-merge sampleable guard so no position is left
+    # with too few AAs after the union with the global omit_AA. Empty cap → no-op
+    # → the merged omit (and the whole run) is byte-identical. (See codex review:
+    # the cap-set alone passing its guard is not enough — the union can still
+    # zero out a position.)
+    if fraction_cap_omit:
+        _pre_cap_omit = merged_omit
+        merged_omit = merge_omit_dicts(_pre_cap_omit, fraction_cap_omit)
+        merged_omit = _enforce_min_sampleable_after_cap(
+            merged_omit, _pre_cap_omit, cycle_cfg.omit_AA,
+        )
     cand_tsv = stage_sample(
         cycle_cfg=cycle_cfg, seed_pdb=seed_pdb, bias=bias_k,
         protein_resnos=protein_resnos, fixed_resnos=fixed_resnos,
@@ -4731,6 +4997,51 @@ def main() -> None:
                         "exposed polar residues. Legacy sap_* are unchanged. (Rescued "
                         "backfill rows carry NaN sap_corr_* — they are not re-scored "
                         "for it.)")
+    # ---- WS-C composition control (opt-in, default OFF/None → byte-identical) ----
+    p.add_argument("--composition_suppress_all_overrep", action="store_true",
+                   help="Opt-in (default OFF → byte-identical). In the per-cycle "
+                        "class-balanced bias_AA, down-weight EVERY over-represented "
+                        "member of an AA class (z > --balance_z_threshold), not just "
+                        "the single class maximum. Without it, when Alanine is the "
+                        "hydrophobic-class max an also-over-represented Leucine "
+                        "escapes correction. The property-conserving within-class "
+                        "swap up-weight is preserved.")
+    p.add_argument("--aa_fraction_cap", type=_fraction_arg, default=None,
+                   metavar="FRAC",
+                   help="Opt-in (default None → byte-identical). Finite fraction in "
+                        "(0, 1]. Hard-omit any amino acid whose fraction in a cycle's "
+                        "survivor pool is >= FRAC (e.g. 0.15) at every non-fixed "
+                        "designable position the next cycle, bounding runaway "
+                        "single-AA over-representation (the 26%%-Ala failure mode). "
+                        "Recomputed per cycle, so an AA is re-allowed once it falls "
+                        "back under the cap. A cap so low it would omit nearly every "
+                        "AA for a low-diversity pool is skipped that cycle with an "
+                        "ERROR (never over-constrains the sampler).")
+    p.add_argument("--composition_soft_bias", action="store_true",
+                   help="Opt-in (default OFF → byte-identical). Activate the "
+                        "expression engine's per-residue SOFT_BIAS tier "
+                        "(long-hydrophobic-stretch, KR-near-catalytic-on-helix, "
+                        "polyproline, repetitive-segment, …): add a negative "
+                        "per-(position,AA) bias at those sites to every cycle's "
+                        "sampler bias. POOL-DERIVED per cycle (the engine is "
+                        "re-evaluated on the survivors and a liability is applied "
+                        "only if it recurs in >= half of them), so it tracks the "
+                        "liabilities the designs introduce; the seed map bootstraps "
+                        "cycle 0. Whole-protein composition hits are excluded (those "
+                        "are the suppress-all / fraction-cap levers' job).")
+    p.add_argument("--composition_soft_bias_nats",
+                   type=lambda s: _nonneg_finite_arg(s, max_value=_SOFT_BIAS_NATS_MAX),
+                   default=0.5,
+                   help="Down-weight magnitude (nats, finite in [0, "
+                        "%g]) applied at each SOFT_BIAS (position, AA) cell when "
+                        "--composition_soft_bias is set. Default 0.5. NOTE the bias "
+                        "is added in LOGIT space (before the softmax temperature "
+                        "divide), so the effective odds penalty is "
+                        "exp(nats / sampling_temperature) — at T≈0.15-0.20 a 0.5-nat "
+                        "bias is ~12-28x (a firm nudge), whereas 1.5 would be "
+                        "~1800-22000x (a near-hard ban). Keep this near the adaptive "
+                        "controller's ~0.6 clamp. No effect unless "
+                        "--composition_soft_bias." % _SOFT_BIAS_NATS_MAX)
     p.add_argument("--copy-input-structure-into-out-dir",
                    "--copy_input_structure_into_out_dir",
                    dest="copy_input_structure_into_out_dir",
@@ -5571,6 +5882,21 @@ def main() -> None:
     LOGGER.info("WT engine eval: %s", wt_eng.summary())
     expression_omit = wt_eng.to_omit_AA_json("A", protein_resnos=protein_resnos)
     LOGGER.info("expression-engine HARD_OMIT JSON: %s", expression_omit)
+    # WS-C: seed-derived SOFT_BIAS map (0-indexed body position -> AAs to
+    # down-weight), LOCAL hits only (whole-protein composition hits excluded —
+    # those are the suppress-all / fraction-cap levers' job). Used by run_cycle
+    # only as the cycle-0 BOOTSTRAP; cycles 1+ rebuild the map from the survivor
+    # pool. Inert + free to compute unless --composition_soft_bias is set.
+    expression_soft_bias = wt_eng.soft_bias_per_residue(
+        max_span_frac=_SOFT_BIAS_MAX_SPAN_FRAC,
+    )
+    if args.composition_soft_bias:
+        LOGGER.info(
+            "expression-engine SOFT_BIAS seed-bootstrap map: %d local positions "
+            "(cycle 0 only; cycles 1+ rebuild from the survivor pool; %.2f nats "
+            "each)",
+            len(expression_soft_bias), args.composition_soft_bias_nats,
+        )
 
     # Graded clash-aware bias replacing the previous hard-omit. Per the
     # rotamer-feasibility audit (commit logs + scripts/audit_clash_omits.py),
@@ -5638,6 +5964,23 @@ def main() -> None:
         # there is no per-cycle resampling/bias-refinement to iterate — one cycle.
         cycles = cycles[:1]
         LOGGER.info("PoE score-only: forcing a single cycle (one-shot pool).")
+        # WS-C: suppress-all-overrep and the fraction cap act on the PREVIOUS
+        # cycle's survivor pool, which never exists in a one-shot PoE run — so they
+        # are silent no-ops here. (The composition soft-bias still applies via its
+        # cycle-0 seed bootstrap.) Surface the dead flags rather than fail silently.
+        _poe_dead = [
+            name for name, on in (
+                ("--composition_suppress_all_overrep", args.composition_suppress_all_overrep),
+                ("--aa_fraction_cap", args.aa_fraction_cap is not None),
+            ) if on
+        ]
+        if _poe_dead:
+            LOGGER.warning(
+                "PoE one-shot backend: %s have NO effect (they steer the next "
+                "cycle from the survivor pool, and PoE runs a single cycle-0 pool "
+                "with no survivors). Use --mpnn_backend bias for these levers.",
+                " and ".join(_poe_dead),
+            )
     LOGGER.info("cycle schedule: %d cycles, omit_AA=%r", len(cycles), args.omit_AA)
 
     # ---- Pre-compute seed DFI once (design-invariant for fixed-backbone) --
@@ -5794,6 +6137,11 @@ def main() -> None:
             boman_max=cyc.boman_max if args.strategy == "annealing"
                       else args.boman_max,
             sap_corrected=args.sap_corrected,
+            composition_suppress_all_overrep=args.composition_suppress_all_overrep,
+            aa_fraction_cap=args.aa_fraction_cap,
+            composition_soft_bias=args.composition_soft_bias,
+            composition_soft_bias_nats=args.composition_soft_bias_nats,
+            expression_soft_bias=expression_soft_bias,
             n_term_pad=args.n_term_pad,
             c_term_pad=args.c_term_pad,
             omit_M_at_pos1=not args.no_omit_M_at_pos1,

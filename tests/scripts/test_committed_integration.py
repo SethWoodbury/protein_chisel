@@ -432,5 +432,240 @@ def test_shell_regex_matches_committed_source():
     fails loudly if the shell wiring's regex ever drifts from what we assert."""
     sh = (REPO / "scripts" / "run_chisel_design.sh").read_text()
     assert _SHELL_TRUTHY_RE in sh
-    # Both feature flags use the identical truthy guard.
+    # The feature flags use the identical truthy guard (veto, sap, +WS-C).
     assert sh.count(_SHELL_TRUTHY_RE) >= 2
+
+
+# ----------------------------------------------------------------------------
+# 6. WS-C composition control: fraction-cap omit builder + flag wiring.
+# ----------------------------------------------------------------------------
+#
+# Guards the opt-in --aa_fraction_cap / --composition_soft_bias /
+# --composition_suppress_all_overrep wiring. The fraction-cap omit builder is a
+# pure host helper; the flags are smoke-checked via --help and the shell truthy
+# guard (mirrors the veto/sap pattern above). All default to a NO-OP so a
+# default run is byte-identical.
+
+
+def test_fraction_cap_omit_builds_nonfixed_designable_omit():
+    """26% A / 20% L / 20% G pool with cap 0.15 -> omit {A,G,L} at every
+    NON-FIXED designable position; the fixed (catalytic) resno is excluded."""
+    pool = "A" * 52 + "L" * 40 + "G" * 40 + "S" * 24 + "T" * 16 + "E" * 14 + "D" * 14
+    omit = idz._build_fraction_cap_omit(
+        pool, 0.15, protein_resnos=[10, 11, 12, 13], fixed_resnos=[12],
+        chain="A", exclude_aas="",
+    )
+    assert set(omit.keys()) == {"A10", "A11", "A13"}      # A12 fixed -> excluded
+    assert all(set(v) == set("AGL") for v in omit.values())
+
+
+def test_fraction_cap_omit_none_cap_is_empty_noop():
+    """cap=None -> {} (the byte-identical default path)."""
+    assert idz._build_fraction_cap_omit(
+        "AAAA", None, protein_resnos=[1, 2], fixed_resnos=[],
+    ) == {}
+
+
+def test_fraction_cap_omit_nothing_over_cap_is_empty():
+    """Uniform 5%-each pool -> nothing over a 15% cap -> {}."""
+    pool = "ACDEFGHIKLMNPQRSTVWY" * 5
+    assert idz._build_fraction_cap_omit(
+        pool, 0.15, protein_resnos=[1, 2], fixed_resnos=[],
+    ) == {}
+
+
+def test_fraction_cap_omit_respects_exclude_aas():
+    """An already-omitted AA (C) is never re-capped even at 30% of the pool."""
+    pool = "C" * 60 + "A" * 140                            # 30% C, 70% A
+    omit = idz._build_fraction_cap_omit(
+        pool, 0.15, protein_resnos=[1], fixed_resnos=[], exclude_aas="C",
+    )
+    assert omit == {f"{idz.CHAIN}1": "A"}
+
+
+def test_fraction_cap_omit_skips_when_cap_too_low_for_pool():
+    """SAFETY (codex/subagent P1): a valid-but-too-low cap that would omit nearly
+    every AA must NOT produce an all/most-AA omit (which fused MPNN encodes as
+    equal -1e8 -> silently samples from 'forbidden' AAs). The builder skips +
+    leaves the omit empty rather than over-constrain the sampler."""
+    uniform = "ACDEFGHIKLMNPQRSTVWY" * 10                  # 5% each, 20 AAs
+    omit = idz._build_fraction_cap_omit(
+        uniform, 0.04, protein_resnos=[1, 2, 3], fixed_resnos=[],
+    )
+    assert omit == {}                                      # degenerate cap -> no-op
+
+
+def test_fraction_arg_rejects_out_of_range_and_nonfinite():
+    """--aa_fraction_cap validator accepts a finite fraction in (0, 1] and rejects
+    0, negatives, >1, nan, inf, and non-numbers."""
+    import argparse
+    for bad in ("0", "0.0", "-0.1", "1.5", "2", "nan", "inf", "-inf", "abc"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            idz._fraction_arg(bad)
+    assert idz._fraction_arg("0.15") == pytest.approx(0.15)
+    assert idz._fraction_arg("1.0") == pytest.approx(1.0)
+
+
+def test_soft_bias_nats_arg_rejects_nonfinite_and_negative():
+    """--composition_soft_bias_nats validator accepts a finite >=0 magnitude and
+    rejects nan/inf/negatives (a NaN bias would poison the sampling softmax)."""
+    import argparse
+    for bad in ("-0.1", "nan", "inf", "abc"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            idz._nonneg_finite_arg(bad)
+    assert idz._nonneg_finite_arg("0") == pytest.approx(0.0)
+    assert idz._nonneg_finite_arg("0.5") == pytest.approx(0.5)
+
+
+def test_nonneg_finite_arg_enforces_max_value():
+    """With max_value, an absurd-but-finite magnitude (e.g. 1e100, which casts to
+    -inf in the float32 sampler bias) is rejected; the bound is inclusive."""
+    import argparse
+    with pytest.raises(argparse.ArgumentTypeError):
+        idz._nonneg_finite_arg("1e100", max_value=20.0)
+    with pytest.raises(argparse.ArgumentTypeError):
+        idz._nonneg_finite_arg("25", max_value=20.0)
+    assert idz._nonneg_finite_arg("20", max_value=20.0) == pytest.approx(20.0)
+    assert idz._nonneg_finite_arg("0.5", max_value=20.0) == pytest.approx(0.5)
+
+
+def test_enforce_min_sampleable_reverts_post_merge_overomit():
+    """SAFETY (codex re-review P1): the cap omit MERGED with structural omits can
+    still leave a position with < N sampleable AAs even though the cap-set alone
+    passed. The post-merge guard reverts the offending position to its pre-cap
+    (structural-only) omit."""
+    canon = "ACDEFGHIKLMNPQRSTVWY"
+    cap_aas = canon.replace("C", "").replace("D", "").replace("E", "")  # 17 AAs
+    assert len(cap_aas) == 17
+    base = {"A5": "DE"}                                  # structural omit (2 AAs)
+    merged = {"A5": "".join(sorted(set(cap_aas) | set("DE")))}   # 19 canon omitted
+    # global omit "CX" also forbids C -> all 20 canonical omitted at A5 -> degenerate.
+    out = idz._enforce_min_sampleable_after_cap(merged, base, "CX", 3)
+    assert out["A5"] == "DE"                             # reverted to the structural omit
+
+
+def test_enforce_min_sampleable_noop_when_safe():
+    """When the merged omit leaves >= min_keep AAs, the guard is a pure no-op."""
+    base = {"A5": "KR"}
+    merged = {"A5": "AKR"}                               # 3 omitted +C global = 4; 16 left
+    out = idz._enforce_min_sampleable_after_cap(merged, base, "CX", 3)
+    assert out == merged
+
+
+def test_enforce_min_sampleable_flags_structural_overomit(caplog):
+    """If reverting the cap is NOT enough (the structural base itself + global omit
+    already leave < min_keep), the guard still reverts the cap AND surfaces the
+    pre-existing structural over-omit (it must not silently claim safety it lacks)."""
+    import logging
+    canon = "ACDEFGHIKLMNPQRSTVWY"
+    base_aas = canon.replace("A", "").replace("V", "")  # 18 AAs omitted (leaves A,V)
+    base = {"A5": base_aas}
+    merged = {"A5": canon.replace("C", "")}             # cap omits 19
+    with caplog.at_level(logging.ERROR):
+        out = idz._enforce_min_sampleable_after_cap(merged, base, "CX", 3)
+    assert out["A5"] == base_aas                        # cap reverted to base
+    # base(18) | C(global) = 19 omitted -> 1 left < 3 -> a DISTINCT structural
+    # warning (unique phrase) is surfaced, separate from the generic revert log.
+    assert "even without the cap" in caplog.text.lower()
+
+
+def test_enforce_min_sampleable_no_structural_warning_when_base_is_safe(caplog):
+    """The structural warning fires ONLY when base+global is itself degenerate —
+    a normal cap revert (safe base) must not emit it (guards the wrong-reason pass)."""
+    import logging
+    canon = "ACDEFGHIKLMNPQRSTVWY"
+    cap_aas = canon.replace("C", "").replace("D", "").replace("E", "")  # 17 AAs
+    base = {"A5": "DE"}                                  # safe base (2 AAs)
+    merged = {"A5": "".join(sorted(set(cap_aas) | set("DE")))}
+    with caplog.at_level(logging.ERROR):
+        out = idz._enforce_min_sampleable_after_cap(merged, base, "CX", 3)
+    assert out["A5"] == "DE"
+    assert "even without the cap" not in caplog.text.lower()
+
+
+def test_cli_rejects_out_of_range_fraction_and_huge_nats():
+    """End-to-end argparse rejection: a >1 cap and an absurd nats both exit != 0."""
+    for args in (["--aa_fraction_cap", "2"],
+                 ["--aa_fraction_cap", "0"],
+                 ["--composition_soft_bias_nats", "1e100"]):
+        proc = subprocess.run(
+            [sys.executable, "scripts/iterative_design.py", "--seed_pdb", "x.pdb",
+             *args],
+            cwd=str(REPO), env={**os.environ, "PYTHONPATH": "src"},
+            capture_output=True, text=True, timeout=120,
+        )
+        assert proc.returncode != 0, f"{args} should be rejected"
+        assert "aa_fraction_cap" in proc.stderr or "composition_soft_bias_nats" in proc.stderr
+
+
+def test_iterative_design_help_advertises_ws_c_flags():
+    """`--help` exits 0 and advertises every WS-C opt-in flag."""
+    proc = subprocess.run(
+        [sys.executable, "scripts/iterative_design.py", "--help"],
+        cwd=str(REPO), env={**os.environ, "PYTHONPATH": "src"},
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    for flag in (
+        "--composition_suppress_all_overrep",
+        "--aa_fraction_cap",
+        "--composition_soft_bias",
+        "--composition_soft_bias_nats",
+    ):
+        assert flag in proc.stdout, flag
+
+
+@pytest.mark.parametrize(
+    "env_var, cli_flag",
+    [
+        ("COMPOSITION_SUPPRESS_ALL_OVERREP", "--composition_suppress_all_overrep"),
+        ("COMPOSITION_SOFT_BIAS", "--composition_soft_bias"),
+    ],
+)
+@pytest.mark.parametrize(
+    "value, expect_flag",
+    [("0", False), ("false", False), ("", False),
+     ("1", True), ("true", True), ("on", True)],
+)
+def test_shell_ws_c_boolean_truthiness(env_var, cli_flag, value, expect_flag):
+    """The WS-C boolean env vars use the same shipped truthy guard as the veto."""
+    script = (
+        'COMPOSITION_CLI=()\n'
+        f'[[ "${{{env_var}:-0}}" =~ {_SHELL_TRUTHY_RE} ]] '
+        f'&& COMPOSITION_CLI+=( {cli_flag} )\n'
+        'echo "${COMPOSITION_CLI[@]}"\n'
+    )
+    proc = subprocess.run(
+        ["bash", "-c", script],
+        env={**os.environ, env_var: value},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert (cli_flag in proc.stdout) is expect_flag
+
+
+def test_shell_aa_fraction_cap_value_passthrough():
+    """AA_FRACTION_CAP=<frac> emits `--aa_fraction_cap <frac>`; unset emits
+    nothing (byte-identical default)."""
+    snippet = (
+        'COMPOSITION_CLI=()\n'
+        '[[ -n "${AA_FRACTION_CAP:-}" ]] '
+        '&& COMPOSITION_CLI+=( --aa_fraction_cap "$AA_FRACTION_CAP" )\n'
+        'echo "${COMPOSITION_CLI[@]}"\n'
+    )
+    # Verify this exact snippet is present in the shipped shell file.
+    assert '[[ -n "${AA_FRACTION_CAP:-}" ]]' in (
+        REPO / "scripts" / "run_chisel_design.sh"
+    ).read_text()
+    set_proc = subprocess.run(
+        ["bash", "-c", snippet],
+        env={**os.environ, "AA_FRACTION_CAP": "0.15"},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert set_proc.stdout.strip() == "--aa_fraction_cap 0.15"
+    env_unset = {k: v for k, v in os.environ.items() if k != "AA_FRACTION_CAP"}
+    unset_proc = subprocess.run(
+        ["bash", "-c", snippet], env=env_unset,
+        capture_output=True, text=True, timeout=30,
+    )
+    assert unset_proc.stdout.strip() == ""
