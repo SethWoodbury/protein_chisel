@@ -5,6 +5,20 @@ All notable changes to **protein_chisel** are documented here. Format loosely fo
 
 ## [Unreleased]
 
+### Added — Corrected SAP + shared `scoring/sap.py` module (opt-in, default OFF, byte-identical)
+- New `src/protein_chisel/scoring/sap.py` — single source of truth for the Kyte-Doolittle scale,
+  Tien max-SASA, the 3→1 map, and a pure `sap_neighborhood_metrics` reduction. Removes the dicts
+  duplicated between `iterative_design.py` and `sampling/adaptive_bias.py` (per the 2026-06 audit)
+  and gives the controller + driver one place to evolve the hydrophobicity model.
+- `_compute_sap_proxy` now uses the shared module — the legacy `sap_*` columns are **byte-identical**
+  (a reference test locks the reducer's arithmetic). `--sap_corrected` / `SAP_CORRECTED=1`
+  (default OFF) additionally emits `sap_corr_{max,mean,p95}`: a **centered, zero-clamped** KD weight
+  (`max(0, KD − mean)`) so exposed *polar* residues no longer cancel hydrophobic ones and **alanine
+  surfaces register** (raw KD scores Ala only +1.8; centered +2.29) — the two blind spots that let a
+  GRAVY=1.05 / 26%-Ala design read sap_max≈17. Threaded worker → `stage_struct_filter` → `run_cycle`
+  → driver → shell. Rescued backfill rows carry NaN `sap_corr_*` (not re-scored). 9 host tests.
+  (Foundation for the planned per-residue SAP ControlAxis; see `docs/plans/solubility_steering_plan.md`.)
+
 ### Fixed / Added — Hard solubility veto in final selection (opt-in, default OFF, byte-identical)
 - **Bug:** deferred-rescue/backfill re-scored fallback candidates through struct/tunnel/fpocket
   but **never re-applied the GRAVY/charge seq band**, so a `passed_seq_filter=False` design

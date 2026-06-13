@@ -482,6 +482,12 @@ SHIP_SOLUBILITY_VETO_CLI=()
 [[ "${SHIP_SOLUBILITY_VETO:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]] \
     && SHIP_SOLUBILITY_VETO_CLI+=( --ship_solubility_veto )
 
+# Corrected SAP columns (opt-in; default OFF => byte-identical). SAP_CORRECTED=1 emits
+# sap_corr_* (centered, polar-cancellation-free) alongside the legacy sap_*.
+SAP_CORRECTED_CLI=()
+[[ "${SAP_CORRECTED:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]] \
+    && SAP_CORRECTED_CLI+=( --sap_corrected )
+
 # Decode-time Product-of-Experts backend (Phase: PoE; opt-in). Default 'bias' = the
 # in-process LigandMPNN sampler with our calibrated fusion bias (byte-identical).
 # MPNN_BACKEND=poe runs a SEPARATE HOST stage (nested apptainer is blocked) that
@@ -772,6 +778,7 @@ run_stage3_driver() {
             "${METRICS_CLI[@]}" \
             "${ADAPTIVE_BIAS_CLI[@]}" \
             "${SHIP_SOLUBILITY_VETO_CLI[@]}" \
+            "${SAP_CORRECTED_CLI[@]}" \
             "$@" \
             ${EXTRA_DRIVER_FLAGS:-}
 }

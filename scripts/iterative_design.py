@@ -1482,35 +1482,28 @@ def _detect_hbond_to_his_sidechain(
     return hits
 
 
-# Kyte-Doolittle hydrophobicity + Tien max-SASA — same as v1 driver.
-KD_HYDROPHOBICITY = {
-    "I": 4.5, "V": 4.2, "L": 3.8, "F": 2.8, "C": 2.5, "M": 1.9, "A": 1.8,
-    "G": -0.4, "T": -0.7, "S": -0.8, "W": -0.9, "Y": -1.3, "P": -1.6,
-    "H": -3.2, "E": -3.5, "Q": -3.5, "D": -3.5, "N": -3.5, "K": -3.9, "R": -4.5,
-}
-SASA_MAX_RESIDUE = {
-    "A": 121, "C": 148, "D": 187, "E": 214, "F": 228, "G": 97,  "H": 216,
-    "I": 195, "K": 230, "L": 191, "M": 203, "N": 187, "P": 154, "Q": 214,
-    "R": 265, "S": 143, "T": 163, "V": 165, "W": 264, "Y": 255,
-}
-THREE_TO_ONE = {
-    "ALA":"A","ARG":"R","ASN":"N","ASP":"D","CYS":"C","GLN":"Q","GLU":"E",
-    "GLY":"G","HIS":"H","HID":"H","HIE":"H","HIP":"H","HIS_D":"H","ILE":"I",
-    "LEU":"L","LYS":"K","KCX":"K","MET":"M","PHE":"F","PRO":"P","SER":"S",
-    "THR":"T","TRP":"W","TYR":"Y","VAL":"V",
-}
+def _compute_sap_proxy(pdb_path: Path, corrected: bool = False) -> Optional[dict]:
+    """SAP proxy via freesasa SASA + Kyte-Doolittle hydrophobicity.
 
+    Per-residue SAP_i = sum over residues j within 10 Å of CA(i):
+        (SASA(j) / SASA_max(j)) * weight(restype(j))
 
-def _compute_sap_proxy(pdb_path: Path) -> Optional[dict]:
-    """Lauer-style SAP via freesasa SASA + Kyte-Doolittle hydrophobicity.
-
-    Per-residue SAP_i = sum over atoms within 10 Å of CA(i):
-        (SASA(j) / SASA_max(j)) * KD(restype(j))
+    Scales + the spatial reduction live in the shared ``protein_chisel.scoring.sap``
+    module (one source of truth, also used by the adaptive controller). The legacy
+    ``sap_*`` columns use the signed Kyte-Doolittle weight and are byte-identical to
+    before. When ``corrected`` is set it ALSO emits ``sap_corr_*`` using the
+    centered, zero-clamped weight, so exposed polar residues can no longer cancel
+    hydrophobic neighbours and alanine surfaces register (the legacy proxy's blind
+    spots, per the 2026-06 audit).
     """
     try:
         import freesasa
     except ImportError:
         return None
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from protein_chisel.scoring.sap import (
+        THREE_TO_ONE, kd_weight_raw, kd_weight_corrected, sap_neighborhood_metrics,
+    )
     try:
         freesasa.setVerbosity(freesasa.silent)
         struct = freesasa.Structure(str(pdb_path))
@@ -1552,28 +1545,23 @@ def _compute_sap_proxy(pdb_path: Path) -> Optional[dict]:
             ca = res_data[k]["atoms_xyz"][0] if res_data[k]["atoms_xyz"] else (0, 0, 0)
         cas.append(ca)
     cas_a = np.array(cas, dtype=float)
+    aas = [THREE_TO_ONE.get(res_data[k]["resname"]) for k in keys_sorted]
+    sasa_total = [res_data[k]["sasa"] for k in keys_sorted]
 
-    sap_per_res = []
-    for i, k_i in enumerate(keys_sorted):
-        d = np.linalg.norm(cas_a - cas_a[i], axis=1)
-        nbrs = np.where(d <= 10.0)[0]
-        s = 0.0
-        for j in nbrs:
-            rj = res_data[keys_sorted[j]]["resname"]
-            aa = THREE_TO_ONE.get(rj)
-            if aa is None:
-                continue
-            sasa_j = res_data[keys_sorted[j]]["sasa"]
-            sasa_max = SASA_MAX_RESIDUE.get(aa, 200.0)
-            s += (sasa_j / sasa_max) * KD_HYDROPHOBICITY.get(aa, 0.0)
-        sap_per_res.append(s)
-
-    arr = np.array(sap_per_res)
-    return {
-        "sap_max": float(np.max(arr)),
-        "sap_mean": float(np.mean(arr)),
-        "sap_p95": float(np.percentile(arr, 95)),
+    legacy = sap_neighborhood_metrics(
+        aas, sasa_total, cas_a, weight_fn=kd_weight_raw)
+    out = {
+        "sap_max": legacy["max"],
+        "sap_mean": legacy["mean"],
+        "sap_p95": legacy["p95"],
     }
+    if corrected:
+        corr = sap_neighborhood_metrics(
+            aas, sasa_total, cas_a, weight_fn=kd_weight_corrected)
+        out["sap_corr_max"] = corr["max"]
+        out["sap_corr_mean"] = corr["mean"]
+        out["sap_corr_p95"] = corr["p95"]
+    return out
 
 
 def stage_struct_filter(
@@ -1590,8 +1578,14 @@ def stage_struct_filter(
     # and broadcast to all designs (DFI is design-invariant for
     # fixed-backbone runs).
     seed_dfi_metrics: Optional[dict] = None,
+    sap_corrected: bool = False,
 ) -> Path:
-    """Apply h-bond + SAP-proxy structural filter."""
+    """Apply h-bond + SAP-proxy structural filter.
+
+    ``sap_corrected`` (opt-in; default False → byte-identical) additionally emits
+    ``sap_corr_*`` columns (centered, polar-cancellation-free SAP from the shared
+    ``scoring.sap`` module) alongside the legacy ``sap_*``.
+    """
     if catalytic_his_resnos is None:
         catalytic_his_resnos = CATALYTIC_HIS_RESNOS
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1611,7 +1605,7 @@ def stage_struct_filter(
         work_args.append((
             cid, pdb, cat_his_list, fixed_list,
             clash_severe_distance, sap_max_threshold,
-            seed_dfi_metrics,
+            seed_dfi_metrics, sap_corrected,
         ))
 
     from protein_chisel.utils.resources import pool_workers
@@ -1670,6 +1664,8 @@ def stage_struct_filter(
         # crash later filters that read this file.
         empty_cols = list(df.columns) + [
             "n_hbonds_to_cat_his", "sap_max", "sap_mean", "sap_p95",
+            *(["sap_corr_max", "sap_corr_mean", "sap_corr_p95"]
+              if sap_corrected else []),
             "passed_struct_filter", "struct_fail",
         ]
         survivors = pd.DataFrame(columns=empty_cols)
@@ -2299,11 +2295,12 @@ def _struct_filter_worker(args: tuple) -> tuple:
 
     Args tuple:
         (cid, pdb_path, catalytic_his_resnos, fixed_resnos,
-         clash_severe_distance, sap_max_threshold)
+         clash_severe_distance, sap_max_threshold, seed_dfi_metrics,
+         sap_corrected)
     Returns: (cid, row_dict, hbond_list, struct_fail_reasons)
     """
     (cid, pdb, cat_his, fixed_, sev_dist, sap_max_thr,
-     seed_dfi_metrics_) = args
+     seed_dfi_metrics_, sap_corrected_) = args
     if pdb is None or not Path(pdb).is_file():
         # Schema-consistent empty row — every key the parent loop
         # writes must be present so missing-PDB rows don't NaN-leak
@@ -2338,6 +2335,11 @@ def _struct_filter_worker(args: tuple) -> tuple:
             "struct_fail_reason": f"pdb_missing: {pdb}",
             "_passed": False,
         }
+        if sap_corrected_:
+            empty_row.update({
+                "sap_corr_max": float("nan"), "sap_corr_mean": float("nan"),
+                "sap_corr_p95": float("nan"),
+            })
         return cid, empty_row, [], [f"pdb_missing: {pdb}"]
     # Lazy imports inside worker so each Pool process re-imports cleanly.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -2353,8 +2355,8 @@ def _struct_filter_worker(args: tuple) -> tuple:
     panel = detect_interactions(pdb, chain=CHAIN, selection="protein_vs_ligand")
     gi_metrics = panel.to_dict("ligand_int__")
 
-    # SAP proxy via freesasa
-    sap = _compute_sap_proxy(pdb) or {}
+    # SAP proxy via freesasa (+ optional corrected sap_corr_* when requested)
+    sap = _compute_sap_proxy(pdb, corrected=sap_corrected_) or {}
     sap_max = sap.get("sap_max", float("nan"))
 
     # Clash detection (catalytic + ligand vs designed sidechains)
@@ -2395,6 +2397,11 @@ def _struct_filter_worker(args: tuple) -> tuple:
         "sap_max": sap_max,
         "sap_mean": sap.get("sap_mean", float("nan")),
         "sap_p95": sap.get("sap_p95", float("nan")),
+        **({
+            "sap_corr_max": sap.get("sap_corr_max", float("nan")),
+            "sap_corr_mean": sap.get("sap_corr_mean", float("nan")),
+            "sap_corr_p95": sap.get("sap_corr_p95", float("nan")),
+        } if sap_corrected_ else {}),
         **clash_dict,
         **preorg_metrics,
         **(seed_dfi_metrics_ or {}),
@@ -4167,6 +4174,7 @@ def run_cycle(
     gravy_max: float = 0.3,
     aliphatic_min: float = 40.0,
     boman_max: float = 4.5,
+    sap_corrected: bool = False,
     n_term_pad: str = "",
     c_term_pad: str = "",
     omit_M_at_pos1: bool = True,
@@ -4442,6 +4450,7 @@ def run_cycle(
         clash_filter=cycle_cfg.clash_filter,
         clash_severe_distance=cycle_cfg.clash_severe_distance,
         seed_dfi_metrics=seed_dfi_metrics,
+        sap_corrected=sap_corrected,
     )
 
     n_struct = len(pd.read_csv(survivors_struct, sep="\t"))
@@ -4711,6 +4720,15 @@ def main() -> None:
                         "ship fewer than target_k (intended). Adds a truthful "
                         "selection__solubility_passed column (distinct from "
                         "selection__hard_final_filter_passed = fpocket druggability).")
+    p.add_argument("--sap_corrected", action="store_true",
+                   help="Opt-in (default OFF → byte-identical). Additionally emit "
+                        "sap_corr_{max,mean,p95} columns on per-cycle designs: a "
+                        "centered, polar-cancellation-free SAP (shared scoring.sap "
+                        "module) that — unlike the legacy signed-KD sap_* — registers "
+                        "alanine-rich hydrophobic surfaces and isn't cancelled by "
+                        "exposed polar residues. Legacy sap_* are unchanged. (Rescued "
+                        "backfill rows carry NaN sap_corr_* — they are not re-scored "
+                        "for it.)")
     p.add_argument("--copy-input-structure-into-out-dir",
                    "--copy_input_structure_into_out_dir",
                    dest="copy_input_structure_into_out_dir",
@@ -5773,6 +5791,7 @@ def main() -> None:
                           else args.aliphatic_min,
             boman_max=cyc.boman_max if args.strategy == "annealing"
                       else args.boman_max,
+            sap_corrected=args.sap_corrected,
             n_term_pad=args.n_term_pad,
             c_term_pad=args.c_term_pad,
             omit_M_at_pos1=not args.no_omit_M_at_pos1,
