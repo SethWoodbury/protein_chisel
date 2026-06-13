@@ -477,7 +477,10 @@ fi
 # net-charge band, so deferred-rescue / backfill can never ship a seq-filter-failing
 # design (e.g. GRAVY=1.05) as rank-0. May ship fewer than TARGET_K (intended).
 SHIP_SOLUBILITY_VETO_CLI=()
-[[ "${SHIP_SOLUBILITY_VETO:-0}" != "0" ]] && SHIP_SOLUBILITY_VETO_CLI+=( --ship_solubility_veto )
+# Truthy only on 1/true/yes/on (case-insensitive) so SHIP_SOLUBILITY_VETO=false|off|0
+# all correctly DISABLE the veto (don't enable on any non-"0" string).
+[[ "${SHIP_SOLUBILITY_VETO:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]] \
+    && SHIP_SOLUBILITY_VETO_CLI+=( --ship_solubility_veto )
 
 # Decode-time Product-of-Experts backend (Phase: PoE; opt-in). Default 'bias' = the
 # in-process LigandMPNN sampler with our calibrated fusion bias (byte-identical).

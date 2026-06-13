@@ -87,3 +87,68 @@ def test_custom_tight_band_minus5_to_minus15():
         {"gravy": 0.2, "net_charge_full_HH": -10.0},    # gravy too high
     ])
     assert v2._within_solubility_band(df, **band).tolist() == [True, False, False]
+
+
+# ---------------------------------------------------------------------------
+# _apply_solubility_veto — the modular caller-side step (default OFF = identity)
+# ---------------------------------------------------------------------------
+
+def _rows():
+    return _df([
+        {"id": "a", "gravy": 0.0, "net_charge_full_HH": -10.0},   # in band
+        {"id": "b", "gravy": 1.05, "net_charge_full_HH": -9.0},   # GRAVY too high
+        {"id": "c", "gravy": -0.2, "net_charge_full_HH": -12.0},  # in band
+        {"id": "d", "gravy": 0.0, "net_charge_full_HH": -3.0},    # charge too positive
+    ])
+
+
+def test_apply_veto_disabled_is_identity_no_column():
+    # Default OFF: returns the SAME object, no new column (byte-identity contract).
+    df = _rows()
+    out = v2._apply_solubility_veto(
+        df, enabled=False, gravy_min=-0.8, gravy_max=0.3,
+        net_charge_min=-18.0, net_charge_max=-4.0)
+    assert out is df
+    assert "selection__solubility_passed" not in out.columns
+
+
+def test_apply_veto_drops_out_of_band_and_adds_column():
+    df = _rows()
+    out = v2._apply_solubility_veto(
+        df, enabled=True, **BAND)
+    assert out["id"].tolist() == ["a", "c"]                 # b, d vetoed
+    assert "selection__solubility_passed" in out.columns
+    assert out["selection__solubility_passed"].tolist() == [True, True]
+    assert df.shape[0] == 4                                  # input not mutated
+
+
+def test_apply_veto_all_out_of_band_returns_empty():
+    df = _df([
+        {"id": "b", "gravy": 1.05, "net_charge_full_HH": -9.0},
+        {"id": "d", "gravy": 0.0, "net_charge_full_HH": -3.0},
+    ])
+    out = v2._apply_solubility_veto(df, enabled=True, **BAND)
+    assert len(out) == 0
+
+
+def test_apply_veto_empty_input_is_unchanged():
+    df = pd.DataFrame(columns=["id", "gravy", "net_charge_full_HH"])
+    out = v2._apply_solubility_veto(df, enabled=True, **BAND)
+    assert out is df  # short-circuits on len==0
+
+
+def test_apply_veto_missing_bound_raises():
+    import pytest
+    with pytest.raises(ValueError):
+        v2._apply_solubility_veto(
+            _rows(), enabled=True, gravy_min=-0.8, gravy_max=0.3,
+            net_charge_min=None, net_charge_max=-4.0)
+
+
+def test_apply_veto_tight_band_passes_only_ideal_window():
+    # User's ideal: charge [-15,-5], negative GRAVY. Only 'c' (gravy -0.2, chg -12) fits.
+    df = _rows()
+    out = v2._apply_solubility_veto(
+        df, enabled=True, gravy_min=-2.0, gravy_max=-0.1,
+        net_charge_min=-15.0, net_charge_max=-5.0)
+    assert out["id"].tolist() == ["c"]

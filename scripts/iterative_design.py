@@ -2971,46 +2971,14 @@ def _write_final_topk_artifacts(
     final_dir: Path,
     pdb_map: dict[str, Path],
     seed_pdb: Optional[Path] = None,
-    ship_solubility_veto: bool = False,
-    gravy_min: Optional[float] = None,
-    gravy_max: Optional[float] = None,
-    net_charge_min: Optional[float] = None,
-    net_charge_max: Optional[float] = None,
 ) -> tuple[Path, pd.DataFrame]:
     """Write a self-consistent top-K artifact set and return the realized rows.
 
-    When ``ship_solubility_veto`` is set (opt-in; default OFF → byte-identical),
-    rows OUTSIDE the GRAVY + net-charge band are dropped before any PDB is copied,
-    so the pipeline can never ship a solubility-failing design (the bug where a
-    rescued GRAVY=1.05 seq-filter reject became rank-0). This is the single hard
-    chokepoint both selection branches funnel through; it covers rescue rows AND
-    annealed primary rows that pass an early-cycle GRAVY band but fail the final
-    one. NOTE: with the veto on, fewer than ``target_k`` designs may ship (by
-    design — better to ship 35 soluble than 40 with garbage). A truthful
-    ``selection__solubility_passed`` column is added (do not confuse with
-    ``selection__hard_final_filter_passed``, which means "passed fpocket
-    druggability").
+    Pure writer (single responsibility): it copies PDBs + writes the TSV/FASTA for
+    whatever rows it is given. The opt-in solubility veto is applied UPSTREAM by
+    ``_apply_solubility_veto`` so this stays a faithful "write what you're handed"
+    step (and so the caller's row-count bookkeeping reflects the post-veto set).
     """
-    if ship_solubility_veto and gravy_min is not None and len(top) > 0:
-        band_ok = _within_solubility_band(
-            top, gravy_min=gravy_min, gravy_max=gravy_max,
-            net_charge_min=net_charge_min, net_charge_max=net_charge_max,
-        )
-        top = top.copy()
-        top["selection__solubility_passed"] = band_ok.values
-        n_veto = int((~band_ok).sum())
-        if n_veto:
-            cols = [c for c in ("id", "gravy", "net_charge_full_HH",
-                                "selection__bucket") if c in top.columns]
-            worst = top.loc[~band_ok, cols].head(5).to_dict("records")
-            LOGGER.error(
-                "ship_solubility_veto: dropping %d/%d final top-K rows OUTSIDE the "
-                "solubility band (GRAVY[%.2f, %.2f], charge(%.1f, %.1f)); shipping "
-                "%d. Worst offenders: %s",
-                n_veto, len(top), gravy_min, gravy_max,
-                net_charge_min, net_charge_max, len(top) - n_veto, worst,
-            )
-            top = top.loc[band_ok].reset_index(drop=True)
     pdb_out = final_dir / "topk_pdbs"
     if pdb_out.exists():
         shutil.rmtree(pdb_out)
@@ -3496,6 +3464,63 @@ def _within_solubility_band(
         & (c > net_charge_min) & (c < net_charge_max)
     )
     return ok.fillna(False).astype(bool)
+
+
+def _apply_solubility_veto(
+    top: pd.DataFrame,
+    *,
+    enabled: bool,
+    gravy_min: Optional[float],
+    gravy_max: Optional[float],
+    net_charge_min: Optional[float],
+    net_charge_max: Optional[float],
+) -> pd.DataFrame:
+    """Opt-in hard solubility veto on a final-selection frame (modular, pure).
+
+    With ``enabled=False`` (default) returns ``top`` UNCHANGED — no copy, no new
+    column → byte-identical. With ``enabled=True`` it drops every row outside the
+    GRAVY + net-charge band (so the deferred-rescue / backfill path can never ship
+    a seq-filter-failing design, e.g. GRAVY=1.05), adds a truthful
+    ``selection__solubility_passed`` column, and logs the dropped offenders.
+
+    The band must match the final cycle's ACTUAL ``stage_seq_filter`` bounds — the
+    caller passes strategy-correct values (GRAVY is ``args.gravy_*`` under
+    'constant', ``cyc.gravy_*`` under 'annealing'; charge is the final
+    ``CycleConfig`` band). May return fewer than ``target_k`` rows (intended:
+    ship soluble-only). Applied in the caller BEFORE the row-count bookkeeping so
+    a legitimate veto drop is never mistaken for a PDB-export failure.
+
+    Distinct from ``selection__hard_final_filter_passed`` (= passed fpocket
+    druggability), which is NOT a solubility signal.
+    """
+    if not enabled or len(top) == 0:
+        return top
+    missing = [n for n, v in (("gravy_min", gravy_min), ("gravy_max", gravy_max),
+                              ("net_charge_min", net_charge_min),
+                              ("net_charge_max", net_charge_max)) if v is None]
+    if missing:
+        raise ValueError(
+            "_apply_solubility_veto: enabled but missing band bound(s): "
+            f"{', '.join(missing)} (caller must pass all four)")
+    band_ok = _within_solubility_band(
+        top, gravy_min=gravy_min, gravy_max=gravy_max,
+        net_charge_min=net_charge_min, net_charge_max=net_charge_max,
+    )
+    out = top.copy()
+    out["selection__solubility_passed"] = band_ok.values
+    n_veto = int((~band_ok).sum())
+    if n_veto:
+        cols = [c for c in ("id", "gravy", "net_charge_full_HH",
+                            "selection__bucket") if c in out.columns]
+        worst = out.loc[~band_ok, cols].head(5).to_dict("records")
+        LOGGER.error(
+            "ship_solubility_veto: dropping %d/%d final top-K rows OUTSIDE the "
+            "solubility band (GRAVY[%.2f, %.2f], charge(%.1f, %.1f)); shipping %d. "
+            "Worst offenders: %s",
+            n_veto, len(out), gravy_min, gravy_max,
+            net_charge_min, net_charge_max, len(out) - n_veto, worst,
+        )
+    return out.loc[band_ok].reset_index(drop=True)
 
 
 def _deferred_rescue_score_candidates(
@@ -6332,17 +6357,22 @@ def main() -> None:
             )
             top = _overlay_rows_by_id(top, rescued_top)
 
+        top = _apply_solubility_veto(
+            top,
+            enabled=args.ship_solubility_veto,
+            gravy_min=(final_cycle_cfg.gravy_min if args.strategy == "annealing"
+                       else args.gravy_min),
+            gravy_max=(final_cycle_cfg.gravy_max if args.strategy == "annealing"
+                       else args.gravy_max),
+            net_charge_min=final_cycle_cfg.net_charge_min,
+            net_charge_max=final_cycle_cfg.net_charge_max,
+        )
         requested_topk_rows = len(top)
         topk_tsv, top = _write_final_topk_artifacts(
             top=top,
             final_dir=final_dir,
             pdb_map=all_pdb_maps,
             seed_pdb=args.seed_pdb,
-            ship_solubility_veto=args.ship_solubility_veto,
-            gravy_min=final_cycle_cfg.gravy_min,
-            gravy_max=final_cycle_cfg.gravy_max,
-            net_charge_min=final_cycle_cfg.net_charge_min,
-            net_charge_max=final_cycle_cfg.net_charge_max,
         )
         copied_pdbs = len(top)
         if copied_pdbs != requested_topk_rows:
@@ -6354,11 +6384,15 @@ def main() -> None:
         if args.final_filter_backfill and copied_pdbs < args.target_k:
             LOGGER.warning(
                 "stage_diverse_topk: final materialized top-K underfilled "
-                "(%d/%d requested). materializable_candidates=%d",
-                copied_pdbs, args.target_k, materializable_candidates,
+                "(%d/%d requested)%s. materializable_candidates=%d",
+                copied_pdbs, args.target_k,
+                " (solubility veto active — underfill is expected)"
+                if args.ship_solubility_veto else "",
+                materializable_candidates,
             )
         if (
             args.final_filter_backfill
+            and not args.ship_solubility_veto
             and copied_pdbs < args.target_k
             and materializable_candidates >= args.target_k
         ):
@@ -6661,17 +6695,22 @@ def main() -> None:
                     chain=CHAIN,
                 )
                 top = _overlay_rows_by_id(top, rescued_top)
+            top = _apply_solubility_veto(
+                top,
+                enabled=args.ship_solubility_veto,
+                gravy_min=(final_cycle_cfg.gravy_min if args.strategy == "annealing"
+                           else args.gravy_min),
+                gravy_max=(final_cycle_cfg.gravy_max if args.strategy == "annealing"
+                           else args.gravy_max),
+                net_charge_min=final_cycle_cfg.net_charge_min,
+                net_charge_max=final_cycle_cfg.net_charge_max,
+            )
             requested_topk_rows = len(top)
             topk_tsv, top = _write_final_topk_artifacts(
                 top=top,
                 final_dir=final_dir,
                 pdb_map=all_pdb_maps,
                 seed_pdb=args.seed_pdb,
-                ship_solubility_veto=args.ship_solubility_veto,
-                gravy_min=final_cycle_cfg.gravy_min,
-                gravy_max=final_cycle_cfg.gravy_max,
-                net_charge_min=final_cycle_cfg.net_charge_min,
-                net_charge_max=final_cycle_cfg.net_charge_max,
             )
             copied_pdbs = len(top)
             if copied_pdbs != requested_topk_rows:
@@ -6683,8 +6722,11 @@ def main() -> None:
             if args.final_filter_backfill and copied_pdbs < args.target_k:
                 LOGGER.warning(
                     "stage_diverse_topk: final materialized top-K underfilled "
-                    "(%d/%d requested). materializable_candidates=%d",
-                    copied_pdbs, args.target_k, materializable_candidates,
+                    "(%d/%d requested)%s. materializable_candidates=%d",
+                    copied_pdbs, args.target_k,
+                    " (solubility veto active — underfill is expected)"
+                    if args.ship_solubility_veto else "",
+                    materializable_candidates,
                 )
 
             if args.copy_input_structure_into_out_dir:

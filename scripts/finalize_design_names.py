@@ -25,7 +25,7 @@ def main() -> int:
                         "DESIGN_PATH lines (default: drop them, leaving one "
                         "chisel_iterative_design line with the final path).")
     p.add_argument("--design_token",
-                   default=os.environ.get("CHISEL_SUFFIX", "chisel"),
+                   default=(os.environ.get("CHISEL_SUFFIX") or "chisel"),
                    help="Name component in the shipped filename "
                         "<stem>_<design_token>_<NNN>.pdb (default 'chisel', or "
                         "the CHISEL_SUFFIX env var). Alphanumeric only.")

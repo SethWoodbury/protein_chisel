@@ -12,13 +12,17 @@ All notable changes to **protein_chisel** are documented here. Format loosely fo
   shipped as the best design. `selection__hard_final_filter_passed` is fpocket-druggability only
   (misleading name) and read `True` for it.
 - **Fix (opt-in):** `--ship_solubility_veto` / `SHIP_SOLUBILITY_VETO=1` (default OFF → byte-identical)
-  makes `_write_final_topk_artifacts` — the single chokepoint both selection branches funnel
-  through — drop any design outside the final-cycle GRAVY + net-charge band *before* any PDB is
-  copied, so no solubility-failing design can ship (covers rescued rows AND annealed primary rows).
-  New pure helper `_within_solubility_band` mirrors `stage_seq_filter` exactly (charge bounds
+  applies a modular `_apply_solubility_veto` step at both final-selection branches — *before* the
+  row-count bookkeeping, so a legitimate veto drop is never mis-logged as a PDB-export failure —
+  dropping any design outside the final cycle's **actual** `stage_seq_filter` band *before* any PDB
+  is copied. Bounds are strategy-correct (GRAVY = `args.gravy_*` under `constant`, `cyc.gravy_*`
+  under `annealing`; charge = final `CycleConfig` band), so the veto matches what the seq filter
+  enforced. Pure helper `_within_solubility_band` mirrors `stage_seq_filter` exactly (charge bounds
   exclusive on `net_charge_full_HH`, GRAVY inclusive; missing/NaN fail closed). Adds a truthful
-  `selection__solubility_passed` column. May ship fewer than `target_k` (intended). 8 host tests.
-  Docs: `docs/backfill_rescue.md`.
+  `selection__solubility_passed` column. May ship fewer than `target_k` (intended; the
+  backfill-underfill ERROR is suppressed when the veto is active). `_write_final_topk_artifacts`
+  stays a pure writer (single responsibility). Robust env parsing (`false`/`off`/`0` all disable).
+  15 host tests. Independently reviewed (subagent + codex). Docs: `docs/backfill_rescue.md`.
 
 ### Added — Configurable design-name suffix (`CHISEL_SUFFIX` / `--design_token`, default byte-identical)
 - The shipped-PDB filename token is now configurable: `CHISEL_SUFFIX=chiseli2` →
