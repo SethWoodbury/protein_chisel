@@ -131,6 +131,7 @@ python scripts/load_chiseled_runs.py \
 | `USE_NODE_LOCAL_SCRATCH` | `true` | stage intermediates in fast node-local scratch + republish at end (auto-detected; falls back to OUTPUT_DIR if none) |
 | `CLOBBER_EXISTING_OUTPUTS` | `false` | clean wrapper-owned artifacts in OUTPUT_DIR before republish (allowlist-only — never touches arbitrary user files) |
 | `COPY_INPUT_STRUCTURE_INTO_OUT_DIR` | `true` | append the seed PDB scored as a reference row into `chiseled_design_metrics.tsv` |
+| `CHISEL_SUFFIX` | `chisel` | filename token for shipped designs: `<stem>_<CHISEL_SUFFIX>_NNN.pdb` (alphanumeric only; e.g. `CHISEL_SUFFIX=chiseli2` → `<stem>_chiseli2_00.pdb`). Default is byte-identical. |
 | `EXTRA_DRIVER_FLAGS` | `""` | passthrough to `iterative_design.py` (e.g. `"--no_throat_feedback --final_filter_backfill false"`) |
 
 Selection-stage backfill: if the strict fpocket-druggability cutoff would empty the final pool, the pipeline pulls near-miss candidates from each cycle's `02_seq_filter/` artifacts, re-scores them through struct + tunnel + fitness + fpocket, and overlays the results onto the primary pool. New `selection__bucket` / `selection__deferred_rescue_*` columns make rescue activity inspectable. Disable with `EXTRA_DRIVER_FLAGS="--final_filter_backfill false"`. See [`docs/backfill_rescue.md`](docs/backfill_rescue.md).

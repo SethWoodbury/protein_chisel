@@ -135,11 +135,14 @@ if manifest_path.is_file():
 PY
 }
 
-# Final rank-order rename (<stem>_chisel_NNN by rank) + DESIGN_PATH collapse on the
-# published dir. Runs LAST (after _rewrite_published_paths), in plain python3.
+# Final rank-order rename (<stem>_<CHISEL_SUFFIX>_NNN by rank) + DESIGN_PATH collapse
+# on the published dir. Runs LAST (after _rewrite_published_paths), in plain python3.
 # Non-fatal: a failure leaves designs as-is (copy-then-swap keeps originals safe).
+# CHISEL_SUFFIX (default 'chisel', alphanumeric) sets the filename token, e.g.
+# CHISEL_SUFFIX=chiseli2 -> <stem>_chiseli2_NNN.pdb. Default is byte-identical.
 FINALIZE_DESIGN_NAMES="${FINALIZE_DESIGN_NAMES:-1}"          # default ON
 KEEP_INTERMEDIATE_DESIGN_PATHS="${KEEP_INTERMEDIATE_DESIGN_PATHS:-0}"  # default OFF
+CHISEL_SUFFIX="${CHISEL_SUFFIX:-chisel}"                     # default 'chisel'
 _finalize_design_names() {
     local root="$1"
     [[ "$FINALIZE_DESIGN_NAMES" == "1" ]] || return 0
@@ -147,6 +150,7 @@ _finalize_design_names() {
     local keep=""
     [[ "$KEEP_INTERMEDIATE_DESIGN_PATHS" == "1" ]] && keep="--keep_intermediate"
     python3 "$REPO/scripts/finalize_design_names.py" --final_root "$root" $keep \
+        --design_token "$CHISEL_SUFFIX" \
         || echo "WARN: finalize_design_names failed on $root (designs left as-is)"
 }
 

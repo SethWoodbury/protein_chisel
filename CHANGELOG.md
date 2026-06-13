@@ -5,6 +5,17 @@ All notable changes to **protein_chisel** are documented here. Format loosely fo
 
 ## [Unreleased]
 
+### Added — Configurable design-name suffix (`CHISEL_SUFFIX` / `--design_token`, default byte-identical)
+- The shipped-PDB filename token is now configurable: `CHISEL_SUFFIX=chiseli2` →
+  `<stem>_chiseli2_NNN.pdb` (env passthrough in `run_chisel_design.sh` →
+  `finalize_design_names.py --design_token` → `finalize_names.finalize_design_names`).
+  Default `chisel` is **byte-identical**. Token must be non-empty alphanumeric (no `_`/`.`)
+  so the trailing-index strip stays unambiguous; the strip also recognises the legacy
+  `chisel` token, so a run minting `_chisel_<idx>` ids renames cleanly to a custom token and
+  a same-token re-run is idempotent. An input stem that itself contains `_chisel_62` keeps it
+  (only the trailing design index is replaced). Removed the now-unused module-level
+  `_CHISEL_RE` (per-call regex built from the token).
+
 ### Added — Adaptive solubility-bias controller (opt-in, default OFF, byte-identical)
 - New closed-loop controller (`src/protein_chisel/sampling/adaptive_bias.py`) that, across
   design cycles, measures the candidate pool's net charge + surface hydrophobicity and steers

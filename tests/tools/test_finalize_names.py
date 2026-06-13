@@ -238,3 +238,44 @@ def test_missing_tsv_noop(tmp_path):
     root = tmp_path / "empty"; root.mkdir()
     out = finalize_design_names(root)
     assert out["status"] == "no_tsv" and out["renamed"] == 0
+
+
+def test_custom_design_token(tmp_path):
+    # WS-H: --design_token replaces the 'chisel' token in the shipped name.
+    root = _make_run(tmp_path, ["seed_x_chisel_0", "seed_x_chisel_1"],
+                     ["seed_x_chisel_1", "seed_x_chisel_0"])  # rank: _1 best -> 0
+    out = finalize_design_names(root, design_token="chiseli2")
+    assert out["status"] == "ok" and out["renamed"] == 2
+    names = sorted(p.name for p in root.glob("*.pdb"))
+    assert names == ["input.pdb", "seed_x_chiseli2_0.pdb", "seed_x_chiseli2_1.pdb"]
+    rows = _ids_in_tsv(root)
+    design = [r for r in rows if r["is_input"] != "True"]
+    assert design[0]["id"] == "seed_x_chiseli2_0"
+    # Idempotent re-run with the SAME token must not double-append.
+    finalize_design_names(root, design_token="chiseli2")
+    assert sorted(p.name for p in root.glob("*.pdb")) == names
+
+
+def test_custom_token_preserves_input_chisel_in_stem(tmp_path):
+    # Real i2 case: the input stem itself contains a prior '_chisel_62'. Only the
+    # TRAILING design index is replaced; the input's own _chisel_62 is preserved.
+    root = _make_run(tmp_path, ["pte_chisel_62_af3i2_chisel_5"],
+                     ["pte_chisel_62_af3i2_chisel_5"])
+    finalize_design_names(root, design_token="chiseli2")
+    names = sorted(p.name for p in root.glob("*.pdb"))
+    assert names == ["input.pdb", "pte_chisel_62_af3i2_chiseli2_0.pdb"]
+
+
+def test_default_token_is_chisel(tmp_path):
+    # Byte-identity: omitting design_token == the legacy 'chisel' behavior.
+    root = _make_run(tmp_path, ["q_chisel_3"], ["q_chisel_3"])
+    finalize_design_names(root)  # no design_token
+    assert (root / "q_chisel_0.pdb").exists()
+
+
+def test_invalid_design_token_rejected(tmp_path):
+    import pytest
+    root = _make_run(tmp_path, ["w_chisel_1"], ["w_chisel_1"])
+    for bad in ("chisel_i2", "chisel.i2", "chisel i2", ""):
+        with pytest.raises(ValueError):
+            finalize_design_names(root, design_token=bad)
