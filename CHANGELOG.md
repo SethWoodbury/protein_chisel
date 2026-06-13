@@ -5,6 +5,21 @@ All notable changes to **protein_chisel** are documented here. Format loosely fo
 
 ## [Unreleased]
 
+### Fixed / Added — Hard solubility veto in final selection (opt-in, default OFF, byte-identical)
+- **Bug:** deferred-rescue/backfill re-scored fallback candidates through struct/tunnel/fpocket
+  but **never re-applied the GRAVY/charge seq band**, so a `passed_seq_filter=False` design
+  (observed: GRAVY=1.05, the user's shipped rank-0) was bucketed `rescued_final_filters` and
+  shipped as the best design. `selection__hard_final_filter_passed` is fpocket-druggability only
+  (misleading name) and read `True` for it.
+- **Fix (opt-in):** `--ship_solubility_veto` / `SHIP_SOLUBILITY_VETO=1` (default OFF → byte-identical)
+  makes `_write_final_topk_artifacts` — the single chokepoint both selection branches funnel
+  through — drop any design outside the final-cycle GRAVY + net-charge band *before* any PDB is
+  copied, so no solubility-failing design can ship (covers rescued rows AND annealed primary rows).
+  New pure helper `_within_solubility_band` mirrors `stage_seq_filter` exactly (charge bounds
+  exclusive on `net_charge_full_HH`, GRAVY inclusive; missing/NaN fail closed). Adds a truthful
+  `selection__solubility_passed` column. May ship fewer than `target_k` (intended). 8 host tests.
+  Docs: `docs/backfill_rescue.md`.
+
 ### Added — Configurable design-name suffix (`CHISEL_SUFFIX` / `--design_token`, default byte-identical)
 - The shipped-PDB filename token is now configurable: `CHISEL_SUFFIX=chiseli2` →
   `<stem>_chiseli2_NNN.pdb` (env passthrough in `run_chisel_design.sh` →

@@ -472,6 +472,13 @@ if [[ "$ADAPTIVE_BIAS" != "0" ]]; then
     [[ "${ADAPTIVE_BIAS_SEED_FROM_INPUT:-0}" == "1" ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_seed_from_input )
 fi
 
+# Hard solubility veto (opt-in; default OFF => byte-identical). SHIP_SOLUBILITY_VETO=1
+# makes the final top-K writer drop any design outside the final-cycle GRAVY +
+# net-charge band, so deferred-rescue / backfill can never ship a seq-filter-failing
+# design (e.g. GRAVY=1.05) as rank-0. May ship fewer than TARGET_K (intended).
+SHIP_SOLUBILITY_VETO_CLI=()
+[[ "${SHIP_SOLUBILITY_VETO:-0}" != "0" ]] && SHIP_SOLUBILITY_VETO_CLI+=( --ship_solubility_veto )
+
 # Decode-time Product-of-Experts backend (Phase: PoE; opt-in). Default 'bias' = the
 # in-process LigandMPNN sampler with our calibrated fusion bias (byte-identical).
 # MPNN_BACKEND=poe runs a SEPARATE HOST stage (nested apptainer is blocked) that
@@ -761,6 +768,7 @@ run_stage3_driver() {
             "${PLM_DTYPE_CLI[@]}" \
             "${METRICS_CLI[@]}" \
             "${ADAPTIVE_BIAS_CLI[@]}" \
+            "${SHIP_SOLUBILITY_VETO_CLI[@]}" \
             "$@" \
             ${EXTRA_DRIVER_FLAGS:-}
 }
