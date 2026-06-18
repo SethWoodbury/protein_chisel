@@ -28,6 +28,62 @@ def _peak_log_probs(L: int, aa_index: int) -> np.ndarray:
     return np.log(p / p.sum(axis=-1, keepdims=True))
 
 
+def _rand_log_probs(L: int, seed: int) -> np.ndarray:
+    """Random per-position log-probs (rows normalized in prob space)."""
+    rng = np.random.default_rng(seed)
+    x = rng.normal(size=(L, 20))
+    return x - np.log(np.exp(x).sum(axis=1, keepdims=True))
+
+
+# ---- WS-E: PLM strength <-> fitness decouple ------------------------------
+
+
+def test_decoupled_fitness_weights_rank_invariant_and_fix_strength_0():
+    """The decoupled (strength=1.0) weights produce the SAME fitness RANK as the
+    legacy strength-1.25 weights on a mixed-class protein — the scale cancels in the
+    ratio, so the rank is invariant (the scalar may differ by ~1 ULP, which is why
+    the driver REUSES the exact strength-scaled weights for strength>0 and only
+    substitutes the strength-1.0 weights at strength==0). And where the strength=0
+    fusion weights collapse fitness to all-ties (0), the decoupled weights rescue a
+    real spread — the weight-2.0 fitness objective the decouple restores."""
+    from protein_chisel.sampling.plm_fusion import (
+        FusionConfig, decoupled_fitness_weights, fuse_experts,
+    )
+    from protein_chisel.sampling.fitness_score import fitness_from_seed_marginals
+    L = 16
+    lp_e, lp_s = _rand_log_probs(L, 1), _rand_log_probs(L, 2)
+    classes = (["primary_sphere", "distal_surface", "nearby_surface",
+                "distal_buried"] * 4)[:L]                       # genuinely mixed
+    seqs = ["ACDEFGHIKLMNPQRS", "WYVTSRQPNMLKIHGF",
+            "AAAACCCCDDDDEEEE", "KRKRKRKRDEDEDEDE"]
+
+    w_dec = decoupled_fitness_weights([lp_e, lp_s], classes,
+                                      FusionConfig(global_strength=0.0))
+    w_125 = fuse_experts([lp_e, lp_s], classes,
+                         FusionConfig(global_strength=1.25)).weights_per_position
+    f_dec = [fitness_from_seed_marginals(s, lp_e, lp_s, w_dec).logp_fused_mean for s in seqs]
+    f_125 = [fitness_from_seed_marginals(s, lp_e, lp_s, w_125).logp_fused_mean for s in seqs]
+    assert list(np.argsort(f_dec)) == list(np.argsort(f_125))   # RANK-invariant
+    # strength=0 fusion weights -> all-ties (0); decoupled rescues a real spread.
+    w_0 = fuse_experts([lp_e, lp_s], classes,
+                       FusionConfig(global_strength=0.0)).weights_per_position
+    f_0 = [fitness_from_seed_marginals(s, lp_e, lp_s, w_0).logp_fused_mean for s in seqs]
+    assert all(v == 0.0 for v in f_0) and len(set(f_dec)) > 1
+
+
+def test_decoupled_fitness_weights_independent_of_config_strength():
+    """The helper ignores the config's global_strength (always fuses at 1.0)."""
+    from protein_chisel.sampling.plm_fusion import (
+        FusionConfig, decoupled_fitness_weights,
+    )
+    L = 8
+    lp_e, lp_s = _rand_log_probs(L, 3), _rand_log_probs(L, 4)
+    classes = ["distal_surface"] * L
+    a = decoupled_fitness_weights([lp_e, lp_s], classes, FusionConfig(global_strength=0.3))
+    b = decoupled_fitness_weights([lp_e, lp_s], classes, FusionConfig(global_strength=2.0))
+    assert np.array_equal(a, b)
+
+
 # ---- log-odds -------------------------------------------------------------
 
 

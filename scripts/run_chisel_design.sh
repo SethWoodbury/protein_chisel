@@ -514,6 +514,15 @@ if [[ "${COMPOSITION_SOFT_BIAS:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|
         && COMPOSITION_CLI+=( --composition_soft_bias_nats "$COMPOSITION_SOFT_BIAS_NATS" )
 fi
 
+# WS-E sampling-core safety (opt-in; unset => byte-identical):
+#   BIAS_TOTAL_CLAMP=<nats>          bound the effective bias_k+bias_AA (suggest 3.0)
+#   SAMPLING_TEMPERATURE_FLOOR=<T>   raise any cycle temp to >= T (suggest 0.3)
+#   PLM_CLASS_STRENGTH=<k=v,...>     absolute per-class PLM weight overrides
+WS_E_CLI=()
+[[ -n "${BIAS_TOTAL_CLAMP:-}"          ]] && WS_E_CLI+=( --bias_total_clamp "$BIAS_TOTAL_CLAMP" )
+[[ -n "${SAMPLING_TEMPERATURE_FLOOR:-}" ]] && WS_E_CLI+=( --sampling_temperature_floor "$SAMPLING_TEMPERATURE_FLOOR" )
+[[ -n "${PLM_CLASS_STRENGTH:-}"        ]] && WS_E_CLI+=( --plm_class_strength "$PLM_CLASS_STRENGTH" )
+
 # Decode-time Product-of-Experts backend (Phase: PoE; opt-in). Default 'bias' = the
 # in-process LigandMPNN sampler with our calibrated fusion bias (byte-identical).
 # MPNN_BACKEND=poe runs a SEPARATE HOST stage (nested apptainer is blocked) that
@@ -806,6 +815,7 @@ run_stage3_driver() {
             "${SHIP_SOLUBILITY_VETO_CLI[@]}" \
             "${SAP_CORRECTED_CLI[@]}" \
             "${COMPOSITION_CLI[@]}" \
+            "${WS_E_CLI[@]}" \
             "$@" \
             ${EXTRA_DRIVER_FLAGS:-}
 }

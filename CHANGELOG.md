@@ -5,6 +5,45 @@ All notable changes to **protein_chisel** are documented here. Format loosely fo
 
 ## [Unreleased]
 
+### Added/Changed — WS-E sampling-core safety (opt-in, default byte-identical)
+- **`--bias_total_clamp NATS` / `BIAS_TOTAL_CLAMP`** — bound the **effective** per-`(position, AA)`
+  sampling bias (`bias_per_residue` + the separately-applied global `bias_AA`) to `±NATS` via
+  `_clamp_bias_total` (`clip(bias_k + g, ±N) − g`, parsed from the final serialized `bias_AA`).
+  Today nothing caps the *sum*: the consensus (+2.0, uncapped) and PLM peak (~2.5) stack to ~4.5 nats
+  → ~10¹³× odds at T≈0.15, a de-facto hard lock that defeats the diversity injection. Applied to the
+  bias the sampler sees (the `bias.npy` diagnostic stays the un-clamped per-position fusion bias).
+  Default `None` → byte-identical; suggested production ~3.0 (an overflow guard, not a regularizer).
+- **`--sampling_temperature_floor T` / `SAMPLING_TEMPERATURE_FLOOR`** — raise any cycle's sampling
+  temperature to `max(cycle_T, T)`, applied once after the schedule is built so the sampler and the
+  logged temperature agree. At T≈0.15 a 0.5-nat bias is ~28× (near-deterministic); ~0.3 restores
+  genuine multinomial diversity. Overrides annealing; no effect under the PoE backend (warned).
+  Default `None` → byte-identical.
+- **PLM strength ↔ fitness decouple** (byte-identical for `--plm_strength > 0`) — at `--plm_strength 0`
+  the seed-marginal fitness used to collapse every design to a 0-tie (the fused mean `(β·lp_e+γ·lp_s)/
+  (β+γ)` with `β=γ=0`), silently zeroing the weight-2.0 fitness objective. Now, **only at strength 0**,
+  the fitness ranking substitutes the structural **strength-1.0** weights
+  (`plm_fusion.decoupled_fitness_weights`) so the rank is meaningful (run PLM-off-for-sampling and
+  still rank by PLM naturalness). For `--plm_strength > 0` the ranking **reuses the exact
+  strength-scaled fusion weights** — so the fitness TSV column is bit-for-bit identical to before
+  (recomputing the scale-invariant mean at 1.0 would have jittered ~25% of rows by 1 ULP; the
+  independent review caught this). The sampling bias always honors `--plm_strength`; `>2`-expert runs
+  are unchanged. Rank-invariance + the strength-0 rescue are pinned by a mixed-class test.
+- **`--plm_class_strength K=V,…` / `PLM_CLASS_STRENGTH`** — absolute per-class overrides of the
+  PLM-fusion `class_weights` (e.g. `distal_surface=0.3,primary_sphere=0.0`); `--plm_strength` still
+  multiplies globally on top. Unknown class names and non-finite/negative values are rejected
+  (`_parse_plm_class_strength`). Default `""` → byte-identical. Also: `--plm_strength` now rejects a
+  non-finite value (the prior `<0` / `>5` checks let NaN through).
+- **Design debate (codex + two subagents) DEFERRED two planned features as redundant:**
+  - *`--anti_repeat_bias`* — the per-cycle bias is regenerated from `survivors_prev` (no cross-cycle
+    composition memory), so "over-represented in the running pool" ≈ "over-represented in this cycle's
+    survivors", already handled by WS-C's `--aa_fraction_cap` (a hard-omit, reference-free, *stronger*
+    anti-mode-collapse lever) + `suppress_all_overrep`; and a naive `bias_AA` anti-repeat is swallowed
+    by the class-balance-wins merge — the same structural reason WS-D deferred its composition axis.
+  - *`--plm_off_mode`* — after the decouple it is identical to `--plm_strength 0` (both zero the
+    sampling bias and keep the decoupled rank); a second flag aliasing an existing one invites the
+    no-op/version-skew bug class. The `0.0` behavior is documented on `--plm_strength`.
+- 8 new host tests; full host suite 790 passed.
+
 ### Added/Changed — WS-D adaptive-controller expansion (opt-in, default byte-identical)
 - **`non_tunnel_surface` scope (`--adaptive_surface_sasa_gate` / `ADAPTIVE_SURFACE_SASA_GATE`)** —
   the controller's surface hydrophobic down-weight no longer acts only on `distal_surface`

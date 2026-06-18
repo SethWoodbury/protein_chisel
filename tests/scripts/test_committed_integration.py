@@ -23,6 +23,7 @@ from pathlib import Path
 
 import math
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -642,6 +643,80 @@ def test_shell_ws_c_boolean_truthiness(env_var, cli_flag, value, expect_flag):
     )
     assert proc.returncode == 0, proc.stderr
     assert (cli_flag in proc.stdout) is expect_flag
+
+
+# ----------------------------------------------------------------------------
+# 7. WS-E sampling-core safety helpers.
+# ----------------------------------------------------------------------------
+
+
+def test_clamp_bias_total_clips_summed_bias():
+    """--bias_total_clamp bounds the summed per-(pos,AA) bias_k (the uncapped
+    consensus+PLM stack) to ±N nats (bias_AA_vec=None => bias_k only)."""
+    bias = np.array([[5.0, -4.0, 0.1], [1.0, -1.0, 0.0]], dtype=np.float32)
+    out = idz._clamp_bias_total(bias, 2.0)
+    assert float(out.max()) == 2.0 and float(out.min()) == -2.0
+    assert float(out[1, 0]) == 1.0                 # within-band cells untouched
+    assert out.dtype == np.float32                 # dtype preserved
+
+
+def test_clamp_bias_total_bounds_the_EFFECTIVE_bias_with_global_bias_AA():
+    """codex: LigandMPNN adds bias_per_residue (bias_k) AND the global bias_AA
+    separately, so the clamp must bound the EFFECTIVE sum bias_k+bias_AA. After
+    clamping, bias_k+g must lie within ±N (and a cell already in-band is unchanged)."""
+    bias_k = np.array([[2.0, 0.0, -2.0]], dtype=np.float32)
+    g = np.array([2.5, 0.1, -2.5], dtype=np.float32)        # global per-AA bias
+    out = idz._clamp_bias_total(bias_k, 3.0, bias_AA_vec=g)
+    eff = out + g
+    assert np.all(eff <= 3.0 + 1e-6) and np.all(eff >= -3.0 - 1e-6)
+    assert eff[0, 0] == pytest.approx(3.0)         # 2.0+2.5=4.5 -> clamped to 3.0
+    assert out[0, 1] == pytest.approx(0.0)         # 0.0+0.1 in band -> bias_k unchanged
+
+
+def test_clamp_bias_total_none_is_identity_noop():
+    """clamp=None returns the SAME array object (byte-identical default path)."""
+    bias = np.array([[5.0, -4.0]], dtype=np.float32)
+    assert idz._clamp_bias_total(bias, None) is bias
+    assert idz._clamp_bias_total(bias, None, bias_AA_vec=np.zeros(2)) is bias
+
+
+def test_iterative_design_help_advertises_ws_e_flags():
+    proc = subprocess.run(
+        [sys.executable, "scripts/iterative_design.py", "--help"],
+        cwd=str(REPO), env={**os.environ, "PYTHONPATH": "src"},
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    for flag in ("--bias_total_clamp", "--sampling_temperature_floor",
+                 "--plm_class_strength"):
+        assert flag in proc.stdout, flag
+
+
+def test_cli_rejects_nonfinite_plm_strength():
+    """--plm_strength nan/inf is rejected at startup (codex: the <0/>5 checks let
+    NaN through)."""
+    for bad in ("nan", "inf"):
+        proc = subprocess.run(
+            [sys.executable, "scripts/iterative_design.py", "--seed_pdb", "x.pdb",
+             "--plm_strength", bad],
+            cwd=str(REPO), env={**os.environ, "PYTHONPATH": "src"},
+            capture_output=True, text=True, timeout=120,
+        )
+        assert proc.returncode != 0
+        assert "plm_strength" in proc.stderr
+
+
+def test_parse_plm_class_strength_parses_and_validates():
+    """--plm_class_strength k=v,...: absolute per-class overrides; reject unknown
+    class names, NaN/inf, and negatives (codex)."""
+    assert idz._parse_plm_class_strength("") == {}
+    assert idz._parse_plm_class_strength("distal_surface=0.3,primary_sphere=0.0") == {
+        "distal_surface": 0.3, "primary_sphere": 0.0}
+    for bad in ("distal_surface=-0.1", "distal_surface=nan", "distal_surface=inf",
+                "bogus_class=0.3", "distal_surface", "distal_surface=x",
+                "surface=0.3", "buried=0.3"):     # legacy keys -> silent no-op -> reject
+        with pytest.raises(ValueError):
+            idz._parse_plm_class_strength(bad)
 
 
 def test_parse_charge_band_arg_requires_exactly_two_floats():

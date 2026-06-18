@@ -225,6 +225,35 @@ def _parse_charge_band_arg(s: str) -> tuple:
     return (lo, hi)
 
 
+def _parse_plm_class_strength(s: str) -> dict:
+    """Parse ``--plm_class_strength 'class=val,...'`` -> ``{class: weight}``.
+
+    ABSOLUTE per-class overrides of ``FusionConfig.class_weights`` (not multipliers):
+    e.g. ``distal_surface=0.3`` sets that class's PLM weight to 0.3 (then scaled by
+    the global ``--plm_strength``). Validates each key is a known position class and
+    each value is finite and ``>= 0`` — a typo'd class would otherwise be a silent
+    no-op (``_lookup`` just wouldn't read it). Empty string -> ``{}`` (byte-identical
+    default).
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from protein_chisel.scoring.multi_objective import parse_kv_string
+    from protein_chisel.tools.classify_positions import NEW_CLASSES
+    overrides = parse_kv_string(s)            # raises on a missing '=' / non-float
+    # Only the CURRENT (directional 6-class) taxonomy: legacy tables are re-classified
+    # to these names before fusion, so a legacy key (surface/buried/…) would be a
+    # silent no-op — reject it (the "no silent no-op" guarantee, per review).
+    known = set(NEW_CLASSES)
+    for cls, val in overrides.items():
+        if cls not in known:
+            raise ValueError(
+                f"--plm_class_strength: unknown position class {cls!r}; "
+                f"choose from {sorted(known)}")
+        if not math.isfinite(val) or val < 0.0:
+            raise ValueError(
+                f"--plm_class_strength: {cls}={val} must be a finite weight >= 0")
+    return overrides
+
+
 def _derive_catres_from_remark_666(seed_pdb: Path | str) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """Read REMARK 666 from ``seed_pdb`` and return:
 
@@ -846,6 +875,40 @@ def merge_omit_dicts(*dicts: dict[str, str]) -> dict[str, str]:
 
 # The 20 canonical amino acids (set; order-independent membership tests).
 _CANONICAL_AAS = frozenset("ACDEFGHIKLMNPQRSTVWY")
+
+
+def _clamp_bias_total(
+    bias_k: np.ndarray,
+    clamp: Optional[float],
+    bias_AA_vec: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """WS-E ``--bias_total_clamp``: bound the EFFECTIVE per-(pos, AA) sampling bias.
+
+    LigandMPNN adds the per-residue bias (``bias_k``) AND the global ``bias_AA``
+    separately, so the effective bias at ``(pos, AA)`` is their sum. When
+    ``bias_AA_vec`` (a ``(20,)`` per-AA vector parsed from the FINAL serialized
+    ``bias_AA`` string) is given, the clamp bounds ``bias_k + bias_AA`` to
+    ``±clamp`` and returns the adjusted ``bias_k`` (so the sum stays in band, while
+    the separately-passed global term is preserved); a cell already in band is
+    unchanged. Without ``bias_AA_vec`` it clamps ``bias_k`` alone.
+
+    ``clamp is None`` returns ``bias_k`` UNCHANGED (the same object) — the
+    byte-identical default. Bounds the otherwise-uncapped consensus(+2.0) + PLM-peak
+    stack that, at T≈0.15, locks a cell near-deterministically (~10¹³× odds).
+    """
+    if clamp is None:
+        return bias_k
+    n = abs(float(clamp))
+    if bias_AA_vec is None:
+        return np.clip(bias_k, -n, n)
+    g = np.asarray(bias_AA_vec, dtype=bias_k.dtype)[None, :]
+    total = bias_k + g
+    clipped = np.clip(total, -n, n)
+    # Only adjust cells that actually exceeded the band; leave in-band bias_k EXACT
+    # (the (bias_k+g)-g round-trip would otherwise perturb in-band cells by ~1e-7 in
+    # float32 and inflate the "n cells adjusted" telemetry).
+    return np.where(clipped != total, clipped - g, bias_k).astype(bias_k.dtype)
+
 
 # WS-C fraction cap never leaves a designable position with fewer than this many
 # sampleable AAs (guards the all-AAs-omitted → uniform-from-forbidden MPNN failure).
@@ -4373,6 +4436,7 @@ def run_cycle(
     composition_soft_bias: bool = False,
     composition_soft_bias_nats: float = 0.5,
     expression_soft_bias: Optional[dict[int, str]] = None,
+    bias_total_clamp: Optional[float] = None,
     n_term_pad: str = "",
     c_term_pad: str = "",
     omit_M_at_pos1: bool = True,
@@ -4684,8 +4748,26 @@ def run_cycle(
         merged_omit = _enforce_min_sampleable_after_cap(
             merged_omit, _pre_cap_omit, cycle_cfg.omit_AA,
         )
+    # WS-E: bound the EFFECTIVE (bias_k + global bias_AA) sampling bias to ±N nats.
+    # None => bias_k unchanged (same object) => byte-identical. The bias.npy saved
+    # above is the un-clamped per-position fusion bias (a diagnostic); the clamp
+    # adjusts only what the sampler sees. Parse the FINAL serialized bias_AA so the
+    # 2-decimal rounding LigandMPNN actually applies is reflected exactly.
+    bias_for_sampling = bias_k
+    if bias_total_clamp is not None:
+        from protein_chisel.sampling.adaptive_bias import AA_TO_IDX, parse_bias_AA
+        _bias_AA_vec = np.zeros(20, dtype=bias_k.dtype)
+        for _aa, _v in parse_bias_AA(bias_AA_str).items():
+            if _aa in AA_TO_IDX:
+                _bias_AA_vec[AA_TO_IDX[_aa]] = _v
+        bias_for_sampling = _clamp_bias_total(bias_k, bias_total_clamp, _bias_AA_vec)
+        n_clamped = int((np.abs(bias_for_sampling - bias_k) > 1e-9).sum())
+        if n_clamped:
+            LOGGER.info("cycle %d: bias_total_clamp=%.2f adjusted %d (pos,AA) cells "
+                        "(effective bias_k+bias_AA bounded)",
+                        cycle_cfg.cycle_idx, bias_total_clamp, n_clamped)
     cand_tsv = stage_sample(
-        cycle_cfg=cycle_cfg, seed_pdb=seed_pdb, bias=bias_k,
+        cycle_cfg=cycle_cfg, seed_pdb=seed_pdb, bias=bias_for_sampling,
         protein_resnos=protein_resnos, fixed_resnos=fixed_resnos,
         out_dir=sample_dir,
         omit_AA_per_residue=merged_omit,
@@ -5180,6 +5262,29 @@ def main() -> None:
                         "'charge,surface_hydrophobicity'). Restrict (e.g. 'charge') "
                         "or, as future registry entries land, extend. An unknown "
                         "axis name is rejected.")
+    # ---- WS-E sampling-core safety (opt-in; defaults => byte-identical) ----
+    p.add_argument("--bias_total_clamp", type=_nonneg_finite_arg, default=None,
+                   metavar="NATS",
+                   help="Opt-in (default None => byte-identical). Bound the EFFECTIVE "
+                        "per-(position,AA) sampling bias (bias_per_residue + global "
+                        "bias_AA) to ±NATS. The consensus(+2.0) + PLM-peak stack is "
+                        "otherwise uncapped; at T≈0.15 that locks a cell near-"
+                        "deterministically (~10^13x odds). Suggested production value "
+                        "~3.0 (an overflow/stacking guard, not a gentle regularizer).")
+    p.add_argument("--sampling_temperature_floor",
+                   type=lambda s: _nonneg_finite_arg(s, max_value=2.0), default=None,
+                   metavar="T",
+                   help="Opt-in (default None => byte-identical). Raise any cycle's "
+                        "sampling temperature to at least T (overriding the annealing "
+                        "schedule). At T≈0.15 a 0.5-nat bias is ~28x (near-"
+                        "deterministic); ~0.3 restores genuine multinomial diversity. "
+                        "No effect under the PoE backend.")
+    p.add_argument("--plm_class_strength", type=str, default="", metavar="K=V,...",
+                   help="Opt-in (default '' => byte-identical). ABSOLUTE per-class "
+                        "overrides of the PLM-fusion class weights, e.g. "
+                        "'distal_surface=0.3,primary_sphere=0.0'. The global "
+                        "--plm_strength still multiplies on top. Unknown class names "
+                        "and non-finite/negative values are rejected.")
     p.add_argument("--protonate_final", action="store_true", default=True,
                    help="After stage_diverse_topk, hydrate every top-K PDB "
                         "via PyRosetta and write a downstream-clean "
@@ -5404,6 +5509,8 @@ def main() -> None:
                         "returns; charge SD inflates). Must be ≥ 0; 0.0 "
                         "disables PLM bias entirely.")
     args = p.parse_args()
+    if not math.isfinite(args.plm_strength):
+        p.error("--plm_strength must be finite")
     if args.plm_strength < 0:
         p.error("--plm_strength must be >= 0 "
                 "(negative would invert the PLM signal)")
@@ -5678,7 +5785,9 @@ def main() -> None:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
     from protein_chisel.io.schemas import PositionTable
     from protein_chisel.io.pdb import extract_sequence
-    from protein_chisel.sampling.plm_fusion import FusionConfig, fuse_experts
+    from protein_chisel.sampling.plm_fusion import (
+        FusionConfig, decoupled_fitness_weights, fuse_experts,
+    )
 
     pt = PositionTable.from_parquet(args.position_table)
     # Detect legacy (5-class) PositionTable and re-classify with the new
@@ -5720,7 +5829,17 @@ def main() -> None:
     # numpy ops on (L, 20) matrices. We then snapshot the runtime
     # result to the run dir so offline analysis/replays use the
     # *actual* bias the cycles saw, not the stale cached one.
+    # WS-E: opt-in ABSOLUTE per-class PLM weight overrides (default {} -> unchanged
+    # -> byte-identical fusion). Fail-fast on a bad class name / value at startup.
+    try:
+        _plm_class_overrides = _parse_plm_class_strength(args.plm_class_strength)
+    except ValueError as _exc:
+        raise SystemExit(str(_exc))
     fusion_cfg = FusionConfig(global_strength=args.plm_strength)
+    if _plm_class_overrides:
+        fusion_cfg.class_weights.update(_plm_class_overrides)
+        LOGGER.info("PLM per-class strength overrides (absolute): %s",
+                    _plm_class_overrides)
     # Default ["esmc","saprot"] (no per-expert knobs) -> fuse_experts delegates to
     # the legacy fuse_plm_logits via its N=2 fast-path -> byte-identical bias
     # (see tests/sampling/test_fuse_experts.py). >=3 experts use the N-way path.
@@ -5729,14 +5848,31 @@ def main() -> None:
         config=fusion_cfg, expert_names=expert_names,
     )
     base_bias = fusion_res.bias
+    # WS-E PLM decouple: for --plm_strength > 0, reuse the EXACT strength-scaled
+    # fusion weights (byte-identical — the fused-mean RANK is scale-invariant in
+    # plm_strength, but the scalar is not bit-exact, so recomputing at 1.0 would
+    # perturb the fitness TSV column by ~1 ULP). Only at strength == 0 — where the
+    # sampling bias is off AND the legacy weights are all-zero (every design ties at
+    # 0, silently zeroing the weight-2.0 fitness objective) — substitute the
+    # structural strength-1.0 weights to rescue a meaningful rank. The (L, 2) fitness
+    # path is the 2-expert default; >2-expert runs keep the legacy None unchanged
+    # (the decoupled helper would return (L, N), which the fitness gather rejects).
     weights_per_position = fusion_res.weights_per_position
+    if args.plm_strength == 0 and weights_per_position is not None:
+        weights_per_position = decoupled_fitness_weights(
+            expert_logprobs, position_classes, config=fusion_cfg,
+            expert_names=expert_names,
+        )
     fusion_dir = run_dir / "fusion_runtime"
     fusion_dir.mkdir(parents=True, exist_ok=True)
     np.save(fusion_dir / "base_bias.npy", base_bias)
     # Legacy snapshots (populated for the default 2-expert case); guarded so a
     # custom >=3-expert set doesn't crash on the None legacy fields.
-    if weights_per_position is not None:
-        np.save(fusion_dir / "weights_per_position.npy", weights_per_position)
+    if fusion_res.weights_per_position is not None:
+        # Save the BIAS-strength weights (byte-identical write-only diagnostic); the
+        # fitness path uses the decoupled strength=1.0 weights in `weights_per_position`.
+        np.save(fusion_dir / "weights_per_position.npy",
+                fusion_res.weights_per_position)
     if fusion_res.log_odds_esmc is not None:
         np.save(fusion_dir / "log_odds_esmc.npy", fusion_res.log_odds_esmc)
     if fusion_res.log_odds_saprot is not None:
@@ -6025,6 +6161,27 @@ def main() -> None:
                 "with no survivors). Use --mpnn_backend bias for these levers.",
                 " and ".join(_poe_dead),
             )
+    # ---- WS-E: sampling temperature floor (opt-in) ---------------------------
+    # Raise any cycle's sampling temperature to at least the floor, applied ONCE
+    # here (after construction / truncation / PoE forcing) so the sampler AND the
+    # logged/telemetered temperature agree. At T≈0.15 even a 0.5-nat bias is ~28x
+    # (near-deterministic); a floor ~0.3 restores genuine multinomial diversity.
+    # None => byte-identical (the schedule is untouched). The floor OVERRIDES the
+    # annealing schedule (a floor above the max cycle temp disables annealing).
+    if args.sampling_temperature_floor is not None:
+        _floored = []
+        for cyc in cycles:
+            if cyc.sampling_temperature < args.sampling_temperature_floor:
+                _floored.append((cyc.cycle_idx, cyc.sampling_temperature))
+                cyc.sampling_temperature = args.sampling_temperature_floor
+        if _floored:
+            LOGGER.info("sampling_temperature_floor=%.3f raised cycles %s",
+                        args.sampling_temperature_floor,
+                        [f"{i}:{t:.3f}->{args.sampling_temperature_floor:.3f}"
+                         for i, t in _floored])
+        if args.poe_output_dir is not None:
+            LOGGER.warning("--sampling_temperature_floor has NO effect under the PoE "
+                           "backend (it already sampled at POE_TEMPERATURE).")
     LOGGER.info("cycle schedule: %d cycles, omit_AA=%r", len(cycles), args.omit_AA)
 
     # ---- Pre-compute seed DFI once (design-invariant for fixed-backbone) --
@@ -6230,6 +6387,7 @@ def main() -> None:
             composition_soft_bias=args.composition_soft_bias,
             composition_soft_bias_nats=args.composition_soft_bias_nats,
             expression_soft_bias=expression_soft_bias,
+            bias_total_clamp=args.bias_total_clamp,
             n_term_pad=args.n_term_pad,
             c_term_pad=args.c_term_pad,
             omit_M_at_pos1=not args.no_omit_M_at_pos1,

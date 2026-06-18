@@ -255,6 +255,14 @@ scope/axes. With `--adaptive_bias` absent, zero change.
 
 ## WS-E: Sampling-core safety (clamp, temperature, anti-repeat, PLM decouple/off, per-class PLM)
 
+> **Status (shipped):** `--bias_total_clamp` (now clamps the EFFECTIVE `bias_k`+`bias_AA`),
+> `--sampling_temperature_floor`, the PLM-strength↔fitness decouple (always-on, byte-identical for
+> strength>0; fixes the `plm_strength=0` fitness collapse), and `--plm_class_strength` landed. A design
+> debate (codex + 2 subagents) **deferred `--anti_repeat_bias`** (redundant with WS-C's reference-free
+> `--aa_fraction_cap` + `suppress_all_overrep`; the class-balance-wins merge swallows a naive `bias_AA`
+> anti-repeat) and **dropped `--plm_off_mode`** (identical to `--plm_strength 0` after the decouple).
+> See `CHANGELOG.md` [Unreleased] WS-E.
+
 **Files:**
 - Modify: `scripts/iterative_design.py` bias assembly (~4099-4173): after summing all terms, when
   `--bias_total_clamp N`: `bias_k = np.clip(bias_k, -N, N)` (the audit/codex note: there is **no**
