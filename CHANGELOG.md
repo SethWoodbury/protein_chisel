@@ -5,6 +5,59 @@ All notable changes to **protein_chisel** are documented here. Format loosely fo
 
 ## [Unreleased]
 
+### Added/Changed — WS-D adaptive-controller expansion (opt-in, default byte-identical)
+- **`non_tunnel_surface` scope (`--adaptive_surface_sasa_gate` / `ADAPTIVE_SURFACE_SASA_GATE`)** —
+  the controller's surface hydrophobic down-weight no longer acts only on `distal_surface`
+  (a ligand-distance shell). New pure `sampling/adaptive_bias.surface_scope(...)` returns an
+  `(L,)` membership mask = SASA fraction ≥ gate AND class in a vetted exposed set
+  (`{distal_surface, nearby_surface}`, configurable) AND not tunnel-lining / throat-band / fixed —
+  a *superset* of `distal_surface` (adds back exposed `nearby_surface`, drops the 10 Å gate)
+  *minus* the tunnel mouth. This is the user's "steer what I can see by eye" surface. The mask
+  is structure-invariant (built once from the seed; tunnel-lining read from the seed annotation,
+  throat-band source not yet wired). `build_surface_delta(surface_mask=…)` consumes it;
+  **`sasa_gate=None` reproduces the legacy `distal_surface` + SASA>0 gate byte-for-byte** (proven
+  over 200 random trials). **Review fix (SEV-1):** the scope POSITIVELY gates on the vetted exposed
+  classes rather than negatively excluding the active site — a negative gate would sweep in any
+  *other* class (legacy `buried`/`first_shell`, or an unknown class on a new scaffold) whose total-
+  SASA cleared the gate, down-weighting a load-bearing core hydrophobic; positive gating closes that
+  (and the total-residue-SASA proxy caveat for `nearby_surface` is documented — restrict to
+  `{distal_surface}` for a conservative run).
+- **Configurable charge band (`--adaptive_charge_band LO,HI` / `ADAPTIVE_CHARGE_BAND`, e.g.
+  `-15,-5`)** — overrides the controller's net-charge band, sets the target to the band MIDPOINT,
+  and **nulls the charge axis's precomputed gap columns** so the fail-fraction is evaluated on raw
+  net charge: those gaps were computed against the *cycle filter* band, so a custom adaptive band
+  must fall back to raw-value evaluation (codex). Validated finite `lo < hi`; bad band / unknown
+  axis fail fast at startup (the per-cycle controller is defensively wrapped, so otherwise they'd
+  silently degrade the run).
+- **Axis selector (`--adaptive_bias_axes` / `ADAPTIVE_BIAS_AXES`)** — `default_axes(axes=…)` returns
+  an ordered subset of the registry (default `charge,surface_hydrophobicity`); the extension point
+  for future registry entries. Rejects an empty selection and duplicates (codex: a repeated axis
+  would double-stack one actuator past its clamp). `--adaptive_charge_band` requires exactly two
+  finite fields (`_parse_charge_band_arg`).
+- **Multi-pool plumbing** — `ControlAxis.pool_key` (default `"seq"`) + `compute_adaptive_bias(pools=…)`
+  (back-compat: a lone `pool_df` is `{"seq": pool_df}`) route each axis to the stage pool it measures.
+  This is the clean, tested enabler for a future struct-stage axis without touching the control law.
+- **Dedup** — `KD_HYDROPHOBICITY` is now imported from the single source of truth in `scoring/sap.py`
+  (re-exported for back-compat); the duplicated dict the 2026-06 audit flagged is gone. Byte-identical
+  (same values; `kd.mean()` arithmetic unchanged).
+- **Design debate (codex + two independent subagents) deliberately DEFERRED two of the planned axes:**
+  - *composition axis* — a scalar integral controller is the wrong model for composition (the offending
+    AA changes each cycle; holding a scalar `u` while recomputing 20-dim weights is incoherent; reversal
+    / secant gain are undefined). And per-cycle over-representation is **already corrected** by WS-C's
+    class-balance + `suppress_all_overrep`; the `merge_bias_AA_strings` policy (class-balance wins) makes
+    a naive composition axis vanish. So nothing sound to add — composition stays in WS-C.
+  - *SAP axis* — `sap_corr` ≡ the GRAVY surface actuator (identical AA set, same `build_surface_delta`)
+    → an independent SAP axis would double-push; `sap_corr_*` lives only on the struct-stage pool (the
+    controller measures seq-stage); struct-survivor counts fall below `min_n` exactly when solubility is
+    failing; and the corrected-SAP threshold is uncalibrated. Deferred pending calibration + an
+    actuator-group controller; the `pool_key`/`pools` plumbing makes it a one-axis follow-up.
+- The control law (`step_axis`, gain estimate, merge, wald gate) is **untouched** → the convergence /
+  hold / anti-overshoot suite cannot regress. With `--adaptive_bias` absent (or on with no WS-D flags),
+  the run is byte-identical (independently verified: codex + two subagents, 6000+ fuzz trials, the
+  default registry compared field-by-field vs HEAD). Their findings — the SEV-1 scope leak, the
+  duplicate/empty axis selector, and the charge-band field count — are folded in above. 22 new host
+  tests; full host suite 784 passed.
+
 ### Added — WS-C composition control that actually corrects (opt-in, default OFF, byte-identical)
 - Three independent opt-in levers attack the over-/single-AA-representation failure
   mode (the shipped rank-0 design was 26% Ala / 20% Leu); each defaults to current

@@ -202,6 +202,15 @@ hydrolases (validation task below) — until calibrated, ship the columns but ke
 
 ## WS-D: Controller expansion (SASA scope + SAP/composition axes + charge band)
 
+> **Status (shipped):** the `non_tunnel_surface` SASA scope, the configurable charge band, the
+> `--adaptive_bias_axes` selector, the multi-pool (`pool_key`/`pools`) plumbing, and the KD dedup
+> landed. A design debate (codex + 2 subagents) **deferred the composition and SAP axes**: a scalar
+> integral controller is the wrong model for composition (per-cycle vector policy; over-rep is
+> already handled by WS-C class-balance, and the merge makes a naive axis vanish), and the SAP axis
+> ≡ the GRAVY surface actuator (double-push), needs the struct-stage pool, can't meet `min_n` when
+> failing, and is uncalibrated. The `pool_key`/`pools` plumbing makes a future SAP axis a one-line
+> follow-up. See `CHANGELOG.md` [Unreleased] WS-D.
+
 **`non_tunnel_surface` scope (user ask — replace "10 Å from ligand" with a real designable-surface set):**
 The user wants the surface controller to act on *any exposed residue that is not part of the active-site
 mouth/tunnel* — "what I can see by eye," not a ligand-distance shell. Define at runtime (no new

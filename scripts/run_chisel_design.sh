@@ -470,6 +470,13 @@ if [[ "$ADAPTIVE_BIAS" != "0" ]]; then
     [[ -n "${ADAPTIVE_BIAS_MIN_N:-}"     ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_min_n "$ADAPTIVE_BIAS_MIN_N" )
     [[ -n "${ADAPTIVE_BIAS_MODE:-}"      ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_mode "$ADAPTIVE_BIAS_MODE" )
     [[ "${ADAPTIVE_BIAS_SEED_FROM_INPUT:-0}" == "1" ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_seed_from_input )
+    # WS-D controller expansion (opt-in; unset => today's controller behavior):
+    #   ADAPTIVE_SURFACE_SASA_GATE=<frac>  non_tunnel_surface scope (e.g. 0.20)
+    #   ADAPTIVE_CHARGE_BAND=<lo,hi>       controller net-charge band (e.g. -15,-5)
+    #   ADAPTIVE_BIAS_AXES=<list>          axis subset (e.g. charge,surface_hydrophobicity)
+    [[ -n "${ADAPTIVE_SURFACE_SASA_GATE:-}" ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_surface_sasa_gate "$ADAPTIVE_SURFACE_SASA_GATE" )
+    [[ -n "${ADAPTIVE_CHARGE_BAND:-}"       ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_charge_band "$ADAPTIVE_CHARGE_BAND" )
+    [[ -n "${ADAPTIVE_BIAS_AXES:-}"         ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_axes "$ADAPTIVE_BIAS_AXES" )
 fi
 
 # Hard solubility veto (opt-in; default OFF => byte-identical). SHIP_SOLUBILITY_VETO=1

@@ -49,6 +49,17 @@ GRAVY_AXIS = default_axes()[1]
 # ---------------------------------------------------------------------------
 # Projections
 # ---------------------------------------------------------------------------
+def test_kd_dict_is_single_source_from_scoring_sap():
+    """WS-D dedup: the controller's KD scale is the SAME object as scoring.sap's
+    (single source of truth), and the centered projection is byte-identical to a
+    hand-computation off that shared dict (no silent value drift)."""
+    from protein_chisel.scoring import sap
+    assert ab.KD_HYDROPHOBICITY is sap.KD_HYDROPHOBICITY
+    kd = np.array([sap.KD_HYDROPHOBICITY[a] for a in ab.AA_ORDER], dtype=float)
+    centered = kd - kd.mean()
+    assert np.array_equal(kd_centered_weights(), centered / np.abs(centered).max())
+
+
 def test_kd_projection_signs_and_norm():
     w = kd_centered_weights()
     assert abs(np.abs(w).max() - 1.0) < 1e-9          # normalized to max 1
@@ -56,6 +67,63 @@ def test_kd_projection_signs_and_norm():
         assert w[AA_TO_IDX[a]] > 0
     for a in "DEKRNQ":                                 # hydrophilic -> negative
         assert w[AA_TO_IDX[a]] < 0
+
+
+def test_default_axes_unchanged_by_default():
+    """No args => today's registry: [charge, surface_hydrophobicity], target -10,
+    band (-18,-4), gap columns present (byte-identical default)."""
+    axes = default_axes()
+    assert [a.name for a in axes] == ["charge", "surface_hydrophobicity"]
+    ch = axes[0]
+    assert ch.target == -10.0 and (ch.band_lo, ch.band_hi) == (-18.0, -4.0)
+    assert ch.fail_high_column == "selection__seq_filter_gap_charge_high"
+    assert ch.fail_low_column == "selection__seq_filter_gap_charge_low"
+
+
+def test_default_axes_charge_band_override_sets_band_target_and_nulls_gaps():
+    """--adaptive_charge_band -15,-5: charge axis band=(-15,-5), target=midpoint
+    -10, and the (cycle-band) gap columns are NULLED so the fail-fraction is
+    evaluated on raw values vs the new band (codex fix)."""
+    ch = default_axes(charge_band=(-15.0, -5.0))[0]
+    assert (ch.band_lo, ch.band_hi) == (-15.0, -5.0)
+    assert ch.target == pytest.approx(-10.0)
+    assert ch.fail_high_column is None and ch.fail_low_column is None
+
+
+def test_charge_band_override_fires_via_raw_value_eval_without_gap_columns():
+    """With the override (gap columns nulled), an out-of-band charge pool that
+    carries NO gap columns still fires through raw-value band evaluation."""
+    ch = default_axes(charge_band=(-15.0, -5.0))[0]
+    rng = np.random.default_rng(43)
+    pool = make_pool(ch, n=200, mean=2.0, std=1.0, rng=rng)   # +2, well above -5
+    assert "selection__seq_filter_gap_charge_high" not in pool.columns
+    oc, _ = step_axis(pool, ch, AxisState(), AdaptiveBiasConfig())
+    assert oc.gate_open and oc.fail_fraction > 0.9
+
+
+def test_default_axes_charge_band_validates_lo_lt_hi():
+    with pytest.raises(ValueError):
+        default_axes(charge_band=(-5.0, -15.0))      # lo > hi
+    with pytest.raises(ValueError):
+        default_axes(charge_band=(float("nan"), -5.0))
+
+
+def test_default_axes_selector_subset_and_unknown_raises():
+    assert [a.name for a in default_axes(axes=["charge"])] == ["charge"]
+    assert [a.name for a in default_axes(axes=["surface_hydrophobicity"])] == \
+        ["surface_hydrophobicity"]
+    with pytest.raises(ValueError):
+        default_axes(axes=["charge", "bogus_axis"])
+
+
+def test_default_axes_selector_rejects_empty_and_duplicates():
+    """codex: an empty selection silently disables the controller, and a duplicate
+    (e.g. the surface axis twice) would stack the actuator past its clamp — both are
+    config errors, not silent behaviors."""
+    with pytest.raises(ValueError):
+        default_axes(axes=[])
+    with pytest.raises(ValueError):
+        default_axes(axes=["surface_hydrophobicity", "surface_hydrophobicity"])
 
 
 def test_charge_projection():
@@ -231,6 +299,173 @@ def test_surface_delta_only_at_surface_and_not_fixed():
     assert np.all(d[1] == 0)                  # buried -> untouched
     assert np.all(d[2] == 0)                  # active-site -> untouched
     assert np.all(d[3] == 0)                  # surface BUT fixed -> untouched
+
+
+# ---------------------------------------------------------------------------
+# WS-D: non_tunnel_surface scope
+# ---------------------------------------------------------------------------
+# L=6 scaffold exercising every branch:
+#   i0 distal_surface, exposed, BUT tunnel-lining   i3 distal_buried (buried)
+#   i1 nearby_surface, exposed (binding region)     i4 distal_surface, low SASA
+#   i2 primary_sphere (active site)                 i5 nearby_surface, but FIXED
+_SCOPE_CLASSES = ["distal_surface", "nearby_surface", "primary_sphere",
+                  "distal_buried", "distal_surface", "nearby_surface"]
+_SCOPE_SASA = np.array([0.5, 0.5, 0.5, 0.05, 0.1, 0.5])
+_SCOPE_FIXED = {5}
+_SCOPE_TUNNEL = frozenset({0})
+
+
+def test_surface_scope_legacy_matches_distal_surface_only():
+    """sasa_gate=None reproduces today's distal_surface + sasa>0 + not-fixed gate
+    EXACTLY (tunnel/throat sets ignored in legacy mode) — byte-identical."""
+    mask = ab.surface_scope(
+        L=6, position_classes=_SCOPE_CLASSES, sasa_fraction=_SCOPE_SASA,
+        fixed_idx=_SCOPE_FIXED, sasa_gate=None, tunnel_lining_idx=_SCOPE_TUNNEL)
+    # distal_surface with sasa>0 and not fixed: i0 (tunnel ignored in legacy), i4.
+    assert list(mask) == [True, False, False, False, True, False]
+
+
+def test_surface_scope_non_tunnel_adds_exposed_nearby_drops_tunnel_and_lowsasa():
+    """sasa_gate set => the non_tunnel_surface set: exposed non-active-site, not
+    tunnel/throat/fixed. Adds back exposed nearby_surface (i1); drops the
+    tunnel-lining distal_surface (i0) and the low-SASA distal_surface (i4)."""
+    mask = ab.surface_scope(
+        L=6, position_classes=_SCOPE_CLASSES, sasa_fraction=_SCOPE_SASA,
+        fixed_idx=_SCOPE_FIXED, sasa_gate=0.2, tunnel_lining_idx=_SCOPE_TUNNEL)
+    assert list(mask) == [False, True, False, False, False, False]
+
+
+def test_surface_scope_excludes_unvetted_classes_positively_gated():
+    """SEV-1 (review): the non_tunnel branch POSITIVELY gates on the steerable
+    exposed classes ({distal_surface, nearby_surface}) rather than only excluding
+    the active site — so a legacy/unknown CORE class (e.g. 'buried', 'first_shell')
+    with high total-SASA is NOT swept into the surface scope."""
+    classes = ["distal_surface", "nearby_surface", "buried", "first_shell", "weird"]
+    sasa = np.array([0.5, 0.5, 0.5, 0.5, 0.5])     # all exposed by the (total-SASA) gate
+    mask = ab.surface_scope(
+        L=5, position_classes=classes, sasa_fraction=sasa, fixed_idx=set(),
+        sasa_gate=0.2)
+    # Only the two vetted exposed classes; the core/unknown classes are excluded
+    # even though their SASA clears the gate.
+    assert list(mask) == [True, True, False, False, False]
+
+
+def test_surface_scope_steerable_classes_configurable():
+    """A caller can restrict the scope (e.g. distal_surface only) for a cautious run."""
+    classes = ["distal_surface", "nearby_surface"]
+    sasa = np.array([0.5, 0.5])
+    mask = ab.surface_scope(
+        L=2, position_classes=classes, sasa_fraction=sasa, fixed_idx=set(),
+        sasa_gate=0.2, steerable_classes=frozenset({"distal_surface"}))
+    assert list(mask) == [True, False]          # nearby_surface now excluded
+
+
+def test_surface_scope_throat_band_excluded():
+    mask = ab.surface_scope(
+        L=6, position_classes=_SCOPE_CLASSES, sasa_fraction=_SCOPE_SASA,
+        fixed_idx=set(), sasa_gate=0.2, throat_band_idx=frozenset({1}))
+    assert mask[1] == False          # i1 is in the throat band -> excluded
+
+
+def test_build_surface_delta_honors_provided_mask():
+    """A provided surface_mask overrides the legacy class gate: a nearby_surface
+    position masked-in gets the down-weight; a distal_surface position masked-out
+    does not."""
+    oc = ab.AxisOutcome(name="x", gate_open=True, reason="", n=200, mean=0.8,
+                        t_stat=9.0, fail_fraction=0.9, signed_error=0.5,
+                        e_norm=0.5, gain_correction=1.0, frozen_wrong_sign=False,
+                        u=0.4, scope="surface")
+    classes = ["distal_surface", "nearby_surface"]
+    mask = np.array([False, True])   # invert the legacy expectation
+    d = ab.build_surface_delta(
+        oc, L=2, position_classes=classes, sasa_fraction=np.ones(2),
+        fixed_idx=set(), cfg=AdaptiveBiasConfig(), surface_mask=mask)
+    assert np.all(d[0] == 0)                      # distal_surface masked OUT
+    assert d[1, AA_TO_IDX["L"]] < 0               # nearby_surface masked IN
+
+
+def test_build_surface_delta_mask_none_is_legacy_byte_identical():
+    """surface_mask=None preserves the exact legacy behavior."""
+    oc = ab.AxisOutcome(name="x", gate_open=True, reason="", n=200, mean=0.8,
+                        t_stat=9.0, fail_fraction=0.9, signed_error=0.5,
+                        e_norm=0.5, gain_correction=1.0, frozen_wrong_sign=False,
+                        u=0.4, scope="surface")
+    classes = ["distal_surface", "nearby_surface", "primary_sphere"]
+    kw = dict(L=3, position_classes=classes, sasa_fraction=np.ones(3),
+              fixed_idx=set(), cfg=AdaptiveBiasConfig())
+    legacy = ab.build_surface_delta(oc, **kw)                 # no surface_mask
+    explicit = ab.build_surface_delta(oc, surface_mask=None, **kw)
+    assert np.array_equal(legacy, explicit)
+    assert d_nonzero_rows(legacy) == [0]          # only distal_surface (legacy)
+
+
+def d_nonzero_rows(d):
+    return [i for i in range(d.shape[0]) if np.any(d[i])]
+
+
+def test_compute_adaptive_bias_threads_surface_mask():
+    rng = np.random.default_rng(31)
+    pool = make_pool(GRAVY_AXIS, n=200, mean=0.8, std=0.1, rng=rng)
+    classes = ["distal_surface", "nearby_surface"]
+    mask = np.array([False, True])
+    res = compute_adaptive_bias(
+        pool_df=pool, axes=[GRAVY_AXIS], cfg=AdaptiveBiasConfig(), state=None,
+        L=2, position_classes=classes, sasa_fraction=np.ones(2), fixed_idx=set(),
+        surface_mask=mask)
+    d = res.per_position_delta
+    assert np.all(d[0] == 0) and d[1, AA_TO_IDX["L"]] < 0
+
+
+# ---------------------------------------------------------------------------
+# WS-D: multi-pool plumbing (pool_key + pools) — enables future struct-stage axes
+# ---------------------------------------------------------------------------
+def test_control_axis_pool_key_defaults_to_seq():
+    assert CHARGE_AXIS.pool_key == "seq" and GRAVY_AXIS.pool_key == "seq"
+
+
+def test_pools_routes_each_axis_to_its_pool():
+    """An axis with pool_key='struct' MEASURES the struct pool, not the seq pool:
+    a healthy seq pool + a too-hydrophobic struct pool must fire the struct axis."""
+    import dataclasses
+    struct_axis = dataclasses.replace(GRAVY_AXIS, name="gravy_struct", pool_key="struct")
+    rng = np.random.default_rng(40)
+    seq_healthy = make_pool(GRAVY_AXIS, n=200, mean=GRAVY_AXIS.target, std=0.1, rng=rng)
+    struct_bad = make_pool(struct_axis, n=200, mean=0.8, std=0.1, rng=rng)
+    res = compute_adaptive_bias(
+        pools={"seq": seq_healthy, "struct": struct_bad}, axes=[struct_axis],
+        cfg=AdaptiveBiasConfig(), state=None, L=3,
+        position_classes=["distal_surface"] * 3, sasa_fraction=np.ones(3),
+        fixed_idx=set())
+    assert res.outcomes[0].gate_open                       # fired off the STRUCT pool
+    assert res.per_position_delta[0, AA_TO_IDX["L"]] < 0
+    assert res.outcomes[0].n == 200
+
+
+def test_pools_back_compat_single_pool_df():
+    """Passing pool_df= (no pools=) is identical to pools={'seq': pool_df}."""
+    rng = np.random.default_rng(41)
+    pool = make_pool(GRAVY_AXIS, n=200, mean=0.8, std=0.1, rng=rng)
+    kw = dict(axes=[GRAVY_AXIS], cfg=AdaptiveBiasConfig(), state=None, L=3,
+              position_classes=["distal_surface"] * 3, sasa_fraction=np.ones(3),
+              fixed_idx=set())
+    a = compute_adaptive_bias(pool_df=pool, **kw)
+    b = compute_adaptive_bias(pools={"seq": pool}, **kw)
+    assert np.array_equal(a.per_position_delta, b.per_position_delta)
+    assert a.outcomes[0].u == b.outcomes[0].u
+
+
+def test_pools_missing_key_holds_not_crashes():
+    """An axis whose pool_key isn't in pools holds (no measurement) — no crash."""
+    import dataclasses
+    struct_axis = dataclasses.replace(GRAVY_AXIS, name="g_struct", pool_key="struct")
+    rng = np.random.default_rng(42)
+    res = compute_adaptive_bias(
+        pools={"seq": make_pool(GRAVY_AXIS, n=200, mean=0.8, std=0.1, rng=rng)},
+        axes=[struct_axis], cfg=AdaptiveBiasConfig(), state=None, L=3,
+        position_classes=["distal_surface"] * 3, sasa_fraction=np.ones(3),
+        fixed_idx=set())
+    assert not res.outcomes[0].gate_open               # struct pool absent -> hold
+    assert "no pool" in res.outcomes[0].reason
 
 
 # ---------------------------------------------------------------------------

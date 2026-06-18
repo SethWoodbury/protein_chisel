@@ -644,6 +644,61 @@ def test_shell_ws_c_boolean_truthiness(env_var, cli_flag, value, expect_flag):
     assert (cli_flag in proc.stdout) is expect_flag
 
 
+def test_parse_charge_band_arg_requires_exactly_two_floats():
+    """--adaptive_charge_band must be exactly 'LO,HI' floats (codex: a 3-field value
+    was silently truncated)."""
+    assert idz._parse_charge_band_arg("-15,-5") == (-15.0, -5.0)
+    for bad in ("-15,-5,0", "-15", "", "a,b", "-15,"):
+        with pytest.raises(ValueError):
+            idz._parse_charge_band_arg(bad)
+
+
+def test_iterative_design_help_advertises_ws_d_flags():
+    """`--help` exits 0 and advertises every WS-D controller-expansion flag."""
+    proc = subprocess.run(
+        [sys.executable, "scripts/iterative_design.py", "--help"],
+        cwd=str(REPO), env={**os.environ, "PYTHONPATH": "src"},
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    for flag in ("--adaptive_surface_sasa_gate", "--adaptive_charge_band",
+                 "--adaptive_bias_axes"):
+        assert flag in proc.stdout, flag
+
+
+def test_shell_ws_d_value_passthrough():
+    """The WS-D env vars emit their CLI flags only when set AND ADAPTIVE_BIAS!=0;
+    unset emits nothing (byte-identical default)."""
+    snippet = (
+        'ADAPTIVE_BIAS_CLI=()\n'
+        'if [[ "${ADAPTIVE_BIAS:-0}" != "0" ]]; then\n'
+        '  [[ -n "${ADAPTIVE_SURFACE_SASA_GATE:-}" ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_surface_sasa_gate "$ADAPTIVE_SURFACE_SASA_GATE" )\n'
+        '  [[ -n "${ADAPTIVE_CHARGE_BAND:-}" ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_charge_band "$ADAPTIVE_CHARGE_BAND" )\n'
+        '  [[ -n "${ADAPTIVE_BIAS_AXES:-}" ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_axes "$ADAPTIVE_BIAS_AXES" )\n'
+        'fi\n'
+        'echo "${ADAPTIVE_BIAS_CLI[@]}"\n'
+    )
+    # Pin the snippet to the shipped shell file.
+    sh = (REPO / "scripts" / "run_chisel_design.sh").read_text()
+    assert '[[ -n "${ADAPTIVE_SURFACE_SASA_GATE:-}" ]]' in sh
+    assert '[[ -n "${ADAPTIVE_CHARGE_BAND:-}"       ]]' in sh
+    set_env = {**os.environ, "ADAPTIVE_BIAS": "1", "ADAPTIVE_SURFACE_SASA_GATE": "0.20",
+               "ADAPTIVE_CHARGE_BAND": "-15,-5", "ADAPTIVE_BIAS_AXES": "charge"}
+    got = subprocess.run(["bash", "-c", snippet], env=set_env,
+                         capture_output=True, text=True, timeout=30)
+    assert got.stdout.strip() == (
+        "--adaptive_surface_sasa_gate 0.20 --adaptive_charge_band -15,-5 "
+        "--adaptive_bias_axes charge")
+    # ADAPTIVE_BIAS unset => the whole block is skipped (no WS-D flags).
+    off_env = {k: v for k, v in os.environ.items()
+               if k not in ("ADAPTIVE_BIAS", "ADAPTIVE_SURFACE_SASA_GATE",
+                            "ADAPTIVE_CHARGE_BAND", "ADAPTIVE_BIAS_AXES")}
+    off_env["ADAPTIVE_SURFACE_SASA_GATE"] = "0.20"      # set but ADAPTIVE_BIAS off
+    off = subprocess.run(["bash", "-c", snippet], env=off_env,
+                        capture_output=True, text=True, timeout=30)
+    assert off.stdout.strip() == ""
+
+
 def test_shell_aa_fraction_cap_value_passthrough():
     """AA_FRACTION_CAP=<frac> emits `--aa_fraction_cap <frac>`; unset emits
     nothing (byte-identical default)."""

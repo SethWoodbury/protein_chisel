@@ -204,6 +204,27 @@ def _nonneg_finite_arg(value: str, *, max_value: Optional[float] = None) -> floa
     return v
 
 
+def _parse_charge_band_arg(s: str) -> tuple:
+    """Parse ``--adaptive_charge_band 'LO,HI'`` -> ``(lo, hi)`` floats.
+
+    Requires EXACTLY two finite values (a 3-field value was previously truncated
+    silently). ``default_axes`` additionally validates ``lo < hi`` at controller
+    setup, so a bad band fails fast at startup.
+    """
+    parts = str(s).split(",")
+    if len(parts) != 2:
+        raise ValueError(
+            f"--adaptive_charge_band must be 'LO,HI' (exactly two values), got {s!r}")
+    try:
+        lo, hi = float(parts[0]), float(parts[1])
+    except ValueError:
+        raise ValueError(
+            f"--adaptive_charge_band values must be numbers, got {s!r}")
+    if not (math.isfinite(lo) and math.isfinite(hi)):
+        raise ValueError(f"--adaptive_charge_band values must be finite, got {s!r}")
+    return (lo, hi)
+
+
 def _derive_catres_from_remark_666(seed_pdb: Path | str) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """Read REMARK 666 from ``seed_pdb`` and return:
 
@@ -5136,6 +5157,29 @@ def main() -> None:
                    default=False,
                    help="Warm-start cycle 0 from the INPUT scaffold's hydrophobicity/"
                         "charge instead of waiting for cycle 0's output.")
+    # ---- WS-D controller expansion (opt-in; defaults reproduce today's controller) ----
+    p.add_argument("--adaptive_surface_sasa_gate", type=_fraction_arg, default=None,
+                   metavar="FRAC",
+                   help="Opt-in (default None => legacy distal_surface scope, "
+                        "byte-identical). When set (e.g. 0.20), the controller's "
+                        "surface hydrophobic down-weight acts on the "
+                        "non_tunnel_surface set: every exposed (sidechain-SASA "
+                        "fraction >= FRAC) NON-active-site, non-tunnel-lining, "
+                        "non-fixed position — a superset of distal_surface (adds "
+                        "exposed nearby_surface, drops the ligand-distance gate) "
+                        "minus the tunnel mouth. Steers 'what you can see by eye'.")
+    p.add_argument("--adaptive_charge_band", type=str, default=None, metavar="LO,HI",
+                   help="Opt-in (default None => the cycle's net-charge filter band). "
+                        "Override the controller's net-charge target band, e.g. "
+                        "'-15,-5'. The target becomes the band midpoint and the "
+                        "fail-fraction is evaluated on raw net charge (the cycle-band "
+                        "gap columns no longer apply). Steers net charge to your band "
+                        "without changing the seq filter.")
+    p.add_argument("--adaptive_bias_axes", type=str, default=None, metavar="LIST",
+                   help="Opt-in comma list of controller axes to run (default "
+                        "'charge,surface_hydrophobicity'). Restrict (e.g. 'charge') "
+                        "or, as future registry entries land, extend. An unknown "
+                        "axis name is rejected.")
     p.add_argument("--protonate_final", action="store_true", default=True,
                    help="After stage_diverse_topk, hydrate every top-K PDB "
                         "via PyRosetta and write a downstream-clean "
@@ -6048,6 +6092,9 @@ def main() -> None:
     _ab_sasa = None
     _ab_fixed_idx: set = set()
     _ab_cfg = None
+    _ab_surface_mask = None        # WS-D non_tunnel_surface mask (None => legacy)
+    _ab_charge_band = None         # WS-D --adaptive_charge_band override (None => cycle)
+    _ab_axes_sel = None            # WS-D --adaptive_bias_axes selector (None => default)
     if args.adaptive_bias:
         from protein_chisel.sampling.adaptive_bias import (
             AdaptiveBiasConfig, compute_adaptive_bias, default_axes,
@@ -6067,6 +6114,46 @@ def main() -> None:
             _ab_sasa = None
         _ab_r2i = {int(r): i for i, r in enumerate(protein_resnos)}
         _ab_fixed_idx = {_ab_r2i[int(r)] for r in fixed_resnos if int(r) in _ab_r2i}
+        # ---- WS-D: opt-in charge band + axes selector (None => today's behavior) ----
+        if args.adaptive_charge_band:
+            try:
+                _ab_charge_band = _parse_charge_band_arg(args.adaptive_charge_band)
+            except ValueError as _exc:
+                raise SystemExit(str(_exc))
+        _ab_axes_sel = ([a.strip() for a in args.adaptive_bias_axes.split(",") if a.strip()]
+                        if args.adaptive_bias_axes else None)
+        # Fail-fast on a bad band/axis selector at STARTUP — the per-cycle controller
+        # is defensively wrapped, so without this an invalid band (lo>=hi) or unknown
+        # axis name would silently degrade the run to unbiased every cycle.
+        try:
+            default_axes(charge_band=_ab_charge_band, axes=_ab_axes_sel)
+        except ValueError as _exc:
+            raise SystemExit(f"adaptive-bias config error: {_exc}")
+        # ---- WS-D: non_tunnel_surface scope mask (structure-invariant; built once).
+        # None unless --adaptive_surface_sasa_gate is set, so build_surface_delta keeps
+        # the legacy distal_surface gate => byte-identical. Tunnel-lining comes from the
+        # seed annotation; the throat-band source is not yet wired (frozenset()).
+        if args.adaptive_surface_sasa_gate is not None:
+            from protein_chisel.sampling.adaptive_bias import surface_scope
+            _ab_tunnel_lining: set = set()
+            try:
+                _tl = pd.read_csv(seed_tunnel_path, sep="\t")
+                _tl_res = _tl.loc[_tl["is_tunnel_lining"].astype(bool), "resno"].astype(int)
+                _ab_tunnel_lining = {_ab_r2i[int(r)] for r in _tl_res if int(r) in _ab_r2i}
+            except Exception as _exc:              # pragma: no cover - defensive
+                LOGGER.warning("adaptive surface scope: no seed tunnel-lining set (%s); "
+                               "proceeding without the tunnel exclusion", _exc)
+            _ab_surface_mask = surface_scope(
+                L=base_bias.shape[0], position_classes=position_classes,
+                sasa_fraction=_ab_sasa, fixed_idx=_ab_fixed_idx,
+                sasa_gate=args.adaptive_surface_sasa_gate,
+                tunnel_lining_idx=frozenset(_ab_tunnel_lining),
+                throat_band_idx=frozenset(),
+            )
+            LOGGER.info("adaptive surface scope: non_tunnel_surface (sasa_gate=%.2f) => "
+                        "%d steerable positions (%d tunnel-lining, %d fixed excluded)",
+                        args.adaptive_surface_sasa_gate, int(_ab_surface_mask.sum()),
+                        len(_ab_tunnel_lining), len(_ab_fixed_idx))
         LOGGER.info("adaptive-bias controller ENABLED (gain=%.2f max=%.2f carry=%.2f "
                     "tmin=%.1f fmin=%.2f min_n=%d mode=%s)",
                     _ab_cfg.gain, _ab_cfg.max_nats, _ab_cfg.carry, _ab_cfg.t_min,
@@ -6078,12 +6165,13 @@ def main() -> None:
                 gravy_band=(args.gravy_min, args.gravy_max),
                 net_charge_band=(cycles[0].net_charge_min, cycles[0].net_charge_max),
                 deadband_frac=args.adaptive_bias_deadband,
+                charge_band=_ab_charge_band, axes=_ab_axes_sel,
             )
             adaptive_global, adaptive_delta, adaptive_state, _ab_seed_tele = seed_warmstart(
                 seed_metrics={"gravy": _seed_gravy, "net_charge_full_HH": _seed_charge},
                 axes=_ab_seed_axes, cfg=_ab_cfg, L=base_bias.shape[0],
                 position_classes=position_classes, sasa_fraction=_ab_sasa,
-                fixed_idx=_ab_fixed_idx,
+                fixed_idx=_ab_fixed_idx, surface_mask=_ab_surface_mask,
             )
             adaptive_global = adaptive_global or None
             adaptive_delta = adaptive_delta if np.any(adaptive_delta) else None
@@ -6178,6 +6266,7 @@ def main() -> None:
                         cyc.gravy_max if args.strategy == "annealing" else args.gravy_max),
                     net_charge_band=(cyc.net_charge_min, cyc.net_charge_max),
                     deadband_frac=args.adaptive_bias_deadband,
+                    charge_band=_ab_charge_band, axes=_ab_axes_sel,
                 )
                 from protein_chisel.sampling.adaptive_bias import hydrophobic_over_rep_mask
                 _ab_overrep = (hydrophobic_over_rep_mask(
@@ -6187,7 +6276,7 @@ def main() -> None:
                     pool_df=seq_stage_df, axes=ab_axes, cfg=_ab_cfg, state=adaptive_state,
                     L=base_bias.shape[0], position_classes=position_classes,
                     sasa_fraction=_ab_sasa, fixed_idx=_ab_fixed_idx,
-                    over_rep_mask=_ab_overrep,
+                    over_rep_mask=_ab_overrep, surface_mask=_ab_surface_mask,
                 )
                 adaptive_state = ab_res.new_state
                 adaptive_global = ab_res.controller_global or None

@@ -89,19 +89,18 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+# Kyte-Doolittle hydrophobicity lives in exactly ONE place — scoring.sap, the
+# module that also backs the driver's SAP proxy. Importing it here (rather than
+# re-declaring the dict) removes the duplication the 2026-06 audit flagged and
+# gives the controller + SAP one hydrophobicity model to evolve. Re-exported via
+# __all__ for back-compat with importers of adaptive_bias.KD_HYDROPHOBICITY.
+from protein_chisel.scoring.sap import KD_HYDROPHOBICITY
+
 # ---------------------------------------------------------------------------
-# Constants (kept in sync with sampling.plm_fusion.AA_ORDER and the driver's
-# KD_HYDROPHOBICITY; identical values so importing either is byte-equivalent).
+# Constants. AA_ORDER matches sampling.plm_fusion.AA_ORDER.
 # ---------------------------------------------------------------------------
 AA_ORDER = "ACDEFGHIKLMNPQRSTVWY"
 AA_TO_IDX = {a: i for i, a in enumerate(AA_ORDER)}
-
-# Kyte-Doolittle hydrophobicity (same dict as scripts/iterative_design.py).
-KD_HYDROPHOBICITY = {
-    "I": 4.5, "V": 4.2, "L": 3.8, "F": 2.8, "C": 2.5, "M": 1.9, "A": 1.8,
-    "G": -0.4, "T": -0.7, "S": -0.8, "W": -0.9, "Y": -1.3, "P": -1.6,
-    "H": -3.2, "E": -3.5, "Q": -3.5, "D": -3.5, "N": -3.5, "K": -3.9, "R": -4.5,
-}
 
 HYDROPHOBIC_AAS = frozenset("AVLIMFWC")   # matches expression.builtin_rules
 ACIDIC_AAS = frozenset("DE")
@@ -114,7 +113,73 @@ BASIC_AAS = frozenset("KR")
 # lacks this class simply yields no surface term (safe degradation).
 SURFACE_CLASSES = frozenset({"distal_surface"})
 
+# Position classes the non_tunnel_surface scope is allowed to steer. POSITIVE
+# gating (admit only these) is deliberately safer than negatively excluding the
+# active site: a negative gate would sweep in any *other* class — legacy core
+# classes ("buried"/"first_shell") or an unknown class on a new scaffold — if its
+# SASA happened to clear the gate, down-weighting a load-bearing core hydrophobic.
+# Both are exposed by construction (distal_surface = exposed distal; nearby_surface
+# = the binding-region surface the user wants back). Configurable per call.
+STEERABLE_SURFACE_CLASSES = SURFACE_CLASSES | frozenset({"nearby_surface"})
+
 CLASS_BALANCE_MAX_NATS = 2.5   # the clamp compute_class_balanced_bias_AA uses
+
+
+def surface_scope(*, L: int, position_classes: list,
+                  sasa_fraction: Optional[np.ndarray], fixed_idx: set,
+                  sasa_gate: Optional[float] = None,
+                  tunnel_lining_idx: frozenset = frozenset(),
+                  throat_band_idx: frozenset = frozenset(),
+                  surface_classes: frozenset = SURFACE_CLASSES,
+                  steerable_classes: frozenset = STEERABLE_SURFACE_CLASSES) -> np.ndarray:
+    """``(L,)`` boolean membership mask for the surface actuator's positions.
+
+    The surface down-weight is applied only where this mask is True. Two modes:
+
+    * ``sasa_gate is None`` → **LEGACY**: position ``i`` is in scope iff its class
+      is in ``surface_classes`` (default ``distal_surface``), it is not fixed, and
+      it is solvent-exposed (``sasa_fraction`` missing/None ⇒ treated exposed, else
+      finite and ``> 0``). This reproduces *exactly* the gate historically inlined
+      in :func:`build_surface_delta`, so a no-gate run is byte-identical.
+
+    * ``sasa_gate`` set → **non_tunnel_surface** (the user's "what I can steer by
+      eye" scope): ``i`` is in scope iff ``sasa_fraction[i] >= sasa_gate`` AND its
+      class is in ``steerable_classes`` (POSITIVE gating — only vetted exposed
+      classes, so a core/unknown class can never leak in via a high SASA) AND ``i``
+      is not in ``tunnel_lining_idx`` / ``throat_band_idx`` AND ``i`` is not fixed.
+      This is a *superset* of ``distal_surface`` (drops the ligand-distance gate,
+      adds back exposed ``nearby_surface``) *minus* the tunnel mouth / throat /
+      active site. NOTE the gate uses the (total-residue-SASA) ``sasa_fraction``
+      proxy, which can overstate sidechain exposure for an exposed-backbone /
+      buried-sidechain ``nearby_surface`` residue — restrict ``steerable_classes``
+      to ``{"distal_surface"}`` for a more conservative run.
+
+    Structure-invariant (depends only on classes/SASA/fixed/tunnel sets), so the
+    driver computes it once and threads it through every cycle.
+    """
+    mask = np.zeros(int(L), dtype=bool)
+    legacy = sasa_gate is None
+    for i in range(int(L)):
+        if i in fixed_idx:
+            continue
+        cls = position_classes[i] if i < len(position_classes) else None
+        s = (float(sasa_fraction[i])
+             if (sasa_fraction is not None and i < len(sasa_fraction)) else None)
+        if legacy:
+            if cls not in surface_classes:
+                continue
+            if s is not None and (not math.isfinite(s) or s <= 0.0):
+                continue
+            mask[i] = True
+        else:
+            if cls not in steerable_classes:        # POSITIVE gate (vetted exposed)
+                continue
+            if i in tunnel_lining_idx or i in throat_band_idx:
+                continue
+            if s is None or not math.isfinite(s) or s < sasa_gate:
+                continue
+            mask[i] = True
+    return mask
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +260,11 @@ class ControlAxis:
     # class-balance bias_AA (which can suppress it), so its requested u may not be
     # what was applied -> disable the secant there and use the fixed gain.
     estimate_gain: bool = True
+    # Which candidate pool this axis MEASURES. "seq" (default) = the per-cycle
+    # seq-stage pool the controller reads today; a future axis on a different stage
+    # (e.g. a struct-stage SAP axis, whose sap_corr_* only exists post-fold) sets
+    # its own key and the driver passes that frame in the ``pools`` mapping.
+    pool_key: str = "seq"
 
 
 @dataclass
@@ -534,7 +604,8 @@ def global_per_aa_bias(outcomes: list, axes_by_name: dict,
 def build_surface_delta(outcome: AxisOutcome, *, L: int, position_classes: list,
                         sasa_fraction: Optional[np.ndarray], fixed_idx: set,
                         cfg: AdaptiveBiasConfig,
-                        over_rep_mask: Optional[np.ndarray] = None) -> np.ndarray:
+                        over_rep_mask: Optional[np.ndarray] = None,
+                        surface_mask: Optional[np.ndarray] = None) -> np.ndarray:
     """(L, 20) bias delta: down-weight hydrophobic AAs at exposed surface positions.
 
     delta[i, a] = -u * expo_i * w_hydro[a]   for surface, non-fixed positions i and
@@ -561,11 +632,19 @@ def build_surface_delta(outcome: AxisOutcome, *, L: int, position_classes: list,
     if over_rep_mask is not None and outcome.u > 0:
         w_hydro = w_hydro * over_rep_mask.astype(float)
     for i in range(L):
-        if i in fixed_idx:
-            continue
-        cls = position_classes[i] if i < len(position_classes) else None
-        if cls not in SURFACE_CLASSES:          # distal_surface only (excludes the
-            continue                            # active-site/binding region entirely)
+        if surface_mask is not None:
+            # Opt-in non_tunnel_surface (or any precomputed) membership mask.
+            if not surface_mask[i]:
+                continue
+        else:
+            # LEGACY membership (unchanged → byte-identical): distal_surface,
+            # non-fixed (the active-site/binding region is excluded by class).
+            if i in fixed_idx:
+                continue
+            cls = position_classes[i] if i < len(position_classes) else None
+            if cls not in SURFACE_CLASSES:
+                continue
+        # Per-position magnitude scales with SASA fraction (shared by both modes).
         expo = 1.0
         if sasa_fraction is not None and i < len(sasa_fraction):
             expo = float(sasa_fraction[i])
@@ -584,30 +663,56 @@ def default_axes(*, gravy_target: float = -0.2, gravy_band: tuple = (-0.8, 0.3),
                  net_charge_target: float = -10.0,
                  net_charge_band: tuple = (-18.0, -4.0),
                  deadband_frac: float = 0.25,
-                 basic_downweight_scale: float = 0.35) -> list:
-    """Build the default two-axis registry (global charge + surface hydrophobicity).
+                 basic_downweight_scale: float = 0.35,
+                 charge_band: Optional[tuple] = None,
+                 axes: Optional[list] = None) -> list:
+    """Build the controller axis registry (global charge + surface hydrophobicity).
 
     Targets default to ``scoring.multi_objective.DEFAULT_METRIC_SPECS``; bands come
     from the cycle's filter configuration. The deadband (``deadband_frac`` of the
     band half-width) keeps the controller from chasing tiny deviations while still
     aiming close to target; ``error_scale`` normalizes the drive so one ``gain``
     fits both axes.
+
+    ``charge_band`` (opt-in ``--adaptive_charge_band``, e.g. ``(-15, -5)``):
+    overrides the charge band, sets the charge target to the band MIDPOINT, and —
+    critically — NULLS the charge axis's precomputed gap columns. Those gaps were
+    computed against the *cycle filter* band, so a custom adaptive band must fall
+    back to raw-value band evaluation or the fail-fraction would be wrong (codex).
+    Validated finite with ``lo < hi``.
+
+    ``axes`` (opt-in ``--adaptive_bias_axes``): the ordered subset of axis names to
+    return; default ``["charge", "surface_hydrophobicity"]`` (today's behavior). An
+    unknown name is a configuration error (fail-fast). This is the extension point
+    for future registry entries (a struct-stage SAP axis, etc.).
     """
+    charge_fail_high: Optional[str] = "selection__seq_filter_gap_charge_high"
+    charge_fail_low: Optional[str] = "selection__seq_filter_gap_charge_low"
+    if charge_band is not None:
+        lo, hi = float(charge_band[0]), float(charge_band[1])
+        if not (math.isfinite(lo) and math.isfinite(hi) and lo < hi):
+            raise ValueError(
+                f"charge_band must be finite (lo, hi) with lo < hi, got {charge_band!r}")
+        net_charge_band = (lo, hi)
+        net_charge_target = (lo + hi) / 2.0
+        charge_fail_high = None     # cycle-band gaps are wrong for a custom band
+        charge_fail_low = None      # -> force raw-value band evaluation
+
     g_lo, g_hi = gravy_band
     g_half = max(g_hi - gravy_target, gravy_target - g_lo)
     c_lo, c_hi = net_charge_band
     c_half = max(c_hi - net_charge_target, net_charge_target - c_lo)
-    return [
-        ControlAxis(
+    registry = {
+        "charge": ControlAxis(
             name="charge", metric_column="net_charge_full_HH",
             target=net_charge_target, band_lo=c_lo, band_hi=c_hi,
             deadband=deadband_frac * c_half, error_scale=c_half, scope="global",
             aa_weights=charge_weights(basic_downweight_scale),
-            fail_high_column="selection__seq_filter_gap_charge_high",
-            fail_low_column="selection__seq_filter_gap_charge_low",
+            fail_high_column=charge_fail_high,
+            fail_low_column=charge_fail_low,
             estimate_gain=False,   # merged with class-balance -> secant unreliable
         ),
-        ControlAxis(
+        "surface_hydrophobicity": ControlAxis(
             name="surface_hydrophobicity", metric_column="gravy",
             target=gravy_target, band_lo=g_lo, band_hi=g_hi,
             deadband=deadband_frac * g_half, error_scale=g_half, scope="surface",
@@ -618,7 +723,20 @@ def default_axes(*, gravy_target: float = -0.2, gravy_band: tuple = (-0.8, 0.3),
             fail_high_column="selection__seq_filter_gap_gravy",
             fail_low_column=None,
         ),
-    ]
+    }
+    selected = axes if axes is not None else ["charge", "surface_hydrophobicity"]
+    if not selected:
+        raise ValueError("adaptive-bias axes selection is empty")
+    if len(selected) != len(set(selected)):
+        raise ValueError(
+            f"duplicate adaptive-bias axes would double-stack an actuator: {selected}")
+    out = []
+    for name in selected:
+        if name not in registry:
+            raise ValueError(
+                f"unknown adaptive-bias axis {name!r}; choose from {sorted(registry)}")
+        out.append(registry[name])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -635,30 +753,41 @@ class AdaptiveBiasResult:
     conflicts: list
 
 
-def compute_adaptive_bias(*, pool_df: Optional[pd.DataFrame], axes: list,
+def compute_adaptive_bias(*, pool_df: Optional[pd.DataFrame] = None,
+                          pools: Optional[dict] = None, axes: list,
                           cfg: AdaptiveBiasConfig, state: Optional[dict],
                           L: int, position_classes: list,
                           sasa_fraction: Optional[np.ndarray], fixed_idx: set,
                           class_balance_bias_AA: str = "",
-                          over_rep_mask: Optional[np.ndarray] = None
+                          over_rep_mask: Optional[np.ndarray] = None,
+                          surface_mask: Optional[np.ndarray] = None
                           ) -> AdaptiveBiasResult:
     """Run all axes for one cycle and produce the global + per-position biases.
 
-    Returns an :class:`AdaptiveBiasResult`. When ``pool_df`` is empty/None or no
-    axis gate opens, the per-position delta is all-zero and the merged bias_AA is
-    just the class-balance string unchanged (so the caller's behavior is unchanged
-    when there's nothing to do).
+    Each axis measures the pool named by its ``pool_key`` in the ``pools`` mapping.
+    Back-compat: a lone ``pool_df`` is treated as ``pools={"seq": pool_df}`` (every
+    default axis is ``pool_key="seq"``), so existing single-pool callers are
+    unchanged. Returns an :class:`AdaptiveBiasResult`. When an axis's pool is
+    empty/None or no gate opens, the per-position delta is all-zero and the merged
+    bias_AA is just the class-balance string unchanged (no-op when nothing to do).
     """
     state = state or {}
     delta = np.zeros((L, 20), dtype=np.float32)
     outcomes: list = []
     new_state: dict = {}
 
-    primary = _controller_pool(pool_df) if pool_df is not None else None
-    have_pool = primary is not None and len(primary) > 0
+    if pools is None:
+        pools = {"seq": pool_df}
+    # Reduce each named pool to its controller distribution once (a key may back
+    # several axes); a None/empty frame becomes None (those axes hold).
+    controller_pools = {
+        k: (_controller_pool(v) if v is not None else None) for k, v in pools.items()
+    }
 
     for axis in axes:
         st = AxisState.from_dict(state.get(axis.name))
+        primary = controller_pools.get(axis.pool_key)
+        have_pool = primary is not None and len(primary) > 0
         if not have_pool or axis.metric_column not in primary.columns:
             # No measurement this cycle: HOLD the previously-applied bias (keep
             # last_u and emit it) rather than dropping it. History is preserved.
@@ -673,7 +802,7 @@ def compute_adaptive_bias(*, pool_df: Optional[pd.DataFrame], axes: list,
                 delta = delta + build_surface_delta(
                     held, L=L, position_classes=position_classes,
                     sasa_fraction=sasa_fraction, fixed_idx=fixed_idx, cfg=cfg,
-                    over_rep_mask=over_rep_mask)
+                    over_rep_mask=over_rep_mask, surface_mask=surface_mask)
             continue
         oc, st_new = step_axis(primary, axis, st, cfg)
         outcomes.append(oc)
@@ -682,7 +811,7 @@ def compute_adaptive_bias(*, pool_df: Optional[pd.DataFrame], axes: list,
             delta = delta + build_surface_delta(
                 oc, L=L, position_classes=position_classes,
                 sasa_fraction=sasa_fraction, fixed_idx=fixed_idx, cfg=cfg,
-                over_rep_mask=over_rep_mask)
+                over_rep_mask=over_rep_mask, surface_mask=surface_mask)
 
     axes_by_name = {a.name: a for a in axes}
     controller_global = global_per_aa_bias(outcomes, axes_by_name, cfg)
@@ -733,7 +862,8 @@ def hydrophobic_over_rep_mask(pool_sequences, *,
 def seed_warmstart(*, seed_metrics: dict, axes: list, cfg: AdaptiveBiasConfig,
                    L: int, position_classes: list,
                    sasa_fraction: Optional[np.ndarray], fixed_idx: set,
-                   strength: float = 0.5
+                   strength: float = 0.5,
+                   surface_mask: Optional[np.ndarray] = None
                    ) -> tuple[dict, np.ndarray, dict]:
     """Warm-start the controller from the INPUT scaffold's scalar properties.
 
@@ -773,7 +903,8 @@ def seed_warmstart(*, seed_metrics: dict, axes: list, cfg: AdaptiveBiasConfig,
         if axis.scope == "surface":
             delta = delta + build_surface_delta(
                 oc, L=L, position_classes=position_classes,
-                sasa_fraction=sasa_fraction, fixed_idx=fixed_idx, cfg=cfg)
+                sasa_fraction=sasa_fraction, fixed_idx=fixed_idx, cfg=cfg,
+                surface_mask=surface_mask)
     axes_by_name = {a.name: a for a in axes}
     global_bias = global_per_aa_bias(outcomes, axes_by_name, cfg)
     return global_bias, delta, state, {"seed_warmstart": tele}
@@ -781,7 +912,8 @@ def seed_warmstart(*, seed_metrics: dict, axes: list, cfg: AdaptiveBiasConfig,
 
 __all__ = [
     "AA_ORDER", "KD_HYDROPHOBICITY", "HYDROPHOBIC_AAS", "ACIDIC_AAS", "BASIC_AAS",
-    "SURFACE_CLASSES", "ControlAxis", "AdaptiveBiasConfig", "AxisState",
+    "SURFACE_CLASSES", "STEERABLE_SURFACE_CLASSES", "surface_scope",
+    "ControlAxis", "AdaptiveBiasConfig", "AxisState",
     "AxisOutcome", "AdaptiveBiasResult", "kd_centered_weights",
     "hydrophobic_surface_weights", "charge_weights", "wald_lower_bound",
     "axis_pool_stats", "estimate_gain_correction", "signed_deadband_error",
