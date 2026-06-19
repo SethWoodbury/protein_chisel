@@ -5,6 +5,17 @@ All notable changes to **protein_chisel** are documented here. Format loosely fo
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-06-18 — Solubility-steering overhaul (8 opt-in workstreams, byte-identical default)
+
+The whole **solubility-steering campaign** (WS-A..H): make `protein_chisel` actually steer designs
+toward solubility — fix the rescue bug that shipped a GRAVY=1.05 / 26%-Ala design as rank-0, add a
+corrected SAP, real composition control, an expanded adaptive controller, sampling-core safety rails,
+a PLM-refresh toolkit, and a tunnel-lining omit — **every behavior behind a flag/env that defaults to
+the prior behavior, so with no new flags the pipeline is byte-for-byte identical**. Each workstream
+was built TDD-first and put through independent review (codex + ≥1 subagent), which deferred several
+planned-but-redundant/unsound levers (the WS-D composition & SAP axes, the WS-E anti-repeat &
+plm_off_mode, the WS-F driver activation) with documented reasons. Host suite: 809 passed.
+
 ### Added — WS-G omit tunnel-lining (opt-in/experimental, default OFF, byte-identical)
 - **`--omit_tunnel_lining` (+ `--omit_tunnel_lining_aas`, default `FWY`) / `OMIT_TUNNEL_LINING` /
   `OMIT_TUNNEL_LINING_AAS`** — hard-omit bulky/aromatic AAs at the seed's tunnel-lining positions to
