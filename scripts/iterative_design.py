@@ -873,6 +873,50 @@ def merge_omit_dicts(*dicts: dict[str, str]) -> dict[str, str]:
     return out
 
 
+def _read_seed_tunnel_lining(tsv_path) -> set:
+    """Resnos with ``is_tunnel_lining==True`` from ``seed_tunnel_residues.tsv``.
+
+    SINGLE source of truth for "tunnel lining" — the seed fpocket annotation
+    (``annotate_seed_tunnel_residues``), shared by WS-G's omit and WS-D's surface-
+    scope exclusion so the two can never drift. Returns an empty set on ANY failure
+    (missing file, empty/failed annotation, schema change) so callers degrade to a
+    no-op rather than crash.
+    """
+    try:
+        df = pd.read_csv(tsv_path, sep="\t")
+        return {int(r) for r in df.loc[df["is_tunnel_lining"].astype(bool), "resno"]}
+    except Exception:
+        return set()
+
+
+def _build_tunnel_lining_omit(lining_resnos, chain: str, omit_aas: str, *,
+                              fixed_resnos=()) -> dict[str, str]:
+    """WS-G ``--omit_tunnel_lining``: forbid bulky/hydrophobic AAs at tunnel-lining
+    positions to keep the substrate channel open.
+
+    Returns ``{"<chain><resno>": AAs}`` for each NON-fixed lining resno (fixed /
+    catalytic residues keep their pinned identity). ``{}`` when the lining set or the
+    canonical AA set is empty → byte-identical no-op. Pure; mirrors
+    :func:`_build_fraction_cap_omit`. The default set (``WFYHMLIV``) is the aromatics
+    + His + the large aliphatics that constrict a tunnel; **Alanine is intentionally
+    excluded** — it is small and cannot constrict (controlling Ala over-representation
+    is WS-C's job, not WS-G's).
+    """
+    aas = "".join(sorted({a for a in str(omit_aas).upper() if a in _CANONICAL_AAS}))
+    if not aas:
+        return {}
+    # Never omit so many AAs that a lining position is left with fewer than
+    # _MIN_SAMPLEABLE_AAS_AFTER_CAP choices (fused MPNN would otherwise sample
+    # uniformly from the "forbidden" set) — fail fast on an absurd user set (codex).
+    if len(_CANONICAL_AAS) - len(aas) < _MIN_SAMPLEABLE_AAS_AFTER_CAP:
+        raise ValueError(
+            f"--omit_tunnel_lining_aas {omit_aas!r} omits {len(aas)} canonical AAs, "
+            f"leaving fewer than {_MIN_SAMPLEABLE_AAS_AFTER_CAP} sampleable at lining "
+            f"positions; use a smaller set (default FWY).")
+    fixed = {int(r) for r in fixed_resnos}
+    return {f"{chain}{int(r)}": aas for r in lining_resnos if int(r) not in fixed}
+
+
 # The 20 canonical amino acids (set; order-independent membership tests).
 _CANONICAL_AAS = frozenset("ACDEFGHIKLMNPQRSTVWY")
 
@@ -3703,29 +3747,17 @@ def _within_solubility_band(
 ) -> pd.Series:
     """Boolean mask: each row is inside the GRAVY + net-charge solubility band.
 
-    Mirrors ``stage_seq_filter`` exactly (see lines ~1143-1164): charge uses the
-    full-HH column with EXCLUSIVE bounds (``net_charge_min < c < net_charge_max``);
-    GRAVY uses INCLUSIVE bounds (``gravy_min <= g <= gravy_max``). Missing /
-    non-numeric values fail closed (``False``) so a design can never ship on absent
-    data. This is the pure predicate behind the opt-in ``--ship_solubility_veto``,
-    which stops the deferred-rescue / final-selection paths from ever shipping a
-    design outside the band (the bug where a GRAVY=1.05 seq-filter reject became
-    rank-0). Off by default → callers skip it → byte-identical.
+    Thin wrapper over the single source of truth ``scoring.solubility``
+    (also used by WS-F's PLM-refresh representative selection) — kept here under its
+    historical name so the WS-A veto call sites are unchanged and byte-identical.
+    Charge EXCLUSIVE, GRAVY INCLUSIVE, missing data fails closed.
     """
-    n = len(df)
-
-    def _num(name: str) -> pd.Series:
-        if name in df.columns:
-            return pd.to_numeric(df[name], errors="coerce")
-        return pd.Series([np.nan] * n, index=df.index)
-
-    g = _num("gravy")
-    c = _num("net_charge_full_HH")
-    ok = (
-        (g >= gravy_min) & (g <= gravy_max)
-        & (c > net_charge_min) & (c < net_charge_max)
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from protein_chisel.scoring.solubility import within_solubility_band
+    return within_solubility_band(
+        df, gravy_min=gravy_min, gravy_max=gravy_max,
+        net_charge_min=net_charge_min, net_charge_max=net_charge_max,
     )
-    return ok.fillna(False).astype(bool)
 
 
 def _apply_solubility_veto(
@@ -5285,6 +5317,21 @@ def main() -> None:
                         "'distal_surface=0.3,primary_sphere=0.0'. The global "
                         "--plm_strength still multiplies on top. Unknown class names "
                         "and non-finite/negative values are rejected.")
+    # ---- WS-G omit tunnel-lining (opt-in/experimental; default OFF => byte-identical) ----
+    p.add_argument("--omit_tunnel_lining", action="store_true", default=False,
+                   help="Opt-in/experimental (default OFF => byte-identical). Hard-omit "
+                        "bulky/aromatic AAs (--omit_tunnel_lining_aas, default FWY) at "
+                        "the seed's tunnel-lining positions (is_tunnel_lining) to keep "
+                        "the substrate channel open from cycle 0. Complementary to the "
+                        "(soft, reactive) throat-feedback bias; a permanent hard ban is "
+                        "blunter, so this is off by default. Catalytic/fixed positions "
+                        "are never omitted.")
+    p.add_argument("--omit_tunnel_lining_aas", type=str, default="FWY", metavar="AAS",
+                   help="AAs to hard-omit at tunnel-lining positions when "
+                        "--omit_tunnel_lining is set. Default FWY (aromatics — the "
+                        "unambiguous channel constrictors; I/L/M/V are left to the "
+                        "throat-feedback controller's capped/decaying pressure). "
+                        "Alanine is excluded by design (it can't constrict).")
     p.add_argument("--protonate_final", action="store_true", default=True,
                    help="After stage_diverse_topk, hydrate every top-K PDB "
                         "via PyRosetta and write a downstream-clean "
@@ -6101,6 +6148,33 @@ def main() -> None:
     )
     base_bias = base_bias + clash_bias   # added to the cycle-0 fusion bias
     omit_AA_per_residue = expression_omit
+    # ---- WS-G: opt-in tunnel-lining hard-omit (merged ONLY when on) -----------
+    # Merge only inside the `if` so a no-flag run leaves expression_omit byte-for-byte
+    # untouched (merge_omit_dicts re-sorts AA strings, so even a `{}` merge is not a
+    # guaranteed no-op — codex). The lining set is the seed is_tunnel_lining
+    # annotation (the SAME source WS-D's surface scope uses).
+    if args.omit_tunnel_lining:
+        _lining = _read_seed_tunnel_lining(seed_tunnel_path)
+        try:
+            _tunnel_omit = _build_tunnel_lining_omit(
+                sorted(_lining), CHAIN, args.omit_tunnel_lining_aas,
+                fixed_resnos=DEFAULT_CATRES,
+            )
+        except ValueError as _exc:
+            raise SystemExit(str(_exc))
+        if _tunnel_omit:
+            omit_AA_per_residue = merge_omit_dicts(expression_omit, _tunnel_omit)
+            LOGGER.info("WS-G omit_tunnel_lining: hard-omit %r at %d non-catalytic "
+                        "lining positions; merged omit now %d positions",
+                        args.omit_tunnel_lining_aas, len(_tunnel_omit),
+                        len(omit_AA_per_residue))
+            if args.throat_feedback:
+                LOGGER.warning("WS-G omit_tunnel_lining + throat_feedback both ON: at "
+                               "lining∩throat positions the hard omit shadows the soft "
+                               "throat bias for those AAs (harmless; the omit wins).")
+        else:
+            LOGGER.warning("WS-G omit_tunnel_lining set but no tunnel-lining positions "
+                           "found (empty/failed seed annotation) — no-op this run.")
     LOGGER.info("structural omit_AA (from rule engine only): %s", omit_AA_per_residue)
 
     # ---- Cycle schedule ---------------------------------------------
@@ -6292,14 +6366,12 @@ def main() -> None:
         # seed annotation; the throat-band source is not yet wired (frozenset()).
         if args.adaptive_surface_sasa_gate is not None:
             from protein_chisel.sampling.adaptive_bias import surface_scope
-            _ab_tunnel_lining: set = set()
-            try:
-                _tl = pd.read_csv(seed_tunnel_path, sep="\t")
-                _tl_res = _tl.loc[_tl["is_tunnel_lining"].astype(bool), "resno"].astype(int)
-                _ab_tunnel_lining = {_ab_r2i[int(r)] for r in _tl_res if int(r) in _ab_r2i}
-            except Exception as _exc:              # pragma: no cover - defensive
-                LOGGER.warning("adaptive surface scope: no seed tunnel-lining set (%s); "
-                               "proceeding without the tunnel exclusion", _exc)
+            # Shared single source of truth (also WS-G's omit source): resno set
+            # from the seed is_tunnel_lining annotation, mapped to 0-based indices.
+            _ab_tunnel_lining = {
+                _ab_r2i[r] for r in _read_seed_tunnel_lining(seed_tunnel_path)
+                if r in _ab_r2i
+            }
             _ab_surface_mask = surface_scope(
                 L=base_bias.shape[0], position_classes=position_classes,
                 sasa_fraction=_ab_sasa, fixed_idx=_ab_fixed_idx,

@@ -646,6 +646,83 @@ def test_shell_ws_c_boolean_truthiness(env_var, cli_flag, value, expect_flag):
 
 
 # ----------------------------------------------------------------------------
+# 8. WS-G omit-tunnel-lining helpers.
+# ----------------------------------------------------------------------------
+
+
+def test_build_tunnel_lining_omit_forbids_bulky_at_nonfixed_lining():
+    """--omit_tunnel_lining hard-omits bulky/hydrophobic AAs at tunnel-lining
+    positions (default WFYHMLIV), skipping fixed/catalytic resnos; Ala is NOT in
+    the default set (it's small — it can't constrict the channel)."""
+    omit = idz._build_tunnel_lining_omit([50, 51, 52], "A", "WFYHMLIV",
+                                         fixed_resnos=[52])
+    assert set(omit.keys()) == {"A50", "A51"}            # 52 fixed -> excluded
+    assert all(v == "".join(sorted(set("WFYHMLIV"))) for v in omit.values())
+    assert "A" not in omit["A50"]
+
+
+def test_build_tunnel_lining_omit_empty_is_noop():
+    assert idz._build_tunnel_lining_omit([], "A", "WFYHMLIV") == {}
+    assert idz._build_tunnel_lining_omit([50], "A", "") == {}        # empty aas
+    assert idz._build_tunnel_lining_omit([50], "A", "XZ-") == {}     # non-canonical
+
+
+def test_build_tunnel_lining_omit_rejects_degenerate_set():
+    """codex: a too-large omit set would forbid nearly every AA at a lining
+    position -> fused-MPNN samples uniformly from the 'forbidden' set. Reject it."""
+    with pytest.raises(ValueError):
+        idz._build_tunnel_lining_omit([50], "A", "ACDEFGHIKLMNPQRSTVWY")   # all 20
+    # A reasonable bulky set is fine.
+    assert idz._build_tunnel_lining_omit([50], "A", "FWY")
+
+
+def test_read_seed_tunnel_lining_from_tsv(tmp_path):
+    p = tmp_path / "seed_tunnel_residues.tsv"
+    pd.DataFrame({"resno": [10, 11, 12],
+                  "is_tunnel_lining": [True, False, True],
+                  "min_dist_to_alpha_sphere": [1.0, 9.0, 2.0]}).to_csv(
+        p, sep="\t", index=False)
+    assert idz._read_seed_tunnel_lining(p) == {10, 12}
+
+
+def test_read_seed_tunnel_lining_missing_or_empty_is_empty_set(tmp_path):
+    assert idz._read_seed_tunnel_lining(tmp_path / "nope.tsv") == set()
+    empty = tmp_path / "empty.tsv"
+    pd.DataFrame({"resno": [], "is_tunnel_lining": []}).to_csv(
+        empty, sep="\t", index=False)
+    assert idz._read_seed_tunnel_lining(empty) == set()
+
+
+def test_iterative_design_help_advertises_ws_g_flag():
+    proc = subprocess.run(
+        [sys.executable, "scripts/iterative_design.py", "--help"],
+        cwd=str(REPO), env={**os.environ, "PYTHONPATH": "src"},
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "--omit_tunnel_lining" in proc.stdout
+    assert "FWY" in proc.stdout                       # the documented default set
+
+
+@pytest.mark.parametrize("value, on", [("0", False), ("false", False), ("", False),
+                                       ("1", True), ("on", True)])
+def test_shell_omit_tunnel_lining_truthiness(value, on):
+    script = (
+        'WS_E_CLI=()\n'
+        f'if [[ "${{OMIT_TUNNEL_LINING:-0}}" =~ {_SHELL_TRUTHY_RE} ]]; then\n'
+        '  WS_E_CLI+=( --omit_tunnel_lining )\n'
+        '  [[ -n "${OMIT_TUNNEL_LINING_AAS:-}" ]] && WS_E_CLI+=( --omit_tunnel_lining_aas "$OMIT_TUNNEL_LINING_AAS" )\n'
+        'fi\n'
+        'echo "${WS_E_CLI[@]}"\n'
+    )
+    proc = subprocess.run(["bash", "-c", script],
+                          env={**os.environ, "OMIT_TUNNEL_LINING": value},
+                          capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    assert ("--omit_tunnel_lining" in proc.stdout) is on
+
+
+# ----------------------------------------------------------------------------
 # 7. WS-E sampling-core safety helpers.
 # ----------------------------------------------------------------------------
 

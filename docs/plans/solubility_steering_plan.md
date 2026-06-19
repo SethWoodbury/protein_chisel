@@ -291,6 +291,14 @@ to a real rank) — and 0 is not a default. Add an A/A assertion at `plm_strengt
 
 ## WS-F: Wire PLM refresh (break the static-seed lock-in)
 
+> **Status (toolkit shipped; activation deferred):** the dead `mpnn_with_refresh.py` is now a complete
+> host-tested toolkit — `run_with_refresh` + the new pure `choose_inband_representative` /
+> `refuse_esmc_only` helpers + the shared `scoring/solubility.within_solubility_band`. The DRIVER
+> activation (a `--plm_refresh_rounds` flag + the mid-run ESM-C recompute) is **deferred** per the design
+> debate: the ESM-C recompute is a between-stage op (the design sif lacks torch/esm; nested apptainer
+> blocked), so the flag would always no-op in the current topology — it needs a PoE-style host stage +
+> a cluster ablation first. The helpers are the building blocks for that follow-up. See CHANGELOG WS-F.
+
 **Files:**
 - Modify: `scripts/iterative_design.py` — when `--plm_refresh_rounds K>0`, after a cycle pick a
   **solubility/composition-passing** representative (median-fitness among in-band survivors; if none
@@ -316,6 +324,14 @@ to a real rank) — and 0 is not a default. Add an A/A assertion at `plm_strengt
 ---
 
 ## WS-G: Omit tunnel-lining residues from design
+
+> **Status (shipped, scoped down, off by default):** `--omit_tunnel_lining` (+ `--omit_tunnel_lining_aas`,
+> default **`FWY`** — NOT the draft `FILMVWYA`: Ala excluded, I/L/M/V left to throat-feedback). Source =
+> the seed `is_tunnel_lining` annotation (NOT pyKVFinder — the plan text below is stale; `pyKVFinder_score`
+> returns only aggregate metrics, and per-design pyKVFinder runs post-sampling so can't seed a cycle-0
+> omit). Shared `_read_seed_tunnel_lining` loader (WS-D's surface scope refactored to use it = one source
+> of truth). Byte-identical off; complementary-but-overlapping with throat-feedback (warns if both on).
+> See CHANGELOG WS-G.
 
 **Files:**
 - Modify: `scripts/iterative_design.py` — when `--omit_tunnel_lining`, derive a tunnel-lining resno

@@ -523,6 +523,14 @@ WS_E_CLI=()
 [[ -n "${SAMPLING_TEMPERATURE_FLOOR:-}" ]] && WS_E_CLI+=( --sampling_temperature_floor "$SAMPLING_TEMPERATURE_FLOOR" )
 [[ -n "${PLM_CLASS_STRENGTH:-}"        ]] && WS_E_CLI+=( --plm_class_strength "$PLM_CLASS_STRENGTH" )
 
+# WS-G omit tunnel-lining (opt-in/experimental; unset => byte-identical):
+#   OMIT_TUNNEL_LINING=1            hard-omit bulky AAs at seed tunnel-lining positions
+#   OMIT_TUNNEL_LINING_AAS=<AAs>    the set to omit (default FWY)
+if [[ "${OMIT_TUNNEL_LINING:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]]; then
+    WS_E_CLI+=( --omit_tunnel_lining )
+    [[ -n "${OMIT_TUNNEL_LINING_AAS:-}" ]] && WS_E_CLI+=( --omit_tunnel_lining_aas "$OMIT_TUNNEL_LINING_AAS" )
+fi
+
 # Decode-time Product-of-Experts backend (Phase: PoE; opt-in). Default 'bias' = the
 # in-process LigandMPNN sampler with our calibrated fusion bias (byte-identical).
 # MPNN_BACKEND=poe runs a SEPARATE HOST stage (nested apptainer is blocked) that

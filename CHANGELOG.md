@@ -5,6 +5,41 @@ All notable changes to **protein_chisel** are documented here. Format loosely fo
 
 ## [Unreleased]
 
+### Added — WS-G omit tunnel-lining (opt-in/experimental, default OFF, byte-identical)
+- **`--omit_tunnel_lining` (+ `--omit_tunnel_lining_aas`, default `FWY`) / `OMIT_TUNNEL_LINING` /
+  `OMIT_TUNNEL_LINING_AAS`** — hard-omit bulky/aromatic AAs at the seed's tunnel-lining positions to
+  keep the substrate channel open from cycle 0. New pure `_build_tunnel_lining_omit` +
+  `_read_seed_tunnel_lining` helpers; the lining set is the seed `is_tunnel_lining` annotation — now
+  the **single source of truth**, shared with WS-D's surface scope (WS-D's inline read was refactored
+  to call `_read_seed_tunnel_lining`). Merged into `omit_AA_per_residue` only inside the flag's `if`
+  (merge re-sorts AA strings, so even a `{}` merge isn't a guaranteed no-op — codex), so a no-flag run
+  is byte-identical. **Design-debate refinements:** default is **`FWY`** (aromatics — the unambiguous
+  constrictors), NOT the plan's draft `FILMVWYA` — Alanine is excluded (it's small, can't constrict;
+  composition is WS-C's job) and I/L/M/V are left to the throat-feedback controller's capped/decaying
+  pressure rather than a permanent hard ban; it warns when both `--omit_tunnel_lining` and
+  `--throat_feedback` are on (the hard omit shadows the soft bias at lining∩throat positions).
+  Off by default — it's the bluntest of the channel levers (complementary to, and overlapping with,
+  the soft throat-feedback). Catalytic/fixed positions are never omitted. 10 host tests; the actual
+  fpocket lining run is cluster-only.
+
+### Added — WS-F PLM-bias refresh toolkit (orchestrator + helpers wired + tested; driver activation deferred)
+- The previously-dead `sampling/mpnn_with_refresh.py` is now a complete, host-tested refresh toolkit:
+  the `run_with_refresh` orchestrator (already present) plus two new **pure** helpers —
+  `choose_inband_representative` (median-fitness sequence among in-band, seq-filter-passing survivors;
+  reuses the shared solubility band) and `refuse_esmc_only` (re-fuse fresh ESM-C marginals against the
+  *unchanged seed SaProt* marginals — SaProt is structure-aware, so refreshing it on the drifted
+  sequence would erase the 3Di signal; the same `fusion_cfg` flows `--plm_strength` /
+  `--plm_class_strength` through). New shared `scoring/solubility.within_solubility_band` (single
+  source of truth; the WS-A veto's `_within_solubility_band` is now a thin wrapper — byte-identical).
+- **Driver activation deliberately DEFERRED** (design debate, codex + 2 subagents): the ESM-C recompute
+  on a drifted sequence is a *between-stage* operation — the design sif where the driver runs has no
+  `torch`/`esm` and nested apptainer is blocked, so a `--plm_refresh_rounds` flag would be an
+  always-no-op in the current topology ("misleading"). Activating the refresh needs a PoE-style host
+  stage that re-precomputes ESM-C mid-run, and a cluster ablation to justify the cost (one full
+  masked-LM recompute per round). The toolkit + helpers are ready for that follow-up; provenance
+  already reserves `plm_refresh_rounds`. (WS-F is the *only* lever that re-grounds the static seed
+  prior, so it is NOT redundant with WS-C/D/E — it is the missing axis, just unverifiable on this host.)
+
 ### Added/Changed — WS-E sampling-core safety (opt-in, default byte-identical)
 - **`--bias_total_clamp NATS` / `BIAS_TOTAL_CLAMP`** — bound the **effective** per-`(position, AA)`
   sampling bias (`bias_per_residue` + the separately-applied global `bias_AA`) to `±NATS` via
