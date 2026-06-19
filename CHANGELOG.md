@@ -17,17 +17,22 @@ planned-but-redundant/unsound levers (the WS-D composition & SAP axes, the WS-E 
 plm_off_mode, the WS-F driver activation) with documented reasons. Host suite: 809 passed.
 
 ### Added — WS-G omit tunnel-lining (opt-in/experimental, default OFF, byte-identical)
-- **`--omit_tunnel_lining` (+ `--omit_tunnel_lining_aas`, default `FWY`) / `OMIT_TUNNEL_LINING` /
+- **`--omit_tunnel_lining` (+ `--omit_tunnel_lining_aas`, default `FHKRWY`) / `OMIT_TUNNEL_LINING` /
   `OMIT_TUNNEL_LINING_AAS`** — hard-omit bulky/aromatic AAs at the seed's tunnel-lining positions to
   keep the substrate channel open from cycle 0. New pure `_build_tunnel_lining_omit` +
   `_read_seed_tunnel_lining` helpers; the lining set is the seed `is_tunnel_lining` annotation — now
   the **single source of truth**, shared with WS-D's surface scope (WS-D's inline read was refactored
   to call `_read_seed_tunnel_lining`). Merged into `omit_AA_per_residue` only inside the flag's `if`
   (merge re-sorts AA strings, so even a `{}` merge isn't a guaranteed no-op — codex), so a no-flag run
-  is byte-identical. **Design-debate refinements:** default is **`FWY`** (aromatics — the unambiguous
-  constrictors), NOT the plan's draft `FILMVWYA` — Alanine is excluded (it's small, can't constrict;
-  composition is WS-C's job) and I/L/M/V are left to the throat-feedback controller's capped/decaying
-  pressure rather than a permanent hard ban; it warns when both `--omit_tunnel_lining` and
+  is byte-identical. **Default = the throat's own bulky-blocker set:** new shared
+  `tunnel_metrics.bulky_blocker_aas(0.70)` derives the set from `_BLOCKER_WEIGHT >= 0.70`, so it's one
+  source of truth with the throat-feedback bias — **`FHKRWY`** (aromatics W/F/Y/H plus the long charged
+  R/K). Lysine and Arginine ARE bulky here (Lys Cb→NZ ~5.5 Å, Arg ~6 Å — genuine channel constrictors,
+  same classification the throat applies); hard-omitting them at lining positions also nudges net charge
+  negative, which *agrees* with WS-D's charge axis. NOT the plan's draft `FILMVWYA` — Alanine is excluded
+  (small, can't constrict; composition is WS-C's job) and the medium hydrophobics I/L/M/V are left to the
+  throat-feedback controller's capped/decaying pressure rather than a permanent hard ban; it warns when
+  both `--omit_tunnel_lining` and
   `--throat_feedback` are on (the hard omit shadows the soft bias at lining∩throat positions).
   Off by default — it's the bluntest of the channel levers (complementary to, and overlapping with,
   the soft throat-feedback). Catalytic/fixed positions are never omitted. 10 host tests; the actual

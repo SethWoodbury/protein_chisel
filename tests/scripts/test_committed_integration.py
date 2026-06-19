@@ -693,6 +693,27 @@ def test_read_seed_tunnel_lining_missing_or_empty_is_empty_set(tmp_path):
     assert idz._read_seed_tunnel_lining(empty) == set()
 
 
+def test_ws_g_default_constant_matches_throat_bulky_set():
+    """The driver's tunnel-lining omit default is a guard-tested literal (NOT an
+    import-time call), so arg-parsing never imports protein_chisel — but it MUST
+    stay equal to the throat's bulky-blocker set (single source of truth)."""
+    from protein_chisel.tools.tunnel_metrics import bulky_blocker_aas
+    assert idz._OMIT_TUNNEL_LINING_DEFAULT == bulky_blocker_aas(0.70)
+    assert idz._OMIT_TUNNEL_LINING_DEFAULT == "FHKRWY"
+
+
+def test_help_works_without_protein_chisel_importable():
+    """--help must not require protein_chisel on sys.path (arg-parsing is pure
+    argparse). Regression guard: a tunnel_metrics import at parse time broke this."""
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    proc = subprocess.run(
+        [sys.executable, "scripts/iterative_design.py", "--help"],
+        cwd=str(REPO), env=env, capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "--omit_tunnel_lining" in proc.stdout
+
+
 def test_iterative_design_help_advertises_ws_g_flag():
     proc = subprocess.run(
         [sys.executable, "scripts/iterative_design.py", "--help"],
@@ -701,7 +722,14 @@ def test_iterative_design_help_advertises_ws_g_flag():
     )
     assert proc.returncode == 0, proc.stderr
     assert "--omit_tunnel_lining" in proc.stdout
-    assert "FWY" in proc.stdout                       # the documented default set
+    # WS-G default = the throat's bulky-blocker set (_BLOCKER_WEIGHT >= 0.70):
+    # aromatics W/F/Y/H plus the long charged R/K. Lysine MUST be in it (Cb->NZ
+    # ~5.5 A — a genuine channel constrictor), same as the throat-feedback bias.
+    from protein_chisel.tools.tunnel_metrics import bulky_blocker_aas
+    default_set = bulky_blocker_aas(0.70)
+    assert default_set == "FHKRWY"
+    assert "K" in default_set and "R" in default_set
+    assert default_set in proc.stdout                 # rendered via %(default)s
 
 
 @pytest.mark.parametrize("value, on", [("0", False), ("false", False), ("", False),

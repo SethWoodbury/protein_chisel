@@ -525,7 +525,8 @@ WS_E_CLI=()
 
 # WS-G omit tunnel-lining (opt-in/experimental; unset => byte-identical):
 #   OMIT_TUNNEL_LINING=1            hard-omit bulky AAs at seed tunnel-lining positions
-#   OMIT_TUNNEL_LINING_AAS=<AAs>    the set to omit (default FWY)
+#   OMIT_TUNNEL_LINING_AAS=<AAs>    the set to omit (default FHKRWY = the
+#                                   throat's bulky set: W/F/Y/H + R/K)
 if [[ "${OMIT_TUNNEL_LINING:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]]; then
     WS_E_CLI+=( --omit_tunnel_lining )
     [[ -n "${OMIT_TUNNEL_LINING_AAS:-}" ]] && WS_E_CLI+=( --omit_tunnel_lining_aas "$OMIT_TUNNEL_LINING_AAS" )

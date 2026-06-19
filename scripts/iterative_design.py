@@ -897,10 +897,12 @@ def _build_tunnel_lining_omit(lining_resnos, chain: str, omit_aas: str, *,
     Returns ``{"<chain><resno>": AAs}`` for each NON-fixed lining resno (fixed /
     catalytic residues keep their pinned identity). ``{}`` when the lining set or the
     canonical AA set is empty → byte-identical no-op. Pure; mirrors
-    :func:`_build_fraction_cap_omit`. The default set (``WFYHMLIV``) is the aromatics
-    + His + the large aliphatics that constrict a tunnel; **Alanine is intentionally
-    excluded** — it is small and cannot constrict (controlling Ala over-representation
-    is WS-C's job, not WS-G's).
+    :func:`_build_fraction_cap_omit`. The default set (``_OMIT_TUNNEL_LINING_DEFAULT``
+    = ``FHKRWY`` = the throat's bulky-blocker set) is the aromatics W/F/Y/H + the long
+    charged R/K that line and constrict a tunnel; **Alanine is intentionally excluded**
+    — it is small and cannot constrict (controlling Ala over-representation is WS-C's
+    job, not WS-G's), and the medium hydrophobics I/L/M/V are left to the soft throat-
+    feedback bias rather than a permanent hard ban.
     """
     aas = "".join(sorted({a for a in str(omit_aas).upper() if a in _CANONICAL_AAS}))
     if not aas:
@@ -912,7 +914,7 @@ def _build_tunnel_lining_omit(lining_resnos, chain: str, omit_aas: str, *,
         raise ValueError(
             f"--omit_tunnel_lining_aas {omit_aas!r} omits {len(aas)} canonical AAs, "
             f"leaving fewer than {_MIN_SAMPLEABLE_AAS_AFTER_CAP} sampleable at lining "
-            f"positions; use a smaller set (default FWY).")
+            f"positions; use a smaller set (default {_OMIT_TUNNEL_LINING_DEFAULT}).")
     fixed = {int(r) for r in fixed_resnos}
     return {f"{chain}{int(r)}": aas for r in lining_resnos if int(r) not in fixed}
 
@@ -957,6 +959,14 @@ def _clamp_bias_total(
 # WS-C fraction cap never leaves a designable position with fewer than this many
 # sampleable AAs (guards the all-AAs-omitted → uniform-from-forbidden MPNN failure).
 _MIN_SAMPLEABLE_AAS_AFTER_CAP = 3
+
+# WS-G --omit_tunnel_lining_aas default = the throat's bulky-blocker set
+# (tunnel_metrics.bulky_blocker_aas(0.70) = "_BLOCKER_WEIGHT >= 0.70"): aromatics
+# W/F/Y/H + the long charged R/K. A guard-tested *literal* (not an import-time call)
+# so arg-parsing never has to import protein_chisel — see
+# test_ws_g_default_constant_matches_throat_bulky_set, which fails loudly if the
+# blocker weights drift out of sync with this string.
+_OMIT_TUNNEL_LINING_DEFAULT = "FHKRWY"
 
 # Upper bound (nats) on --composition_soft_bias_nats: well past a hard ban (the
 # effective odds penalty is exp(nats / T); at T≈0.15 even 0.5 is ~28x), and small
@@ -5320,18 +5330,20 @@ def main() -> None:
     # ---- WS-G omit tunnel-lining (opt-in/experimental; default OFF => byte-identical) ----
     p.add_argument("--omit_tunnel_lining", action="store_true", default=False,
                    help="Opt-in/experimental (default OFF => byte-identical). Hard-omit "
-                        "bulky/aromatic AAs (--omit_tunnel_lining_aas, default FWY) at "
-                        "the seed's tunnel-lining positions (is_tunnel_lining) to keep "
-                        "the substrate channel open from cycle 0. Complementary to the "
-                        "(soft, reactive) throat-feedback bias; a permanent hard ban is "
-                        "blunter, so this is off by default. Catalytic/fixed positions "
-                        "are never omitted.")
-    p.add_argument("--omit_tunnel_lining_aas", type=str, default="FWY", metavar="AAS",
+                        "bulky AAs (--omit_tunnel_lining_aas) at the seed's tunnel-lining "
+                        "positions (is_tunnel_lining) to keep the substrate channel open "
+                        "from cycle 0. Complementary to the (soft, reactive) throat-"
+                        "feedback bias; a permanent hard ban is blunter, so this is off "
+                        "by default. Catalytic/fixed positions are never omitted.")
+    p.add_argument("--omit_tunnel_lining_aas", type=str,
+                   default=_OMIT_TUNNEL_LINING_DEFAULT, metavar="AAS",
                    help="AAs to hard-omit at tunnel-lining positions when "
-                        "--omit_tunnel_lining is set. Default FWY (aromatics — the "
-                        "unambiguous channel constrictors; I/L/M/V are left to the "
-                        "throat-feedback controller's capped/decaying pressure). "
-                        "Alanine is excluded by design (it can't constrict).")
+                        "--omit_tunnel_lining is set. Default %(default)s = the throat's "
+                        "bulky-blocker set (tunnel_metrics._BLOCKER_WEIGHT >= 0.70): "
+                        "aromatics W/F/Y/H plus the long charged R/K (Lys Cb->NZ ~5.5 A, "
+                        "Arg ~6 A — genuine channel constrictors, same as the throat-"
+                        "feedback bias). The medium hydrophobics I/L/M/V are left to that "
+                        "controller's capped/decaying pressure; Ala can't constrict.")
     p.add_argument("--protonate_final", action="store_true", default=True,
                    help="After stage_diverse_topk, hydrate every top-K PDB "
                         "via PyRosetta and write a downstream-clean "
