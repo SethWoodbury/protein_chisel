@@ -837,9 +837,11 @@ def compute_adaptive_bias(*, pool_df: Optional[pd.DataFrame] = None,
         "n_surface_positions_touched": int((np.abs(delta) > 1e-6).any(axis=1).sum()),
         "max_surface_penalty_nats": float(delta.min()) if delta.size else 0.0,
         "config": vars(eff_cfg),
-        "odds_clamp": {"max_odds": cfg.max_odds, "temperature": temperature,
-                       "eff_max_nats": round(float(_eff_max_nats), 4)},
     }
+    if cfg.max_odds is not None:               # only emit when the odds clamp is engaged
+        telemetry["odds_clamp"] = {
+            "max_odds": cfg.max_odds, "temperature": temperature,
+            "eff_max_nats": round(float(_eff_max_nats), 4)}
     return AdaptiveBiasResult(
         bias_AA_string=merged, controller_global=controller_global,
         per_position_delta=delta, outcomes=outcomes, new_state=new_state,

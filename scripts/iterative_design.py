@@ -6597,6 +6597,10 @@ def main() -> None:
                     L=base_bias.shape[0], position_classes=position_classes,
                     sasa_fraction=_ab_sasa, fixed_idx=_ab_fixed_idx,
                     over_rep_mask=_ab_overrep, surface_mask=_ab_surface_mask,
+                    # this cycle's T; the bias is APPLIED next cycle at a (possibly
+                    # annealed, lower) T, so the odds clamp runs slightly loose under
+                    # annealing. Acceptable for the opt-in clamp; the CF-3 coordinator
+                    # will own bias-application timing (codex CF-1 review).
                     temperature=cyc.sampling_temperature,
                 )
                 adaptive_state = ab_res.new_state

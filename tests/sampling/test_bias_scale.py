@@ -28,6 +28,9 @@ def test_effective_clamp_nats_is_odds_space_when_set():
     # falls back to legacy max_nats if T is missing/invalid (can't compute odds)
     assert effective_clamp_nats(0.6, ODDS_STRONG, None) == 0.6
     assert effective_clamp_nats(0.6, ODDS_STRONG, 0.0) == 0.6
+    # degenerate odds <= 1 (would be a non-positive clamp) degrades safely to max_nats
+    assert effective_clamp_nats(0.6, 1.0, 0.15) == 0.6
+    assert effective_clamp_nats(0.6, 0.5, 0.15) == 0.6
 
 
 def test_odds_for_nats_matches_exp_bias_over_T():
