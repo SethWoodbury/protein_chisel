@@ -203,7 +203,7 @@ def test_compute_adaptive_bias_applies_odds_space_clamp():
                   sasa_fraction=np.ones(L), fixed_idx=set())
     res0 = compute_adaptive_bias(cfg=AdaptiveBiasConfig(), **common)
     assert res0.telemetry["config"]["max_nats"] == 0.6          # legacy path
-    assert res0.telemetry["odds_clamp"]["max_odds"] is None
+    assert "odds_clamp" not in res0.telemetry                   # clamp not engaged
     T = 0.15
     res1 = compute_adaptive_bias(cfg=AdaptiveBiasConfig(max_odds=ODDS_NUDGE),
                                  temperature=T, **common)
