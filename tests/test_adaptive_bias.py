@@ -191,6 +191,29 @@ def test_too_hydrophobic_pushes_hydrophilic_at_surface():
     assert d[0, AA_TO_IDX["I"]] < d[0, AA_TO_IDX["A"]]   # Ile down more than Ala (KD)
 
 
+def test_compute_adaptive_bias_applies_odds_space_clamp():
+    # CF-1: cfg.max_odds + temperature -> the |u| clamp becomes nats_for_odds(max_odds, T)
+    # (temperature-invariant authority); no max_odds -> raw max_nats (byte-identical).
+    from protein_chisel.sampling.bias_scale import nats_for_odds, ODDS_NUDGE
+    rng = np.random.default_rng(7)
+    pool = make_pool(GRAVY_AXIS, n=200, mean=0.8, std=0.1, rng=rng)
+    L = 5
+    common = dict(pool_df=pool, axes=[GRAVY_AXIS], state=None, L=L,
+                  position_classes=["distal_surface"] * L,
+                  sasa_fraction=np.ones(L), fixed_idx=set())
+    res0 = compute_adaptive_bias(cfg=AdaptiveBiasConfig(), **common)
+    assert res0.telemetry["config"]["max_nats"] == 0.6          # legacy path
+    assert res0.telemetry["odds_clamp"]["max_odds"] is None
+    T = 0.15
+    res1 = compute_adaptive_bias(cfg=AdaptiveBiasConfig(max_odds=ODDS_NUDGE),
+                                 temperature=T, **common)
+    exp = nats_for_odds(ODDS_NUDGE, T)
+    assert abs(res1.telemetry["config"]["max_nats"] - exp) < 1e-9
+    assert abs(res1.telemetry["odds_clamp"]["eff_max_nats"] - round(exp, 4)) < 1e-9
+    # a tighter clamp (NUDGE=2x=0.10 nats < 0.6) can only reduce the applied drive
+    assert abs(res1.telemetry["axes"][0]["u"]) <= abs(res0.telemetry["axes"][0]["u"]) + 1e-9
+
+
 def test_overshoot_hydrophilic_reverses():
     # An over-corrected pool (too hydrophilic, GRAVY well below target) must REVERSE:
     # surface term flips to UP-weight hydrophobic.

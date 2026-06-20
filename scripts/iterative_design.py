@@ -5267,6 +5267,14 @@ def main() -> None:
                    help="Initial integral gain (unitless band-normalized error).")
     p.add_argument("--adaptive_bias_max_nats", type=float, default=0.6,
                    help="Clamp on the per-AA / per-cell bias magnitude (nats).")
+    p.add_argument("--adaptive_bias_max_odds", type=float, default=None, metavar="X",
+                   help="CF-1 opt-in: clamp the controller |bias| in ODDS space at X-fold "
+                        "(temperature-invariant: max_nats := T*ln(X) each cycle) instead "
+                        "of the raw --adaptive_bias_max_nats. None (default) keeps the raw "
+                        "nats clamp => byte-identical. Typical 2 (nudge) to 8 (strong); "
+                        "MPNN odds shift is exp(bias/T) so a fixed nats clamp silently "
+                        "amplifies as T anneals — this makes the controller's authority "
+                        "invariant to the temperature schedule.")
     p.add_argument("--adaptive_bias_carry", type=float, default=0.9,
                    help="Integral leak during active correction (1=pure integral). "
                         "When the pool is in-band the bias is held exactly.")
@@ -5608,6 +5616,10 @@ def main() -> None:
                           ("--plm_autoskip_hydrophobic_frac", args.plm_autoskip_hydrophobic_frac)):
         if not (math.isfinite(_tval) and 0.0 < _tval <= 1.0):
             p.error(f"{_tname} must be a fraction in (0, 1], got {_tval}")
+    if args.adaptive_bias_max_odds is not None and not (
+            math.isfinite(args.adaptive_bias_max_odds) and args.adaptive_bias_max_odds > 1.0):
+        p.error("--adaptive_bias_max_odds must be a finite odds multiplier > 1.0 "
+                f"(T*ln(X) must be positive), got {args.adaptive_bias_max_odds}")
     debug_short_test_override_msg = None
     if args.debug_short_test:
         if args.target_k != 5 or args.cycles != 3:
@@ -6412,7 +6424,7 @@ def main() -> None:
             gain=args.adaptive_bias_gain, max_nats=args.adaptive_bias_max_nats,
             carry=args.adaptive_bias_carry, t_min=args.adaptive_bias_tmin,
             f_min=args.adaptive_bias_fmin, min_n=args.adaptive_bias_min_n,
-            mode=args.adaptive_bias_mode,
+            mode=args.adaptive_bias_mode, max_odds=args.adaptive_bias_max_odds,
         )
         try:
             _ab_r2s = dict(zip(pt.df["resno"].astype(int),
@@ -6585,6 +6597,7 @@ def main() -> None:
                     L=base_bias.shape[0], position_classes=position_classes,
                     sasa_fraction=_ab_sasa, fixed_idx=_ab_fixed_idx,
                     over_rep_mask=_ab_overrep, surface_mask=_ab_surface_mask,
+                    temperature=cyc.sampling_temperature,
                 )
                 adaptive_state = ab_res.new_state
                 adaptive_global = ab_res.controller_global or None

@@ -10,8 +10,24 @@ import math
 import pytest
 
 from protein_chisel.sampling.bias_scale import (
-    nats_for_odds, odds_for_nats, ODDS_NUDGE, ODDS_STRONG, ODDS_LOCK,
+    nats_for_odds, odds_for_nats, effective_clamp_nats,
+    ODDS_NUDGE, ODDS_STRONG, ODDS_LOCK,
 )
+
+
+def test_effective_clamp_nats_legacy_when_no_max_odds():
+    # max_odds=None -> the raw max_nats (byte-identical legacy path), regardless of T.
+    assert effective_clamp_nats(0.6, None, 0.15) == 0.6
+    assert effective_clamp_nats(0.6, None, None) == 0.6
+
+
+def test_effective_clamp_nats_is_odds_space_when_set():
+    # max_odds set + T given -> temperature-invariant nats for that odds multiplier.
+    assert effective_clamp_nats(0.6, ODDS_STRONG, 0.15) == pytest.approx(0.15 * math.log(8.0))
+    assert effective_clamp_nats(0.6, ODDS_STRONG, 0.30) == pytest.approx(0.30 * math.log(8.0))
+    # falls back to legacy max_nats if T is missing/invalid (can't compute odds)
+    assert effective_clamp_nats(0.6, ODDS_STRONG, None) == 0.6
+    assert effective_clamp_nats(0.6, ODDS_STRONG, 0.0) == 0.6
 
 
 def test_odds_for_nats_matches_exp_bias_over_T():

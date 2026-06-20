@@ -271,6 +271,11 @@ class ControlAxis:
 class AdaptiveBiasConfig:
     gain: float = 0.6              # initial integral gain (unitless error)
     max_nats: float = 0.6         # clamp on |u| (below PLM fusion mean_abs ~0.85)
+    # CF-1 opt-in: when set, the |u| clamp is computed in ODDS space at the cycle
+    # temperature (max_nats := nats_for_odds(max_odds, T)) so a controller's authority
+    # is invariant to the T-schedule. None (default) => the raw max_nats above =>
+    # byte-identical to the legacy behaviour.
+    max_odds: Optional[float] = None
     carry: float = 0.9            # integral HOLD factor (~1 holds bias; leak=1-carry)
     t_min: float = 2.5            # |t| threshold for the gate
     f_min: float = 0.15           # fail-fraction threshold for the gate
@@ -760,7 +765,8 @@ def compute_adaptive_bias(*, pool_df: Optional[pd.DataFrame] = None,
                           sasa_fraction: Optional[np.ndarray], fixed_idx: set,
                           class_balance_bias_AA: str = "",
                           over_rep_mask: Optional[np.ndarray] = None,
-                          surface_mask: Optional[np.ndarray] = None
+                          surface_mask: Optional[np.ndarray] = None,
+                          temperature: Optional[float] = None,
                           ) -> AdaptiveBiasResult:
     """Run all axes for one cycle and produce the global + per-position biases.
 
@@ -772,6 +778,12 @@ def compute_adaptive_bias(*, pool_df: Optional[pd.DataFrame] = None,
     bias_AA is just the class-balance string unchanged (no-op when nothing to do).
     """
     state = state or {}
+    # CF-1: opt-in odds-space clamp at the cycle temperature. byte-identical no-op when
+    # cfg.max_odds is None (effective_clamp_nats returns cfg.max_nats -> eff_cfg is cfg).
+    import dataclasses as _dc
+    from protein_chisel.sampling.bias_scale import effective_clamp_nats
+    _eff_max_nats = effective_clamp_nats(cfg.max_nats, cfg.max_odds, temperature)
+    eff_cfg = cfg if _eff_max_nats == cfg.max_nats else _dc.replace(cfg, max_nats=_eff_max_nats)
     delta = np.zeros((L, 20), dtype=np.float32)
     outcomes: list = []
     new_state: dict = {}
@@ -801,20 +813,20 @@ def compute_adaptive_bias(*, pool_df: Optional[pd.DataFrame] = None,
             if axis.scope == "surface":
                 delta = delta + build_surface_delta(
                     held, L=L, position_classes=position_classes,
-                    sasa_fraction=sasa_fraction, fixed_idx=fixed_idx, cfg=cfg,
+                    sasa_fraction=sasa_fraction, fixed_idx=fixed_idx, cfg=eff_cfg,
                     over_rep_mask=over_rep_mask, surface_mask=surface_mask)
             continue
-        oc, st_new = step_axis(primary, axis, st, cfg)
+        oc, st_new = step_axis(primary, axis, st, eff_cfg)
         outcomes.append(oc)
         new_state[axis.name] = st_new.to_dict()
         if axis.scope == "surface":
             delta = delta + build_surface_delta(
                 oc, L=L, position_classes=position_classes,
-                sasa_fraction=sasa_fraction, fixed_idx=fixed_idx, cfg=cfg,
+                sasa_fraction=sasa_fraction, fixed_idx=fixed_idx, cfg=eff_cfg,
                 over_rep_mask=over_rep_mask, surface_mask=surface_mask)
 
     axes_by_name = {a.name: a for a in axes}
-    controller_global = global_per_aa_bias(outcomes, axes_by_name, cfg)
+    controller_global = global_per_aa_bias(outcomes, axes_by_name, eff_cfg)
     merged, conflicts = merge_bias_AA_strings(class_balance_bias_AA, controller_global)
 
     telemetry = {
@@ -824,7 +836,9 @@ def compute_adaptive_bias(*, pool_df: Optional[pd.DataFrame] = None,
         "class_balance_conflicts": conflicts,
         "n_surface_positions_touched": int((np.abs(delta) > 1e-6).any(axis=1).sum()),
         "max_surface_penalty_nats": float(delta.min()) if delta.size else 0.0,
-        "config": vars(cfg),
+        "config": vars(eff_cfg),
+        "odds_clamp": {"max_odds": cfg.max_odds, "temperature": temperature,
+                       "eff_max_nats": round(float(_eff_max_nats), 4)},
     }
     return AdaptiveBiasResult(
         bias_AA_string=merged, controller_global=controller_global,

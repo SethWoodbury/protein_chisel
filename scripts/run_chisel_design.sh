@@ -463,6 +463,7 @@ if [[ "$ADAPTIVE_BIAS" != "0" ]]; then
     # ${VAR:-} so an unset sub-knob does not trip `set -u` when ADAPTIVE_BIAS=1.
     [[ -n "${ADAPTIVE_BIAS_GAIN:-}"      ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_gain "$ADAPTIVE_BIAS_GAIN" )
     [[ -n "${ADAPTIVE_BIAS_MAX_NATS:-}"  ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_max_nats "$ADAPTIVE_BIAS_MAX_NATS" )
+    [[ -n "${ADAPTIVE_BIAS_MAX_ODDS:-}"  ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_max_odds "$ADAPTIVE_BIAS_MAX_ODDS" )
     [[ -n "${ADAPTIVE_BIAS_CARRY:-}"     ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_carry "$ADAPTIVE_BIAS_CARRY" )
     [[ -n "${ADAPTIVE_BIAS_DEADBAND:-}"  ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_deadband "$ADAPTIVE_BIAS_DEADBAND" )
     [[ -n "${ADAPTIVE_BIAS_TMIN:-}"      ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_tmin "$ADAPTIVE_BIAS_TMIN" )

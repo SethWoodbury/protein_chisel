@@ -23,7 +23,18 @@ survivors finally appeared so the composition cap fired.
   regenerates from structure + fixed residues instead of the PLM amplifying the bad seed. Default
   OFF → byte-identical (imports + work happen only inside the opt-in branch; `--help` needs no PLM).
 - New `sampling/bias_scale.py` (`nats_for_odds = T·ln(M)`, `odds_for_nats = exp(b/T)`, odds
-  vocabulary) — the temperature-invariant foundation for the upcoming bias recalibration.
+  vocabulary) — the temperature-invariant foundation for the bias recalibration.
+
+### Added — CF-1: odds-space controller clamp (`--adaptive_bias_max_odds`)
+- First step of the unified multi-objective controller framework (design: `docs/plans/controller_framework.md`).
+  The adaptive controller's `|bias|` clamp was a fixed `max_nats=0.6`; because MPNN samples
+  `softmax((logits+bias)/T)`, that is 55× odds at T=0.15 but only 20× at T=0.20 — the controller's
+  authority silently varied with the temperature schedule. `--adaptive_bias_max_odds X` (env
+  `ADAPTIVE_BIAS_MAX_ODDS`) instead clamps in **odds space**: `max_nats := T·ln(X)` per cycle (via new
+  `bias_scale.effective_clamp_nats`), so the authority is temperature-invariant and legible (X=2 nudge …
+  8 strong). `AdaptiveBiasConfig.max_odds` defaults `None`, `compute_adaptive_bias` gains an optional
+  `temperature`; when unset the effective cfg **is** the original cfg → byte-identical (61 controller
+  tests + full 839 green). Validated `> 1.0` at parse time. The `step_axis` control law is untouched.
 
 ## [1.1.0] — 2026-06-18 — Solubility-steering overhaul (8 opt-in workstreams, byte-identical default)
 

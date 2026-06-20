@@ -50,3 +50,16 @@ def odds_for_nats(nats: float, temperature: float) -> float:
     if not temperature > 0:
         raise ValueError(f"temperature must be > 0, got {temperature}")
     return math.exp(nats / temperature)
+
+
+def effective_clamp_nats(max_nats, max_odds, temperature):
+    """The per-axis bias clamp in nats — temperature-invariant when opted in.
+
+    When ``max_odds`` is given AND ``temperature`` is usable (>0), return the nats that
+    yield that odds multiplier at this cycle's temperature (so a controller's authority
+    is invariant to the T-schedule). Otherwise return the legacy raw ``max_nats`` — so a
+    caller that does not set ``max_odds`` is byte-identical to the prior behaviour.
+    """
+    if max_odds is not None and temperature is not None and temperature > 0:
+        return nats_for_odds(max_odds, temperature)
+    return max_nats
