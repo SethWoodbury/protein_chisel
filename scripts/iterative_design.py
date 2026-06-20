@@ -232,6 +232,36 @@ def _parse_charge_band_arg(s: str) -> tuple:
     return (lo, hi)
 
 
+def _parse_catalytic_resnos_arg(s: str) -> tuple[int, ...]:
+    """Parse ``--catalytic_resnos '10,20,30'`` -> ``(10, 20, 30)``, sorted
+    ascending and de-duplicated.
+
+    These are 1-indexed PDB resseq numbers on the catalytic chain (CHAIN). An
+    explicit override exists for scaffolds whose seed PDB lacks a REMARK 666
+    block: without it the driver falls back to the PTE_i1 builtin positions,
+    which are wrong for any other enzyme. Requires at least one value and
+    every value a positive int (resseq is 1-indexed) — a typo'd/empty value
+    would otherwise silently pin the wrong residues.
+    """
+    parts = [tok.strip() for tok in str(s).split(",") if tok.strip()]
+    if not parts:
+        raise argparse.ArgumentTypeError(
+            f"--catalytic_resnos must list >=1 residue number, got {s!r}")
+    out: set[int] = set()
+    for tok in parts:
+        try:
+            v = int(tok)
+        except (TypeError, ValueError):
+            raise argparse.ArgumentTypeError(
+                f"--catalytic_resnos values must be integers, got {tok!r}")
+        if v < 1:
+            raise argparse.ArgumentTypeError(
+                f"--catalytic_resnos values must be positive (1-indexed "
+                f"resseq), got {v}")
+        out.add(v)
+    return tuple(sorted(out))
+
+
 def _parse_plm_class_strength(s: str) -> dict:
     """Parse ``--plm_class_strength 'class=val,...'`` -> ``{class: weight}``.
 
@@ -261,24 +291,61 @@ def _parse_plm_class_strength(s: str) -> dict:
     return overrides
 
 
-def _derive_catres_from_remark_666(seed_pdb: Path | str) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    """Read REMARK 666 from ``seed_pdb`` and return:
+def _resolve_catalytic_resnos(
+    override: Optional[Iterable[int]],
+    seed_pdb: Path | str,
+) -> tuple[tuple[int, ...], tuple[int, ...], str]:
+    """Resolve the catalytic residue set for ANY scaffold, by priority:
 
-        (all_catalytic_resnos, his_only_catalytic_resnos)
+        1. ``override`` (``--catalytic_resnos``) — explicit user intent.
+        2. The seed PDB's ``REMARK 666`` motif block — auto-derived.
+        3. The hard-coded PTE_i1 builtin (``DEFAULT_CATRES`` /
+           ``CATALYTIC_HIS_RESNOS``) — correct ONLY for that scaffold.
 
-    sorted ascending. Falls back to the module defaults
-    (PTE_i1 SEED1) if no REMARK 666 entries are found.
+    Returns ``(all_catalytic_resnos, his_only_catalytic_resnos, source)`` with
+    ``source`` in ``{"override", "remark_666", "builtin"}``, all resno tuples
+    sorted ascending.
+
+    When (and only when) it falls through to case 3 — no override AND no
+    REMARK 666 — it emits a LOUD ``LOGGER.warning`` naming the PTE-specific
+    residues, flagging them as almost certainly wrong for a non-PTE scaffold,
+    and pointing at ``--catalytic_resnos``. The VALUES are unchanged from the
+    historic silent fallback (byte-identical: same residues, just warned).
+
+    For the override case the HIS subset is taken to be the SAME set as the
+    overridden resnos: every downstream consumer of the HIS subset (e.g.
+    ``_detect_hbond_to_his_sidechain``) is resname-guarded, so a non-HIS resno
+    in that set simply never matches a HIS atom — a safe superset.
     """
+    if override is not None:
+        ov = tuple(sorted({int(r) for r in override}))
+        if ov:
+            return ov, ov, "override"
+
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
     from protein_chisel.tools.protonate_final import parse_remark_666 as _parse666
     entries = _parse666(seed_pdb)
-    if not entries:
-        return DEFAULT_CATRES, CATALYTIC_HIS_RESNOS
-    all_resnos = tuple(sorted({e.motif_resno for e in entries}))
-    his_resnos = tuple(sorted({
-        e.motif_resno for e in entries if e.motif_resname.upper() == "HIS"
-    }))
-    return all_resnos, his_resnos
+    if entries:
+        all_resnos = tuple(sorted({e.motif_resno for e in entries}))
+        his_resnos = tuple(sorted({
+            e.motif_resno for e in entries if e.motif_resname.upper() == "HIS"
+        }))
+        return all_resnos, his_resnos, "remark_666"
+
+    # No override and no REMARK 666 -> the PTE_i1 builtin. Correct ONLY for the
+    # PTE scaffold; loudly warn so a non-PTE run can't silently pin the wrong
+    # residues (the historic failure mode this resolver exists to fix).
+    LOGGER.warning(
+        "No --catalytic_resnos override and NO REMARK 666 block in seed_pdb "
+        "(%s): falling back to the hard-coded PTE_i1 catalytic residues "
+        "all=%s his=%s. These are almost certainly WRONG for a non-PTE "
+        "scaffold and will pin/fix the wrong positions. Pass "
+        "--catalytic_resnos 'r1,r2,...' (1-indexed resseq on chain %s) or add "
+        "a REMARK 666 motif block to the seed PDB.",
+        seed_pdb, DEFAULT_CATRES, CATALYTIC_HIS_RESNOS, CHAIN,
+    )
+    return DEFAULT_CATRES, CATALYTIC_HIS_RESNOS, "builtin"
+
 
 # Apptainer / cluster paths
 UNIVERSAL_SIF = Path("/net/software/containers/universal.sif")
@@ -5084,6 +5151,16 @@ def main() -> None:
                         "no canonical AAs are silently forbidden. Pass 'CX' "
                         "to also exclude cysteine (recommended for scaffolds "
                         "with no catalytic Cys); add others as needed.")
+    p.add_argument("--catalytic_resnos", type=_parse_catalytic_resnos_arg,
+                   default=None, metavar="R1,R2,...",
+                   help="Comma-separated 1-indexed catalytic resnos (chain A) to "
+                        "fix/protect, e.g. '41,64,187'. Default None. Resolution "
+                        "priority: this flag > the seed PDB's REMARK 666 motif "
+                        "block > the hard-coded PTE_i1 builtin "
+                        "(60,64,128,131,132,157). Set this for ANY non-PTE "
+                        "scaffold whose seed lacks REMARK 666 — otherwise the run "
+                        "falls back to the PTE positions (with a loud warning) "
+                        "and pins the wrong residues.")
     p.add_argument("--expression_profile", type=str,
                    default="bl21_cytosolic_streptag",
                    choices=["bl21_cytosolic_streptag", "k12_cytosolic",
@@ -5111,12 +5188,14 @@ def main() -> None:
                         + ", ".join(AVAILABLE_ENHANCE_CHECKPOINTS))
     p.add_argument("--pi_min", type=float, default=5.0,
                    help="Minimum theoretical pI. Default 5.0 selects the "
-                        "least-acidic ~1%% of cycle-0 designs at "
-                        "--net_charge_max<-10. Low cycle-0 pass rate is "
-                        "fine: consensus-bias iteration in cycle 1+ pulls "
-                        "subsequent cycles toward less-acidic sequences. "
-                        "Relax to 4.7 for higher cycle-0 pass at the cost "
-                        "of weaker selection pressure.")
+                        "least-acidic ~1%% of cycle-0 designs under the "
+                        "cycle-0 net-charge band (which comes from the "
+                        "per-cycle strategy schedule, not a CLI flag). Low "
+                        "cycle-0 pass rate is fine: consensus-bias iteration "
+                        "in cycle 1+ pulls subsequent cycles toward "
+                        "less-acidic sequences. Relax to 4.7 for higher "
+                        "cycle-0 pass at the cost of weaker selection "
+                        "pressure.")
     p.add_argument("--pi_max", type=float, default=7.5)
     p.add_argument("--fpocket_druggability_min", type=float, default=0.30,
                    help="Drop designs with fpocket-druggability below this "
@@ -5655,19 +5734,26 @@ def main() -> None:
         # accidentally truncated.
         LOGGER.warning(debug_short_test_override_msg)
 
-    # Auto-derive catalytic resnos from the seed's REMARK 666 block. This
-    # makes the same driver/sbatch work on any scaffold in the design
-    # campaign — even though the catalytic His/Lys/Glu sequence positions
-    # vary between scaffolds (e.g. SEED1 LYS 157 vs SEED2 LYS 19), the
-    # REMARK 666 block records them and we adopt those positions for the
-    # filter / fixed-residue / catres-aware code paths.
+    # Resolve catalytic resnos for ANY scaffold, by priority:
+    #   --catalytic_resnos override > seed REMARK 666 derivation > PTE builtin.
+    # This makes the same driver/sbatch work on any scaffold in the design
+    # campaign — even though the catalytic His/Lys/Glu sequence positions vary
+    # between scaffolds (e.g. SEED1 LYS 157 vs SEED2 LYS 19), the REMARK 666
+    # block (or the explicit override) records them and we adopt those
+    # positions for the filter / fixed-residue / catres-aware code paths. The
+    # builtin-fallback path (no override AND no REMARK 666) is loudly warned
+    # inside _resolve_catalytic_resnos — those PTE positions are wrong off-PTE.
     global DEFAULT_CATRES, CATALYTIC_HIS_RESNOS
-    derived_catres, derived_his = _derive_catres_from_remark_666(args.seed_pdb)
-    if derived_catres != DEFAULT_CATRES:
+    _orig_default_catres, _orig_default_his = DEFAULT_CATRES, CATALYTIC_HIS_RESNOS
+    derived_catres, derived_his, catres_source = _resolve_catalytic_resnos(
+        args.catalytic_resnos, args.seed_pdb,
+    )
+    if catres_source != "builtin" and derived_catres != _orig_default_catres:
         LOGGER.info(
-            "auto-derived catalytic resnos from seed REMARK 666: "
-            "all_catres=%s (was default %s); his_only=%s (was default %s)",
-            derived_catres, DEFAULT_CATRES, derived_his, CATALYTIC_HIS_RESNOS,
+            "catalytic resnos resolved from %s: all_catres=%s (was PTE default "
+            "%s); his_only=%s (was PTE default %s)",
+            catres_source, derived_catres, _orig_default_catres,
+            derived_his, _orig_default_his,
         )
     DEFAULT_CATRES = derived_catres
     CATALYTIC_HIS_RESNOS = derived_his

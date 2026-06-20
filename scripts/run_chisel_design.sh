@@ -318,6 +318,13 @@ if [[ -z "$SEED_PDB" ]]; then
     exit 1
 fi
 LIG_PARAMS="${LIG_PARAMS:?Set LIG_PARAMS to your ligand .params file}"
+# CATALYTIC_RESNOS: comma-separated 1-indexed catalytic resnos (chain A) to
+#   fix/protect, e.g. CATALYTIC_RESNOS='41,64,187'. Default empty = let the
+#   driver resolve them: REMARK 666 in SEED_PDB if present, else the hard-coded
+#   PTE_i1 builtin (with a loud warning). Set this for ANY non-PTE scaffold
+#   whose seed lacks REMARK 666 so the wrong (PTE) residues aren't pinned.
+#   Forwarded to iterative_design.py's --catalytic_resnos.
+CATALYTIC_RESNOS="${CATALYTIC_RESNOS:-}"
 TARGET_K="${TARGET_K:-50}"
 MIN_HAMMING="${MIN_HAMMING:-3}"
 N_CYCLES="${N_CYCLES:-3}"
@@ -375,6 +382,11 @@ CONSERVE_GROW_NETWORK="${CONSERVE_GROW_NETWORK:-0}"
 # Canonical REMARK transfer + DESIGN_PATH provenance (Feature 2). On by default;
 # carries REMARK 665/666/667/668/QCB from the seed onto restored + final PDBs.
 TRANSFER_REMARKS="${TRANSFER_REMARKS:-1}"
+
+# Catalytic-residue override passthrough. Empty (default) => omit the flag so the
+# driver auto-resolves from REMARK 666 / PTE builtin (byte-identical default).
+CATALYTIC_RESNOS_CLI=()
+[[ -n "$CATALYTIC_RESNOS" ]] && CATALYTIC_RESNOS_CLI+=( --catalytic_resnos "$CATALYTIC_RESNOS" )
 
 # Assemble the driver CLI fragment for the two features once (avoids fragile
 # inline quoting in the apptainer invocation below).
@@ -834,6 +846,7 @@ run_stage3_driver() {
             "${DRIVER_CLI_ARGS[@]}" \
             ${PTM:+--ptm "$PTM"} \
             ${ENHANCE:+--enhance "$ENHANCE"} \
+            "${CATALYTIC_RESNOS_CLI[@]}" \
             "${CONSERVE_CLI[@]}" \
             "${EXPERTS_CLI[@]}" \
             "${PLM_DTYPE_CLI[@]}" \
