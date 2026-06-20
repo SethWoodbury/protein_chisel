@@ -433,8 +433,78 @@ def test_shell_regex_matches_committed_source():
     fails loudly if the shell wiring's regex ever drifts from what we assert."""
     sh = (REPO / "scripts" / "run_chisel_design.sh").read_text()
     assert _SHELL_TRUTHY_RE in sh
-    # The feature flags use the identical truthy guard (veto, sap, +WS-C).
+    # The feature flags use the identical truthy guard (veto, sap, +WS-C, +CF-5).
     assert sh.count(_SHELL_TRUTHY_RE) >= 2
+
+
+# ----------------------------------------------------------------------------
+# CF-5: verbose controller trace (opt-in --controller_verbose).
+# ----------------------------------------------------------------------------
+#
+# --help advertises the flag (and must do so WITHOUT PYTHONPATH, since --help
+# reaches argparse before any protein_chisel import); the shell CONTROLLER_VERBOSE
+# env var maps onto --controller_verbose with the same truthy guard as the other
+# opt-in flags. Default OFF => byte-identical (no trace, no new import at runtime).
+
+
+def test_iterative_design_help_advertises_controller_verbose():
+    """`iterative_design.py --help` mentions --controller_verbose (CF-5)."""
+    proc = subprocess.run(
+        [sys.executable, "scripts/iterative_design.py", "--help"],
+        cwd=str(REPO), env={**os.environ, "PYTHONPATH": "src"},
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "--controller_verbose" in proc.stdout
+
+
+def test_controller_verbose_help_works_without_pythonpath():
+    """CF-5 constraint: --help must exit 0 and show --controller_verbose even with
+    PYTHONPATH unset — i.e. the trace import stays inside the opt-in branch, not at
+    module/parse time (so a default `--help` never needs the package on the path)."""
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    proc = subprocess.run(
+        [sys.executable, "scripts/iterative_design.py", "--help"],
+        cwd=str(REPO), env=env,
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "--controller_verbose" in proc.stdout
+
+
+@pytest.mark.parametrize(
+    "value, expect_flag",
+    [
+        ("0", False), ("false", False), ("off", False), ("", False),
+        ("no", False),
+        ("1", True), ("true", True), ("YES", True), ("On", True),
+    ],
+)
+def test_shell_controller_verbose_truthiness(value, expect_flag):
+    """The run_chisel_design.sh CONTROLLER_VERBOSE snippet maps {1,true,yes,on} ->
+    --controller_verbose and everything else -> disabled. Runs the EXACT regex from
+    the shell file in real bash so it stays pinned to the shipped wiring."""
+    script = (
+        'ADAPTIVE_BIAS_CLI=()\n'
+        f'[[ "${{CONTROLLER_VERBOSE:-0}}" =~ {_SHELL_TRUTHY_RE} ]] '
+        '&& ADAPTIVE_BIAS_CLI+=( --controller_verbose )\n'
+        'echo "${ADAPTIVE_BIAS_CLI[@]}"\n'
+    )
+    proc = subprocess.run(
+        ["bash", "-c", script],
+        env={**os.environ, "CONTROLLER_VERBOSE": value},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert ("--controller_verbose" in proc.stdout) is expect_flag
+
+
+def test_shell_controller_verbose_wired_in_source():
+    """Pin the CONTROLLER_VERBOSE -> --controller_verbose wiring to the committed
+    run_chisel_design.sh so the passthrough can't silently disappear."""
+    sh = (REPO / "scripts" / "run_chisel_design.sh").read_text()
+    assert "CONTROLLER_VERBOSE" in sh
+    assert "--controller_verbose" in sh
 
 
 # ----------------------------------------------------------------------------

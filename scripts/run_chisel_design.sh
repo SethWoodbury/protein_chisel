@@ -478,6 +478,9 @@ if [[ "$ADAPTIVE_BIAS" != "0" ]]; then
     [[ -n "${ADAPTIVE_SURFACE_SASA_GATE:-}" ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_surface_sasa_gate "$ADAPTIVE_SURFACE_SASA_GATE" )
     [[ -n "${ADAPTIVE_CHARGE_BAND:-}"       ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_charge_band "$ADAPTIVE_CHARGE_BAND" )
     [[ -n "${ADAPTIVE_BIAS_AXES:-}"         ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_axes "$ADAPTIVE_BIAS_AXES" )
+    # CF-5 opt-in verbose controller trace (default OFF => byte-identical). Truthy on
+    # 1/true/yes/on; writes <run_dir>/controller_trace.tsv + per-cycle CONTROLLER REPORT.
+    [[ "${CONTROLLER_VERBOSE:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]] && ADAPTIVE_BIAS_CLI+=( --controller_verbose )
 fi
 
 # Hard solubility veto (opt-in; default OFF => byte-identical). SHIP_SOLUBILITY_VETO=1

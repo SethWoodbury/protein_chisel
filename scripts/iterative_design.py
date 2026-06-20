@@ -5320,6 +5320,15 @@ def main() -> None:
                         "'charge,surface_hydrophobicity'). Restrict (e.g. 'charge') "
                         "or, as future registry entries land, extend. An unknown "
                         "axis name is rejected.")
+    p.add_argument("--controller_verbose", action="store_true", default=False,
+                   help="CF-5 opt-in observability (default OFF => byte-identical). "
+                        "With --adaptive_bias, after each cycle append one row per "
+                        "axis to <run_dir>/controller_trace.tsv (long format: cycle, "
+                        "axis, scope, measured vs target/band, signed_error, gate + "
+                        "why, drive_u, effective_odds=exp(u/T), n) and emit a per-cycle "
+                        "CONTROLLER REPORT to the log, for step-by-step chronological "
+                        "validation. Advisory only — a trace write error never stops "
+                        "the run. No effect without --adaptive_bias.")
     # ---- WS-E sampling-core safety (opt-in; defaults => byte-identical) ----
     p.add_argument("--bias_total_clamp", type=_nonneg_finite_arg, default=None,
                    metavar="NATS",
@@ -6614,6 +6623,39 @@ def main() -> None:
                         json.dump(ab_res.telemetry, fh, indent=2, default=str)
                 except Exception:                  # pragma: no cover - telemetry only
                     pass
+                # CF-5: opt-in verbose controller trace. Default OFF => byte-identical
+                # (nothing below runs, controller_trace is not imported). Advisory only:
+                # a write/format error is logged and swallowed, never stopping the run.
+                if args.controller_verbose:
+                    try:
+                        from protein_chisel.sampling.controller_trace import (
+                            TRACE_COLUMNS, controller_trace_rows,
+                            format_controller_report_lines,
+                        )
+                        _axes_by_name = {ax.name: ax for ax in ab_axes}
+                        _trace_rows = controller_trace_rows(
+                            ab_res.outcomes, _axes_by_name,
+                            cycle_idx=cyc.cycle_idx,
+                            temperature=cyc.sampling_temperature,
+                        )
+                        # append-only long-format TSV at the RUN ROOT (one row per axis
+                        # per cycle across the whole run); header written once.
+                        _trace_tsv = run_dir / "controller_trace.tsv"
+                        _need_header = not _trace_tsv.exists()
+                        with open(_trace_tsv, "a") as _tfh:
+                            if _need_header:
+                                _tfh.write("\t".join(TRACE_COLUMNS) + "\n")
+                            for _row in _trace_rows:
+                                _tfh.write("\t".join(
+                                    str(_row[_c]) for _c in TRACE_COLUMNS) + "\n")
+                        LOGGER.info("cycle %d CONTROLLER REPORT (T=%.3f):",
+                                    cyc.cycle_idx, cyc.sampling_temperature)
+                        for _line in format_controller_report_lines(_trace_rows):
+                            LOGGER.info("%s", _line)
+                    except Exception:              # pragma: no cover - advisory only
+                        LOGGER.exception(
+                            "cycle %d controller_verbose trace failed (advisory; "
+                            "run continues)", cyc.cycle_idx)
                 _open = [o.name for o in ab_res.outcomes if o.gate_open]
                 LOGGER.info("cycle %d adaptive controller: axes_active=%s global=%s "
                             "surface_positions=%d", cyc.cycle_idx, _open or "none",
