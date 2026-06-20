@@ -5601,6 +5601,13 @@ def main() -> None:
             "MPNN's structure-conditioned logits (collapse to PLM "
             "consensus). Typical range 0.5-2.0.", args.plm_strength,
         )
+    # Seed-triage thresholds: GRAVY any finite value; fractions in (0, 1] (codex).
+    if not math.isfinite(args.plm_autoskip_gravy):
+        p.error("--plm_autoskip_gravy must be finite")
+    for _tname, _tval in (("--plm_autoskip_max_aa_frac", args.plm_autoskip_max_aa_frac),
+                          ("--plm_autoskip_hydrophobic_frac", args.plm_autoskip_hydrophobic_frac)):
+        if not (math.isfinite(_tval) and 0.0 < _tval <= 1.0):
+            p.error(f"{_tname} must be a fraction in (0, 1], got {_tval}")
     debug_short_test_override_msg = None
     if args.debug_short_test:
         if args.target_k != 5 or args.cycles != 3:
@@ -5923,11 +5930,14 @@ def main() -> None:
     # LigandMPNN regenerates from structure + fixed residues. Default OFF => the fusion
     # below is byte-identical (imports + work happen only inside the opt-in branch).
     if args.plm_autoskip_bad_input:
-        from protein_chisel.sampling.seed_triage import assess_seed, should_skip_plm
-        from protein_chisel.io.pdb import extract_sequence as _triage_extract_seq
-        from protein_chisel.filters.protparam import protparam_metrics as _triage_ppm
-        _seed_assessment = None
+        # ALL imports + work inside the try so a missing dep (e.g. Biopython for
+        # protparam) degrades to "no skip" rather than crashing the run (codex).
+        _triage_skip = False
+        _triage_reasons = ""
         try:
+            from protein_chisel.sampling.seed_triage import assess_seed, should_skip_plm
+            from protein_chisel.io.pdb import extract_sequence as _triage_extract_seq
+            from protein_chisel.filters.protparam import protparam_metrics as _triage_ppm
             _triage_seq = _triage_extract_seq(args.seed_pdb, chain=CHAIN)
             _triage_gravy = float(_triage_ppm(
                 _triage_seq, ph=args.design_ph,
@@ -5937,15 +5947,18 @@ def main() -> None:
                 gravy_max=args.plm_autoskip_gravy,
                 max_aa_frac=args.plm_autoskip_max_aa_frac,
                 hydrophobic_frac_max=args.plm_autoskip_hydrophobic_frac)
+            if should_skip_plm(_seed_assessment, enabled=True,
+                               current_plm_strength=args.plm_strength):
+                _triage_skip = True
+                _triage_reasons = "; ".join(_seed_assessment.reasons)
         except Exception as _triage_exc:               # advisory; never crash the run
             LOGGER.warning("seed triage skipped (%s)", _triage_exc)
-        if should_skip_plm(_seed_assessment, enabled=True,
-                           current_plm_strength=args.plm_strength):
+        if _triage_skip:
             LOGGER.warning(
                 "SEED TRIAGE: input scaffold is pathological (%s) -> forcing "
                 "--plm_strength %.2f -> 0.0 (PLM bias would amplify the seed; "
                 "LigandMPNN regenerates from structure + fixed residues).",
-                "; ".join(_seed_assessment.reasons), args.plm_strength)
+                _triage_reasons, args.plm_strength)
             args.plm_strength = 0.0
     fusion_cfg = FusionConfig(global_strength=args.plm_strength)
     if _plm_class_overrides:
