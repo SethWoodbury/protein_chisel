@@ -16,6 +16,17 @@ was built TDD-first and put through independent review (codex + ≥1 subagent), 
 planned-but-redundant/unsound levers (the WS-D composition & SAP axes, the WS-E anti-repeat &
 plm_off_mode, the WS-F driver activation) with documented reasons. Host suite: 809 passed.
 
+### Fixed — graded-clash bias Lys/Arg symmetry (⚠️ behavior change, NOT byte-identical vs 1.0.0)
+- The always-on `compute_graded_clash_bias` call site passed `bulky_aas="YFWHMR"`, dropping **Lys**
+  while keeping **Arg** — even though the function's own default was `"YFWHMRK"` and K/R are the same
+  length tier (Cb→NZ ~5.5 Å, Cb→CZ ~6 Å). K can collide with a fixed catalytic atom just as R can, so
+  it now gets the same graded clash down-weight. Both the function default and the call site reference a
+  single `_CLASH_BULKY_AAS = "YFWHMRK"` constant (guard-tested) so they cannot drift apart again. **This
+  is the one intentional exception to the "byte-identical default" rule above:** the clash bias has no
+  flag, and `base_bias = base_bias + clash_bias` is the fusion baseline carried into *every* cycle (not
+  just cycle 0), so this shifts design output at clash-prone positions where Lys was previously
+  un-penalised. Folded into the unreleased 1.1.0. Companion to the WS-G bulky-set fix.
+
 ### Added — WS-G omit tunnel-lining (opt-in/experimental, default OFF, byte-identical)
 - **`--omit_tunnel_lining` (+ `--omit_tunnel_lining_aas`, default `FHKRWY`) / `OMIT_TUNNEL_LINING` /
   `OMIT_TUNNEL_LINING_AAS`** — hard-omit bulky/aromatic AAs at the seed's tunnel-lining positions to

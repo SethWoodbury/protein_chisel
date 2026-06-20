@@ -693,6 +693,23 @@ def test_read_seed_tunnel_lining_missing_or_empty_is_empty_set(tmp_path):
     assert idz._read_seed_tunnel_lining(empty) == set()
 
 
+def test_clash_bulky_set_includes_lysine_symmetric_with_arg():
+    """The always-on graded-clash bias must treat Lys and Arg symmetrically: both
+    are long (Cb->NZ ~5.5/6.0 A) and can clash with fixed catalytic atoms. A prior
+    call site passed 'YFWHMR' (dropping K while keeping R); the shared
+    _CLASH_BULKY_AAS constant is now used by BOTH the function default and the call
+    site so they cannot diverge again."""
+    import inspect
+    assert idz._CLASH_BULKY_AAS == "YFWHMRK"
+    assert "K" in idz._CLASH_BULKY_AAS and "R" in idz._CLASH_BULKY_AAS
+    # function default uses the shared constant
+    assert inspect.signature(
+        idz.compute_graded_clash_bias).parameters["bulky_aas"].default == idz._CLASH_BULKY_AAS
+    # regression: the K-dropping literal must not reappear anywhere in the driver
+    src = (REPO / "scripts" / "iterative_design.py").read_text()
+    assert '"YFWHMR"' not in src and "'YFWHMR'" not in src
+
+
 def test_ws_g_default_constant_matches_throat_bulky_set():
     """The driver's tunnel-lining omit default is a guard-tested literal (NOT an
     import-time call), so arg-parsing never imports protein_chisel — but it MUST

@@ -82,6 +82,13 @@ DEFAULT_CATRES = (60, 64, 128, 131, 132, 157)
 CATALYTIC_HIS_RESNOS = (60, 64, 128, 132)
 CHAIN = "A"
 
+# Bulky AAs for the always-on graded-clash bias (compute_graded_clash_bias).
+# Long/aromatic side chains that can collide with a fixed catalytic atom: aromatics
+# Y/F/W/H, long aliphatic M, and the long charged R AND K. K and R are the same
+# length tier (Cb->NZ ~5.5 A / Cb->CZ ~6 A), so they must be treated symmetrically —
+# shared here so the function default and its call site cannot drift apart.
+_CLASH_BULKY_AAS = "YFWHMRK"
+
 # --metrics objective-gating filter (add-on #7). Set once in main() from the
 # resolved metric selection: a frozenset of multi_objective labels to keep in the
 # TOPSIS basket, or None for "no gating" (the default --metrics all => byte-identical
@@ -651,7 +658,7 @@ def compute_graded_clash_bias(
         "first_shell", "buried",                                  # legacy
         "primary_sphere", "secondary_sphere", "distal_buried",    # new
     ),
-    bulky_aas: str = "YFWHMRK",   # K is as long as R (Cb->NZ ~6 A)
+    bulky_aas: str = _CLASH_BULKY_AAS,   # K is as long as R (Cb->NZ ~6 A)
     # Per-AA bias = -bias_strength_per_pct_clash * clash_pct.
     # Crude 9-stub rotamer grid produces small clash percentages
     # (typically 0.1-0.3), so we need a high strength to give a
@@ -672,10 +679,11 @@ def compute_graded_clash_bias(
 
         bias[i, j] -= bias_strength_per_pct_clash * clash_fraction
 
-    Result: positions where Y/F/W literally have no fitting rotamer
-    get -3 nats; positions where they fit fine get 0; in-between get
-    proportional. Replaces the previous all-or-nothing hard-omit which
-    forbade Y/F/W/H/M at every clash-prone position even when they fit.
+    Result: positions where a bulky AA has no fitting rotamer get the full
+    ``-bias_strength_per_pct_clash`` (−20 nats at the default strength=20);
+    positions where they fit fine get 0; in-between get proportional. Replaces
+    the previous all-or-nothing hard-omit which forbade the bulky set at every
+    clash-prone position even when they fit.
 
     Returns (bias_matrix, telemetry_dict). bias_matrix is shape (L, 20)
     in PLM_AA_ORDER ('ACDEFGHIKLMNPQRSTVWY').
@@ -6142,7 +6150,7 @@ def main() -> None:
     # no (clash-prone-pos, bulky-AA) pair has >50% clashing rotamers in
     # a 9-rotamer grid stub, so the previous hard-omit was unjustified.
     # Now: add a per-position per-AA bias proportional to the clash %
-    # to the base PLM-fusion bias (max -3 nats at 100% clash, 0 at 0%).
+    # to the base PLM-fusion bias (max -20 nats at 100% clash, 0 at 0%).
     # MPNN can still pick a "clash-prone" AA when other context strongly
     # favors it; the filter-time severe-clash check (1.5 A) catches the
     # remaining hard failures.
@@ -6152,13 +6160,13 @@ def main() -> None:
         fixed_resnos=DEFAULT_CATRES,
         chain=CHAIN,
         cb_clearance_threshold=5.0,
-        bulky_aas="YFWHMR",
+        bulky_aas=_CLASH_BULKY_AAS,
     )
     LOGGER.info(
         "graded clash bias: %d positions biased, mean magnitude=%.3f nats",
         clash_telem["n_positions_biased"], float(np.abs(clash_bias).mean()),
     )
-    base_bias = base_bias + clash_bias   # added to the cycle-0 fusion bias
+    base_bias = base_bias + clash_bias   # fusion baseline, carried into every cycle
     omit_AA_per_residue = expression_omit
     # ---- WS-G: opt-in tunnel-lining hard-omit (merged ONLY when on) -----------
     # Merge only inside the `if` so a no-flag run leaves expression_omit byte-for-byte
