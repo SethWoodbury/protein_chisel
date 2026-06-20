@@ -532,6 +532,20 @@ if [[ "${OMIT_TUNNEL_LINING:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$
     [[ -n "${OMIT_TUNNEL_LINING_AAS:-}" ]] && WS_E_CLI+=( --omit_tunnel_lining_aas "$OMIT_TUNNEL_LINING_AAS" )
 fi
 
+# Seed triage (opt-in; unset => byte-identical):
+#   PLM_AUTOSKIP_BAD_INPUT=1   force --plm_strength 0 when the INPUT scaffold is
+#                              pathologically hydrophobic / over-represented, so MPNN
+#                              regenerates without the PLM bias amplifying the bad seed.
+#   PLM_AUTOSKIP_GRAVY / PLM_AUTOSKIP_MAX_AA_FRAC / PLM_AUTOSKIP_HYDROPHOBIC_FRAC
+#                              triage thresholds (driver defaults 0.4 / 0.16 / 0.50).
+PLM_AUTOSKIP_CLI=()
+if [[ "${PLM_AUTOSKIP_BAD_INPUT:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]]; then
+    PLM_AUTOSKIP_CLI+=( --plm_autoskip_bad_input )
+    [[ -n "${PLM_AUTOSKIP_GRAVY:-}" ]]            && PLM_AUTOSKIP_CLI+=( --plm_autoskip_gravy "$PLM_AUTOSKIP_GRAVY" )
+    [[ -n "${PLM_AUTOSKIP_MAX_AA_FRAC:-}" ]]      && PLM_AUTOSKIP_CLI+=( --plm_autoskip_max_aa_frac "$PLM_AUTOSKIP_MAX_AA_FRAC" )
+    [[ -n "${PLM_AUTOSKIP_HYDROPHOBIC_FRAC:-}" ]] && PLM_AUTOSKIP_CLI+=( --plm_autoskip_hydrophobic_frac "$PLM_AUTOSKIP_HYDROPHOBIC_FRAC" )
+fi
+
 # Decode-time Product-of-Experts backend (Phase: PoE; opt-in). Default 'bias' = the
 # in-process LigandMPNN sampler with our calibrated fusion bias (byte-identical).
 # MPNN_BACKEND=poe runs a SEPARATE HOST stage (nested apptainer is blocked) that
@@ -825,6 +839,7 @@ run_stage3_driver() {
             "${SAP_CORRECTED_CLI[@]}" \
             "${COMPOSITION_CLI[@]}" \
             "${WS_E_CLI[@]}" \
+            "${PLM_AUTOSKIP_CLI[@]}" \
             "$@" \
             ${EXTRA_DRIVER_FLAGS:-}
 }

@@ -5575,6 +5575,20 @@ def main() -> None:
                         "1.5+ for maximum PLM influence (diminishing "
                         "returns; charge SD inflates). Must be ≥ 0; 0.0 "
                         "disables PLM bias entirely.")
+    # ---- Seed triage: opt-in PLM auto-skip on a pathological input (default OFF) ----
+    p.add_argument("--plm_autoskip_bad_input", action="store_true", default=False,
+                   help="Opt-in (default OFF => byte-identical). If the INPUT scaffold is "
+                        "pathologically hydrophobic / over-represented (per the "
+                        "--plm_autoskip_* thresholds), force --plm_strength to 0 for the "
+                        "run, so LigandMPNN regenerates from structure + fixed residues "
+                        "instead of the PLM bias amplifying the bad seed. Empirically on a "
+                        "GRAVY=1.34 seed this took GRAVY->-0.5 and Ala 27%%->0.5%%.")
+    p.add_argument("--plm_autoskip_gravy", type=float, default=0.4, metavar="G",
+                   help="Seed-triage GRAVY ceiling (default 0.4; trips above it).")
+    p.add_argument("--plm_autoskip_max_aa_frac", type=float, default=0.16, metavar="F",
+                   help="Seed-triage single-AA fraction ceiling (default 0.16).")
+    p.add_argument("--plm_autoskip_hydrophobic_frac", type=float, default=0.50, metavar="F",
+                   help="Seed-triage hydrophobic-fraction ceiling (default 0.50).")
     args = p.parse_args()
     if not math.isfinite(args.plm_strength):
         p.error("--plm_strength must be finite")
@@ -5902,6 +5916,37 @@ def main() -> None:
         _plm_class_overrides = _parse_plm_class_strength(args.plm_class_strength)
     except ValueError as _exc:
         raise SystemExit(str(_exc))
+    # ---- Seed triage (opt-in): drop the PLM bias on a pathological input scaffold ----
+    # The PLM fusion is conditioned on the seed; on a hydrophobic / over-represented
+    # scaffold it AMPLIFIES the bad composition (a near-lock at low T). When enabled and
+    # the seed trips the triage, force plm_strength -> 0 BEFORE building the fusion so
+    # LigandMPNN regenerates from structure + fixed residues. Default OFF => the fusion
+    # below is byte-identical (imports + work happen only inside the opt-in branch).
+    if args.plm_autoskip_bad_input:
+        from protein_chisel.sampling.seed_triage import assess_seed, should_skip_plm
+        from protein_chisel.io.pdb import extract_sequence as _triage_extract_seq
+        from protein_chisel.filters.protparam import protparam_metrics as _triage_ppm
+        _seed_assessment = None
+        try:
+            _triage_seq = _triage_extract_seq(args.seed_pdb, chain=CHAIN)
+            _triage_gravy = float(_triage_ppm(
+                _triage_seq, ph=args.design_ph,
+                n_term_pad=args.n_term_pad, c_term_pad=args.c_term_pad).gravy)
+            _seed_assessment = assess_seed(
+                _triage_seq, _triage_gravy,
+                gravy_max=args.plm_autoskip_gravy,
+                max_aa_frac=args.plm_autoskip_max_aa_frac,
+                hydrophobic_frac_max=args.plm_autoskip_hydrophobic_frac)
+        except Exception as _triage_exc:               # advisory; never crash the run
+            LOGGER.warning("seed triage skipped (%s)", _triage_exc)
+        if should_skip_plm(_seed_assessment, enabled=True,
+                           current_plm_strength=args.plm_strength):
+            LOGGER.warning(
+                "SEED TRIAGE: input scaffold is pathological (%s) -> forcing "
+                "--plm_strength %.2f -> 0.0 (PLM bias would amplify the seed; "
+                "LigandMPNN regenerates from structure + fixed residues).",
+                "; ".join(_seed_assessment.reasons), args.plm_strength)
+            args.plm_strength = 0.0
     fusion_cfg = FusionConfig(global_strength=args.plm_strength)
     if _plm_class_overrides:
         fusion_cfg.class_weights.update(_plm_class_overrides)

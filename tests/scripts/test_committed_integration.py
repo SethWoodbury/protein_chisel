@@ -710,6 +710,35 @@ def test_clash_bulky_set_includes_lysine_symmetric_with_arg():
     assert '"YFWHMR"' not in src and "'YFWHMR'" not in src
 
 
+def test_iterative_design_help_advertises_seed_triage_flags():
+    proc = subprocess.run(
+        [sys.executable, "scripts/iterative_design.py", "--help"],
+        cwd=str(REPO), env={**os.environ, "PYTHONPATH": "src"},
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    for flag in ("--plm_autoskip_bad_input", "--plm_autoskip_gravy",
+                 "--plm_autoskip_max_aa_frac", "--plm_autoskip_hydrophobic_frac"):
+        assert flag in proc.stdout
+
+
+@pytest.mark.parametrize("value, on", [("0", False), ("false", False), ("", False),
+                                       ("1", True), ("on", True)])
+def test_shell_plm_autoskip_truthiness(value, on):
+    script = (
+        'PLM_AUTOSKIP_CLI=()\n'
+        f'if [[ "${{PLM_AUTOSKIP_BAD_INPUT:-0}}" =~ {_SHELL_TRUTHY_RE} ]]; then\n'
+        '  PLM_AUTOSKIP_CLI+=( --plm_autoskip_bad_input )\n'
+        'fi\n'
+        'echo "${PLM_AUTOSKIP_CLI[@]}"\n'
+    )
+    proc = subprocess.run(["bash", "-c", script],
+                          env={**os.environ, "PLM_AUTOSKIP_BAD_INPUT": value},
+                          capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    assert ("--plm_autoskip_bad_input" in proc.stdout) is on
+
+
 def test_ws_g_default_constant_matches_throat_bulky_set():
     """The driver's tunnel-lining omit default is a guard-tested literal (NOT an
     import-time call), so arg-parsing never imports protein_chisel — but it MUST

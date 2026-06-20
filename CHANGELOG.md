@@ -3,7 +3,27 @@
 All notable changes to **protein_chisel** are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions use semver.
 
-## [Unreleased]
+## [Unreleased] — diverse-backbone effectiveness (post-1.1.0, opt-in, byte-identical)
+
+Root-cause work after cluster validation revealed two reasons steering under-performed on
+hydrophobic seeds: (1) **bias mis-scaling** — LigandMPNN samples `softmax((logits+bias)/T)`,
+so a bias of `b` nats shifts odds by `exp(b/T)`; at T≈0.15 the PLM fusion (~1.36 nats) is an
+~8,700× *lock* while the charge controller (~0.6 nats, ~55×) is dwarfed (independent codex +
+subagent audit). (2) the composition correctors are gated behind survivors that never exist
+when the GRAVY band rejects 100% of samples. Empirically, dropping the PLM (`plm_strength=0`)
+on a GRAVY=1.34 seed took **GRAVY → −0.50, Ala 27% → 0.5%, hydrophobic 66% → 32%**, and
+survivors finally appeared so the composition cap fired.
+
+### Added — seed triage: opt-in PLM auto-skip on a pathological input (`--plm_autoskip_bad_input`)
+- New pure, reference-free `sampling/seed_triage.py` (`assess_seed` + `should_skip_plm`): flags an
+  input scaffold as pathological when GRAVY > `--plm_autoskip_gravy` (0.4), any single AA ≥
+  `--plm_autoskip_max_aa_frac` (0.16), or hydrophobic fraction > `--plm_autoskip_hydrophobic_frac`
+  (0.50). When `--plm_autoskip_bad_input` is set (+ env `PLM_AUTOSKIP_BAD_INPUT=1`) and the seed
+  trips, the driver forces `plm_strength → 0` **before** building the fusion, so LigandMPNN
+  regenerates from structure + fixed residues instead of the PLM amplifying the bad seed. Default
+  OFF → byte-identical (imports + work happen only inside the opt-in branch; `--help` needs no PLM).
+- New `sampling/bias_scale.py` (`nats_for_odds = T·ln(M)`, `odds_for_nats = exp(b/T)`, odds
+  vocabulary) — the temperature-invariant foundation for the upcoming bias recalibration.
 
 ## [1.1.0] — 2026-06-18 — Solubility-steering overhaul (8 opt-in workstreams, byte-identical default)
 
