@@ -153,6 +153,56 @@ Defaults from `FusionConfig` in `src/protein_chisel/sampling/plm_fusion.py`:
 
 A small **graded clash bias** (`compute_graded_clash_bias`) is added to the fusion bias before cycle 0: for each `(clash-prone position, bulky AA ∈ {Y,F,W,H,M,R,K})` pair, sample a 9-rotamer χ1×χ2 stub grid, count what fraction lands within 2.0 Å of any fixed-residue sidechain heavy atom, and subtract `20 · clash_fraction` nats from the corresponding bias entry. Replaces a previous all-or-nothing hard-omit that over-suppressed positions where the bulky AA actually fit. (Lys is included alongside Arg — both reach ~5.5–6 Å, so they're treated symmetrically.)
 
+## Adaptive-controller framework & odds-space bias scaling
+
+All steering — PLM fusion, consensus reinforcement, class balance, the adaptive
+solubility controller, the composition levers — composes as **additive logit bias**
+that MPNN folds into its per-position softmax. The design synthesis is
+`docs/plans/controller_framework.md`; the shipped closed-loop controller is documented
+in `docs/adaptive_bias.md`. This section records the one principle that governs how all
+of these knobs *scale*.
+
+### The odds-space scaling principle (why CF-1 exists)
+
+MPNN samples each position from `softmax((logits + bias) / T)`, where `T` is the
+per-cycle sampling temperature (the annealing schedule lowers it toward ~0.15). Adding
+`bias` nats to a cell therefore multiplies that AA's **odds** by `exp(bias / T)`, not by
+a fixed factor:
+
+```
+odds_shift = exp(bias / T)        # nats_for_odds(M, T) = T · ln(M)
+```
+
+The temperature is in the *denominator*, so a clamp expressed in **fixed nats silently
+tracks the schedule**: the adaptive controller's default `max_nats = 0.6` is only
+`exp(0.6/0.15) ≈ 55×` at `T = 0.15` but a much weaker shift at higher `T`, while the
+PLM-fusion peak (~1.36 nats) is `exp(1.36/0.15) ≈ 8700×` and the additive stack
+(PLM + consensus + clash + …) **multiplies in odds space** to ~10¹³× — locking cells and
+collapsing diversity. A nats-space budget is thus not a stable notion of "authority".
+
+The fix is to express clamps in **odds space**: `--adaptive_bias_max_odds X` (CF-1) sets
+`max_nats := T · ln(X)` *each cycle*, so the controller's odds authority is `X`-fold
+regardless of where the annealing schedule has `T` (helpers `nats_for_odds` /
+`odds_for_nats` live in `src/protein_chisel/sampling/bias_scale.py`). The same arithmetic
+explains the `--composition_soft_bias_nats` help text (a 0.5-nat penalty is ~12–28× at
+`T ≈ 0.15–0.20`) and motivates the `--bias_total_clamp` overflow guard on the combined
+effective bias. `--controller_verbose` (CF-5) logs each axis's `effective_odds = exp(u/T)`
+to `controller_trace.tsv` so this can be validated cycle-by-cycle.
+
+### Seed triage (`--plm_autoskip_bad_input`)
+
+The PLM fusion is **conditioned on the seed** structure/sequence, so on a pathologically
+hydrophobic or over-represented input it *amplifies* the bad composition rather than
+fixing it — and per the principle above, at `T = 0.15` a ~1.36-nat fusion peak is a
+~8700× lock, effectively pinning the seed's residue choices. Seed triage detects such an
+input up front (GRAVY / single-AA fraction / hydrophobic fraction over the
+`--plm_autoskip_*` ceilings, defaults `0.4 / 0.16 / 0.50`) and, when `--plm_autoskip_bad_input`
+is set, **forces `--plm_strength` to 0 for the whole run** so LigandMPNN regenerates from
+structure + fixed residues instead of inheriting the seed's composition. Verified on a
+`GRAVY = 1.34` seed: GRAVY → −0.5, Ala 27% → 0.5%. This is the seed-quality counterpart
+to the (surface-only) adaptive controller, which can steer the surface but cannot make a
+hydrophobic *fold* soluble. Implementation: `src/protein_chisel/sampling/seed_triage.py`.
+
 ## Multi-objective TOPSIS ranking
 
 `src/protein_chisel/scoring/multi_objective.py` provides:

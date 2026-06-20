@@ -2,8 +2,11 @@
 
 Reference for every flag accepted by
 `/home/woodbuse/codebase_projects/protein_chisel/scripts/iterative_design.py`.
-Defaults reflect the source on `main` as of 2026-05-04. Source of truth:
-`scripts/iterative_design.py`, lines 2536–2725.
+Defaults reflect the source on `main` as of 2026-05-04; the opt-in
+solubility-steering / controller flags in §13 were added on
+`feat/solubility-steering` (2026-06). Source of truth: the `argparse` block in
+`scripts/iterative_design.py` and the env passthrough in
+`scripts/run_chisel_design.sh`. Always defer to the live `--help` if it disagrees.
 
 Run via:
 
@@ -277,6 +280,107 @@ PYTHONPATH=src:scripts python scripts/iterative_design.py \
 - **Description:** Comma-separated severity overrides for expression rules. SEVERITY ∈ `{WARN_ONLY, SOFT_BIAS, HARD_OMIT, HARD_FILTER}`.
 - **Change when:** want to demote (`WARN_ONLY`) or promote (`HARD_FILTER`) a specific rule for a specific run.
 - **Example:** `--expression_overrides kr_neighbor_dibasic=HARD_OMIT,polyproline_stall=WARN_ONLY`
+
+---
+
+## 13. Opt-in solubility steering & adaptive controller
+
+Every flag in this section is **opt-in and OFF/None by default → byte-identical to
+the legacy pipeline when unset**. Each has an environment-variable equivalent honored
+by `scripts/run_chisel_design.sh` (truthy on `1/true/yes/on`, case-insensitive; value
+knobs forwarded only when set). See `docs/architecture.md` (adaptive-controller
+framework + odds-space scaling, seed triage) and the design synthesis in
+`docs/plans/controller_framework.md`.
+
+### `--catalytic_resnos` (str `R1,R2,...`) — env `CATALYTIC_RESNOS`
+- **Default:** `None`.
+- **Description:** Comma-separated 1-indexed catalytic resnos (chain A) to fix/protect, e.g. `'41,64,187'`. Resolution priority is **this flag > the seed PDB's `REMARK 666` motif block > the hard-coded PTE_i1 builtin (`60,64,128,131,132,157`)**. When it falls through to the builtin (no override AND no REMARK 666) it emits a **loud warning** naming the PTE residues as almost certainly wrong for a non-PTE scaffold. Set this for ANY non-PTE scaffold whose seed lacks REMARK 666 — otherwise the run pins the wrong residues.
+- **Change when:** designing on any non-PTE scaffold whose seed PDB has no REMARK 666 block.
+- **Example:** `--catalytic_resnos '41,64,187'` / `CATALYTIC_RESNOS='41,64,187'`
+
+### `--ship_solubility_veto` (flag) — env `SHIP_SOLUBILITY_VETO` (WS-A)
+- **Default:** off.
+- **Description:** When set, the final top-K writer drops any design **outside the final-cycle GRAVY + net-charge band** before shipping, so the deferred-rescue / backfill path can never ship a seq-filter-failing design (e.g. `GRAVY=1.05`) as rank-0. May ship **fewer than `--target_k`** (intended). Adds a truthful `selection__solubility_passed` column (distinct from `selection__hard_final_filter_passed`, which is the fpocket-druggability gate).
+- **Change when:** you need a hard guarantee that no out-of-band design ships, even at the cost of a smaller shortlist.
+- **Example:** `--ship_solubility_veto` / `SHIP_SOLUBILITY_VETO=1`
+
+### `--sap_corrected` (flag) — env `SAP_CORRECTED` (WS-B)
+- **Default:** off.
+- **Description:** Additionally emits `sap_corr_{max,mean,p95}` columns on per-cycle designs — a centered, polar-cancellation-free SAP (shared `scoring.sap` module) that, unlike the legacy signed-Kyte-Doolittle `sap_*`, **registers alanine-rich hydrophobic surfaces and is not cancelled by exposed polar residues**. The legacy `sap_*` columns are unchanged. Rescued/backfill rows carry `NaN` for `sap_corr_*` (they are not re-scored).
+- **Change when:** you want a hydrophobic-patch metric that catches Ala-rich surfaces the legacy SAP misses.
+- **Example:** `--sap_corrected` / `SAP_CORRECTED=1`
+
+### `--composition_suppress_all_overrep` (flag) — env `COMPOSITION_SUPPRESS_ALL_OVERREP` (WS-C)
+- **Default:** off.
+- **Description:** In the per-cycle class-balanced `bias_AA`, down-weight **every** over-represented member of an AA class (`z > --balance_z_threshold`), not just the single class maximum. Without it, when Alanine is the hydrophobic-class max an also-over-represented Leucine escapes correction. The property-conserving within-class swap up-weight is preserved.
+- **Change when:** a single class has multiple over-represented members and you want all of them suppressed.
+- **Example:** `--composition_suppress_all_overrep` / `COMPOSITION_SUPPRESS_ALL_OVERREP=1`
+
+### `--aa_fraction_cap` (float `FRAC` in `(0, 1]`) — env `AA_FRACTION_CAP` (WS-C)
+- **Default:** `None`.
+- **Description:** Hard-omit any amino acid whose fraction in a cycle's survivor pool is `>= FRAC` (e.g. `0.15`) at every non-fixed designable position in the next cycle, bounding runaway single-AA over-representation (the 26%-Ala failure mode). **Recomputed per cycle**, so an AA is re-allowed once it falls back under the cap. A cap so low it would omit nearly every AA for a low-diversity pool is **skipped that cycle with an ERROR** (it never over-constrains the sampler).
+- **Change when:** you want a hard ceiling on any one residue's pool fraction.
+- **Example:** `--aa_fraction_cap 0.15` / `AA_FRACTION_CAP=0.15`
+
+### `--composition_soft_bias` (flag) — env `COMPOSITION_SOFT_BIAS` (WS-C)
+- **Default:** off.
+- **Description:** Activates the expression engine's per-residue `SOFT_BIAS` tier (long-hydrophobic-stretch, KR-near-catalytic-on-helix, polyproline, repetitive-segment, …): adds a negative per-`(position, AA)` bias at those sites to every cycle's sampler bias. **Pool-derived per cycle** — the engine is re-evaluated on the survivors and a liability is applied only if it recurs in `>=` half of them, so it tracks the liabilities the designs actually introduce; the seed map bootstraps cycle 0. Whole-protein composition hits are excluded (those are the suppress-all / fraction-cap levers' job).
+- **Change when:** you want sequence-liability motifs steered against at sampling, not just filtered after.
+- **Example:** `--composition_soft_bias` / `COMPOSITION_SOFT_BIAS=1`
+
+### `--composition_soft_bias_nats` (float, nats) — env `COMPOSITION_SOFT_BIAS_NATS` (WS-C)
+- **Default:** `0.5`.
+- **Description:** Down-weight magnitude applied at each `SOFT_BIAS (position, AA)` cell when `--composition_soft_bias` is set. The bias is added in **logit space** (before the softmax temperature divide), so the effective odds penalty is `exp(nats / T)`: at `T≈0.15–0.20` a 0.5-nat bias is ~12–28× (a firm nudge), whereas 1.5 would be ~1800–22000× (a near-hard ban). Keep it near the adaptive controller's ~0.6 clamp. No effect unless `--composition_soft_bias`.
+- **Change when:** tuning how firmly the SOFT_BIAS tier nudges (lower = gentler).
+- **Example:** `--composition_soft_bias_nats 0.7` / `COMPOSITION_SOFT_BIAS_NATS=0.7`
+
+### `--omit_tunnel_lining` (flag) — env `OMIT_TUNNEL_LINING` (WS-G)
+- **Default:** off (experimental).
+- **Description:** Hard-omit bulky AAs (`--omit_tunnel_lining_aas`) at the seed's tunnel-lining positions (`is_tunnel_lining`) to keep the substrate channel open from cycle 0. Complementary to the soft, reactive throat-feedback bias; a permanent hard ban is blunter, so this is off by default. Catalytic/fixed positions are never omitted.
+- **Change when:** the substrate channel keeps collapsing and the soft throat-feedback bias isn't enough.
+- **Example:** `--omit_tunnel_lining` / `OMIT_TUNNEL_LINING=1`
+
+### `--omit_tunnel_lining_aas` (str `AAS`) — env `OMIT_TUNNEL_LINING_AAS` (WS-G)
+- **Default:** `FHKRWY` (the throat's bulky-blocker set, `tunnel_metrics._BLOCKER_WEIGHT >= 0.70`).
+- **Description:** AAs to hard-omit at tunnel-lining positions when `--omit_tunnel_lining` is set. The default = aromatics W/F/Y/H plus the long charged R/K (Lys Cβ→NZ ~5.5 Å, Arg ~6 Å — genuine channel constrictors, same set as the throat-feedback bias). The medium hydrophobics I/L/M/V are deliberately left to the throat controller's capped/decaying pressure; Ala can't constrict. No effect unless `--omit_tunnel_lining`.
+- **Change when:** you want a different channel-blocker set than the bulky default.
+- **Example:** `--omit_tunnel_lining_aas WFYH` / `OMIT_TUNNEL_LINING_AAS=WFYH`
+
+### `--plm_autoskip_bad_input` (flag) — env `PLM_AUTOSKIP_BAD_INPUT` (seed triage)
+- **Default:** off.
+- **Description:** If the **input scaffold** is pathologically hydrophobic / over-represented (per the `--plm_autoskip_*` thresholds below), **force `--plm_strength` to 0 for the whole run** so LigandMPNN regenerates from structure + fixed residues instead of the PLM bias amplifying the bad seed. The PLM fusion is conditioned on the seed, so on a hydrophobic seed it would otherwise amplify the bad composition (a ~1.36-nat fusion peak is a ~8700× lock at `T=0.15`). Empirically on a `GRAVY=1.34` seed this took GRAVY → −0.5 and Ala 27% → 0.5%.
+- **Change when:** running on scaffolds that may be pathologically hydrophobic and you want automatic PLM bypass on the bad ones.
+- **Example:** `--plm_autoskip_bad_input` / `PLM_AUTOSKIP_BAD_INPUT=1`
+
+### `--plm_autoskip_gravy` (float `G`) — env `PLM_AUTOSKIP_GRAVY` (seed triage)
+- **Default:** `0.4`.
+- **Description:** Seed-triage GRAVY ceiling — the input trips the auto-skip above this value. No effect unless `--plm_autoskip_bad_input`.
+- **Change when:** tuning how hydrophobic a seed must be to trigger the PLM bypass.
+- **Example:** `--plm_autoskip_gravy 0.5` / `PLM_AUTOSKIP_GRAVY=0.5`
+
+### `--plm_autoskip_max_aa_frac` (float `F` in `(0, 1]`) — env `PLM_AUTOSKIP_MAX_AA_FRAC` (seed triage)
+- **Default:** `0.16`.
+- **Description:** Seed-triage single-AA fraction ceiling — an input whose most-frequent residue exceeds this fraction trips the auto-skip. No effect unless `--plm_autoskip_bad_input`.
+- **Change when:** tuning the single-AA over-representation trigger.
+- **Example:** `--plm_autoskip_max_aa_frac 0.20` / `PLM_AUTOSKIP_MAX_AA_FRAC=0.20`
+
+### `--plm_autoskip_hydrophobic_frac` (float `F` in `(0, 1]`) — env `PLM_AUTOSKIP_HYDROPHOBIC_FRAC` (seed triage)
+- **Default:** `0.50`.
+- **Description:** Seed-triage hydrophobic-fraction ceiling — an input whose hydrophobic-residue fraction exceeds this trips the auto-skip. No effect unless `--plm_autoskip_bad_input`.
+- **Change when:** tuning the overall-hydrophobicity trigger.
+- **Example:** `--plm_autoskip_hydrophobic_frac 0.55` / `PLM_AUTOSKIP_HYDROPHOBIC_FRAC=0.55`
+
+### `--adaptive_bias_max_odds` (float `X > 1.0`) — env `ADAPTIVE_BIAS_MAX_ODDS` (CF-1)
+- **Default:** `None` (keeps the raw `--adaptive_bias_max_nats` clamp → byte-identical).
+- **Description:** Clamps the adaptive controller's `|bias|` in **odds space** at `X`-fold instead of in raw nats. It is **temperature-invariant**: each cycle the clamp becomes `max_nats := T·ln(X)`. Because MPNN's odds shift is `exp(bias/T)`, a fixed-nats clamp silently amplifies as `T` anneals; this knob makes the controller's authority invariant to the temperature schedule. Typical `2` (nudge) to `8` (strong). Only takes effect alongside `--adaptive_bias`; the value must be a finite multiplier `> 1.0`.
+- **Change when:** running `--adaptive_bias` and you want a stable controller authority across the annealing schedule rather than a raw-nats clamp that tracks `T`.
+- **Example:** `--adaptive_bias --adaptive_bias_max_odds 8` / `ADAPTIVE_BIAS=1 ADAPTIVE_BIAS_MAX_ODDS=8`
+
+### `--controller_verbose` (flag) — env `CONTROLLER_VERBOSE` (CF-5)
+- **Default:** off.
+- **Description:** With `--adaptive_bias`, after each cycle append one row per axis to `<run_dir>/controller_trace.tsv` (long format: cycle, axis, scope, measured vs target/band, signed_error, gate + why, drive `u`, `effective_odds = exp(u/T)`, n) and emit a per-cycle **CONTROLLER REPORT** to the log, for step-by-step chronological validation. **Advisory only** — a trace write error never stops the run. No effect without `--adaptive_bias`.
+- **Change when:** validating or debugging the adaptive controller cycle-by-cycle.
+- **Example:** `--adaptive_bias --controller_verbose` / `ADAPTIVE_BIAS=1 CONTROLLER_VERBOSE=1`
 
 ---
 
