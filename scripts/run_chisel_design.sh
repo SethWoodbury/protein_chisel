@@ -532,10 +532,14 @@ fi
 
 # WS-E sampling-core safety (opt-in; unset => byte-identical):
 #   BIAS_TOTAL_CLAMP=<nats>          bound the effective bias_k+bias_AA (suggest 3.0)
+#   BIAS_TOTAL_CLAMP_ODDS=<X>        CF-3a: same bound in ODDS space (T-invariant,
+#                                    clamp := T*ln(X) each cycle; suggest 8-100).
+#                                    Mutually exclusive with BIAS_TOTAL_CLAMP.
 #   SAMPLING_TEMPERATURE_FLOOR=<T>   raise any cycle temp to >= T (suggest 0.3)
 #   PLM_CLASS_STRENGTH=<k=v,...>     absolute per-class PLM weight overrides
 WS_E_CLI=()
 [[ -n "${BIAS_TOTAL_CLAMP:-}"          ]] && WS_E_CLI+=( --bias_total_clamp "$BIAS_TOTAL_CLAMP" )
+[[ -n "${BIAS_TOTAL_CLAMP_ODDS:-}"     ]] && WS_E_CLI+=( --bias_total_clamp_odds "$BIAS_TOTAL_CLAMP_ODDS" )
 [[ -n "${SAMPLING_TEMPERATURE_FLOOR:-}" ]] && WS_E_CLI+=( --sampling_temperature_floor "$SAMPLING_TEMPERATURE_FLOOR" )
 [[ -n "${PLM_CLASS_STRENGTH:-}"        ]] && WS_E_CLI+=( --plm_class_strength "$PLM_CLASS_STRENGTH" )
 

@@ -4554,6 +4554,7 @@ def run_cycle(
     composition_soft_bias_nats: float = 0.5,
     expression_soft_bias: Optional[dict[int, str]] = None,
     bias_total_clamp: Optional[float] = None,
+    bias_total_clamp_odds: Optional[float] = None,
     n_term_pad: str = "",
     c_term_pad: str = "",
     omit_M_at_pos1: bool = True,
@@ -4870,19 +4871,38 @@ def run_cycle(
     # above is the un-clamped per-position fusion bias (a diagnostic); the clamp
     # adjusts only what the sampler sees. Parse the FINAL serialized bias_AA so the
     # 2-decimal rounding LigandMPNN actually applies is reflected exactly.
+    #
+    # CF-3a: --bias_total_clamp_odds X expresses the ceiling in temperature-invariant
+    # ODDS space — the per-cell clamp magnitude becomes nats_for_odds(X, T) = T*ln(X)
+    # at THIS cycle's sampling temperature (threaded via cycle_cfg.sampling_temperature),
+    # then runs through the SAME _clamp_bias_total path. The two clamp flags are
+    # mutually exclusive (validated at parse time), so at most one of these is set;
+    # neither set => bias_for_sampling stays bias_k (same object) => byte-identical.
     bias_for_sampling = bias_k
-    if bias_total_clamp is not None:
+    _clamp_nats = bias_total_clamp
+    if bias_total_clamp_odds is not None:
+        from protein_chisel.sampling.bias_scale import nats_for_odds
+        _clamp_nats = nats_for_odds(bias_total_clamp_odds, cycle_cfg.sampling_temperature)
+    if _clamp_nats is not None:
         from protein_chisel.sampling.adaptive_bias import AA_TO_IDX, parse_bias_AA
         _bias_AA_vec = np.zeros(20, dtype=bias_k.dtype)
         for _aa, _v in parse_bias_AA(bias_AA_str).items():
             if _aa in AA_TO_IDX:
                 _bias_AA_vec[AA_TO_IDX[_aa]] = _v
-        bias_for_sampling = _clamp_bias_total(bias_k, bias_total_clamp, _bias_AA_vec)
+        bias_for_sampling = _clamp_bias_total(bias_k, _clamp_nats, _bias_AA_vec)
         n_clamped = int((np.abs(bias_for_sampling - bias_k) > 1e-9).sum())
         if n_clamped:
-            LOGGER.info("cycle %d: bias_total_clamp=%.2f adjusted %d (pos,AA) cells "
-                        "(effective bias_k+bias_AA bounded)",
-                        cycle_cfg.cycle_idx, bias_total_clamp, n_clamped)
+            if bias_total_clamp_odds is not None:
+                LOGGER.info("cycle %d: bias_total_clamp_odds=%.2f (=%.3f nats @ T=%.3f) "
+                            "adjusted %d (pos,AA) cells (effective bias_k+bias_AA "
+                            "bounded to %.2fx odds)",
+                            cycle_cfg.cycle_idx, bias_total_clamp_odds, _clamp_nats,
+                            cycle_cfg.sampling_temperature, n_clamped,
+                            bias_total_clamp_odds)
+            else:
+                LOGGER.info("cycle %d: bias_total_clamp=%.2f adjusted %d (pos,AA) cells "
+                            "(effective bias_k+bias_AA bounded)",
+                            cycle_cfg.cycle_idx, _clamp_nats, n_clamped)
     cand_tsv = stage_sample(
         cycle_cfg=cycle_cfg, seed_pdb=seed_pdb, bias=bias_for_sampling,
         protein_resnos=protein_resnos, fixed_resnos=fixed_resnos,
@@ -5417,6 +5437,16 @@ def main() -> None:
                         "otherwise uncapped; at T≈0.15 that locks a cell near-"
                         "deterministically (~10^13x odds). Suggested production value "
                         "~3.0 (an overflow/stacking guard, not a gentle regularizer).")
+    p.add_argument("--bias_total_clamp_odds", type=float, default=None, metavar="X",
+                   help="CF-3a opt-in (default None => byte-identical). Like "
+                        "--bias_total_clamp but the ceiling is expressed in ODDS space "
+                        "at X-fold: the per-(pos,AA) clamp magnitude becomes "
+                        "nats_for_odds(X, T) = T*ln(X) EACH cycle, so 'no cell's total "
+                        "bias exceeds X-fold odds' holds invariant to the temperature "
+                        "schedule (MPNN samples softmax((logits+bias)/T) so a fixed-nats "
+                        "clamp silently tracks T as it anneals). Mutually exclusive with "
+                        "--bias_total_clamp. Must be > 1.0 (an odds ceiling <=1 is a "
+                        "non-positive clamp). Suggested ~8-100 (a stacking guard).")
     p.add_argument("--sampling_temperature_floor",
                    type=lambda s: _nonneg_finite_arg(s, max_value=2.0), default=None,
                    metavar="T",
@@ -5708,6 +5738,17 @@ def main() -> None:
             math.isfinite(args.adaptive_bias_max_odds) and args.adaptive_bias_max_odds > 1.0):
         p.error("--adaptive_bias_max_odds must be a finite odds multiplier > 1.0 "
                 f"(T*ln(X) must be positive), got {args.adaptive_bias_max_odds}")
+    # CF-3a: odds-space joint bias-total clamp validation. The odds ceiling must be
+    # > 1.0 (T*ln(X) must be a positive clamp), and it is mutually exclusive with the
+    # raw-nats --bias_total_clamp (clearer than a silent precedence between them).
+    if args.bias_total_clamp_odds is not None and not (
+            math.isfinite(args.bias_total_clamp_odds) and args.bias_total_clamp_odds > 1.0):
+        p.error("--bias_total_clamp_odds must be a finite odds multiplier > 1.0 "
+                f"(T*ln(X) must be positive), got {args.bias_total_clamp_odds}")
+    if args.bias_total_clamp is not None and args.bias_total_clamp_odds is not None:
+        p.error("--bias_total_clamp and --bias_total_clamp_odds are mutually exclusive "
+                "(one bounds the total bias in raw nats, the other in odds space); "
+                "set only one.")
     debug_short_test_override_msg = None
     if args.debug_short_test:
         if args.target_k != 5 or args.cycles != 3:
@@ -6645,6 +6686,7 @@ def main() -> None:
             composition_soft_bias_nats=args.composition_soft_bias_nats,
             expression_soft_bias=expression_soft_bias,
             bias_total_clamp=args.bias_total_clamp,
+            bias_total_clamp_odds=args.bias_total_clamp_odds,
             n_term_pad=args.n_term_pad,
             c_term_pad=args.c_term_pad,
             omit_M_at_pos1=not args.no_omit_M_at_pos1,

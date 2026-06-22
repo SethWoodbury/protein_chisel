@@ -1020,3 +1020,125 @@ def test_shell_aa_fraction_cap_value_passthrough():
         capture_output=True, text=True, timeout=30,
     )
     assert unset_proc.stdout.strip() == ""
+
+
+# ----------------------------------------------------------------------------
+# CF-3a: odds-space joint bias-total clamp (opt-in --bias_total_clamp_odds).
+# ----------------------------------------------------------------------------
+#
+# --bias_total_clamp bounds the EFFECTIVE per-(pos,AA) bias in raw NATS, but MPNN
+# samples softmax((logits+bias)/T) so the odds shift is exp(bias/T): a fixed-nats
+# clamp silently tracks the annealing schedule. --bias_total_clamp_odds X expresses
+# the ceiling in temperature-invariant ODDS space — the clamp magnitude each cycle
+# is nats_for_odds(X, T) = T*ln(X), fed through the EXISTING _clamp_bias_total path.
+# Default (neither flag) is byte-identical; the two clamp flags are mutually
+# exclusive. Mirrors the CF-1 --adaptive_bias_max_odds odds-space clamp.
+
+
+def test_bias_total_clamp_odds_equals_nats_for_odds_at_T():
+    """The cycle clamp magnitude that CF-3a applies is exactly nats_for_odds(X, T)
+    = T*ln(X) for a couple of (X, T) — the temperature-invariant odds-space ceiling
+    that --bias_total_clamp_odds promises. (The conversion the run_cycle clamp site
+    performs is this same helper at the cycle temperature.)"""
+    from protein_chisel.sampling.bias_scale import nats_for_odds
+    # (X=8 odds, T=0.15) and (X=10 odds, T=0.20): clamp_nats == T*ln(X).
+    assert nats_for_odds(8.0, 0.15) == pytest.approx(0.15 * math.log(8.0))
+    assert nats_for_odds(10.0, 0.20) == pytest.approx(0.20 * math.log(10.0))
+    # temperature-invariant intent: a lower T yields a proportionally smaller nats
+    # clamp for the SAME odds ceiling (so the odds ceiling itself is T-invariant).
+    assert nats_for_odds(8.0, 0.15) < nats_for_odds(8.0, 0.30)
+
+
+def test_bias_total_clamp_odds_band_clamps_through_existing_path():
+    """Behavioral: feeding the odds-derived nats (nats_for_odds(X, T)) through the
+    EXISTING _clamp_bias_total bounds the effective bias_k+bias_AA to that ±band —
+    i.e. CF-3a reuses the clamp, it does not reimplement one. An X=8 odds ceiling at
+    T=0.15 is ~0.31 nats; a +5-nat stacked cell is pulled to that bound."""
+    from protein_chisel.sampling.bias_scale import nats_for_odds
+    clamp_nats = nats_for_odds(8.0, 0.15)            # ~0.3119 nats
+    bias_k = np.full((4, 20), 5.0, dtype=np.float32)  # absurd stacked lock (~10^14x)
+    bias_AA = np.zeros(20, dtype=np.float32)
+    out = idz._clamp_bias_total(bias_k, clamp_nats, bias_AA)
+    assert np.allclose(out, clamp_nats, atol=1e-5)    # bounded to the odds-derived band
+    assert float(np.max(np.abs(out))) == pytest.approx(clamp_nats, abs=1e-5)
+
+
+def test_iterative_design_help_advertises_bias_total_clamp_odds():
+    """`iterative_design.py --help` (host, PYTHONPATH=src) exits 0 and advertises
+    the opt-in --bias_total_clamp_odds flag."""
+    proc = subprocess.run(
+        [sys.executable, "scripts/iterative_design.py", "--help"],
+        cwd=str(REPO), env={**os.environ, "PYTHONPATH": "src"},
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "--bias_total_clamp_odds" in proc.stdout
+
+
+def test_bias_total_clamp_odds_help_works_without_pythonpath():
+    """CF-3a constraint: --help must exit 0 and show --bias_total_clamp_odds even
+    with PYTHONPATH unset — no new protein_chisel import is added at parse time, so
+    the odds conversion stays inside the opt-in run_cycle branch."""
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    proc = subprocess.run(
+        [sys.executable, "scripts/iterative_design.py", "--help"],
+        cwd=str(REPO), env=env,
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "--bias_total_clamp_odds" in proc.stdout
+
+
+def test_bias_total_clamp_odds_rejects_le_one():
+    """An odds ceiling <= 1 is a non-positive clamp (T*ln(X) <= 0) — parse-time
+    error (mirrors --adaptive_bias_max_odds validation). Runs the real CLI so the
+    argparse-level p.error() path (exit 2) is exercised end-to-end."""
+    for bad in ("1.0", "0.5", "0"):
+        proc = subprocess.run(
+            [sys.executable, "scripts/iterative_design.py",
+             "--bias_total_clamp_odds", bad],
+            cwd=str(REPO), env={**os.environ, "PYTHONPATH": "src"},
+            capture_output=True, text=True, timeout=120,
+        )
+        assert proc.returncode != 0, (bad, proc.stdout)
+        assert "--bias_total_clamp_odds" in proc.stderr
+
+
+def test_bias_total_clamp_and_clamp_odds_are_mutually_exclusive():
+    """Setting BOTH --bias_total_clamp and --bias_total_clamp_odds is a parse-time
+    error (clearer than silent precedence between a nats and an odds ceiling)."""
+    proc = subprocess.run(
+        [sys.executable, "scripts/iterative_design.py",
+         "--bias_total_clamp", "3.0", "--bias_total_clamp_odds", "8.0"],
+        cwd=str(REPO), env={**os.environ, "PYTHONPATH": "src"},
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode != 0, proc.stdout
+    assert "--bias_total_clamp_odds" in proc.stderr
+    assert "--bias_total_clamp" in proc.stderr
+
+
+def test_shell_bias_total_clamp_odds_value_passthrough():
+    """BIAS_TOTAL_CLAMP_ODDS=<X> emits `--bias_total_clamp_odds <X>`; unset emits
+    nothing (byte-identical default). Pins to the shipped run_chisel_design.sh."""
+    snippet = (
+        'WS_E_CLI=()\n'
+        '[[ -n "${BIAS_TOTAL_CLAMP_ODDS:-}" ]] '
+        '&& WS_E_CLI+=( --bias_total_clamp_odds "$BIAS_TOTAL_CLAMP_ODDS" )\n'
+        'echo "${WS_E_CLI[@]}"\n'
+    )
+    assert '[[ -n "${BIAS_TOTAL_CLAMP_ODDS:-}"' in (
+        REPO / "scripts" / "run_chisel_design.sh"
+    ).read_text()
+    set_proc = subprocess.run(
+        ["bash", "-c", snippet],
+        env={**os.environ, "BIAS_TOTAL_CLAMP_ODDS": "8.0"},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert set_proc.stdout.strip() == "--bias_total_clamp_odds 8.0"
+    env_unset = {k: v for k, v in os.environ.items() if k != "BIAS_TOTAL_CLAMP_ODDS"}
+    unset_proc = subprocess.run(
+        ["bash", "-c", snippet], env=env_unset,
+        capture_output=True, text=True, timeout=30,
+    )
+    assert unset_proc.stdout.strip() == ""
