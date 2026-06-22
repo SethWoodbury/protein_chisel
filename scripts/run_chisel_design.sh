@@ -325,6 +325,15 @@ LIG_PARAMS="${LIG_PARAMS:?Set LIG_PARAMS to your ligand .params file}"
 #   whose seed lacks REMARK 666 so the wrong (PTE) residues aren't pinned.
 #   Forwarded to iterative_design.py's --catalytic_resnos.
 CATALYTIC_RESNOS="${CATALYTIC_RESNOS:-}"
+# CHAIN: single-character chain id of the catalytic/design chain in SEED_PDB.
+#   Default 'A' (byte-identical). Set (e.g. CHAIN=B) for any scaffold whose
+#   design chain is not A. Forwarded to iterative_design.py's --chain.
+CHAIN="${CHAIN:-A}"
+# REQUIRE_CAT_HIS: require >=1 side-chain H-bond to a catalytic HIS in the
+#   struct filter. Default 1 (ON, byte-identical). Set REQUIRE_CAT_HIS=0 for an
+#   enzyme with NO catalytic His (else that criterion rejects every design);
+#   forwarded as iterative_design.py's --no_require_cat_his_hbond.
+REQUIRE_CAT_HIS="${REQUIRE_CAT_HIS:-1}"
 TARGET_K="${TARGET_K:-50}"
 MIN_HAMMING="${MIN_HAMMING:-3}"
 N_CYCLES="${N_CYCLES:-3}"
@@ -387,6 +396,16 @@ TRANSFER_REMARKS="${TRANSFER_REMARKS:-1}"
 # driver auto-resolves from REMARK 666 / PTE builtin (byte-identical default).
 CATALYTIC_RESNOS_CLI=()
 [[ -n "$CATALYTIC_RESNOS" ]] && CATALYTIC_RESNOS_CLI+=( --catalytic_resnos "$CATALYTIC_RESNOS" )
+
+# Chain passthrough. Default 'A' => omit the flag (the driver default is 'A', so
+# the invocation stays byte-identical). Any other id is forwarded.
+CHAIN_CLI=()
+[[ -n "$CHAIN" && "$CHAIN" != "A" ]] && CHAIN_CLI+=( --chain "$CHAIN" )
+
+# Catalytic-HIS-H-bond requirement passthrough. Default 1 (ON) => omit the flag
+# (byte-identical). REQUIRE_CAT_HIS=0 forwards --no_require_cat_his_hbond.
+REQUIRE_CAT_HIS_CLI=()
+[[ "$REQUIRE_CAT_HIS" == 0 ]] && REQUIRE_CAT_HIS_CLI+=( --no_require_cat_his_hbond )
 
 # Assemble the driver CLI fragment for the two features once (avoids fragile
 # inline quoting in the apptainer invocation below).
@@ -869,6 +888,8 @@ run_stage3_driver() {
             ${PTM:+--ptm "$PTM"} \
             ${ENHANCE:+--enhance "$ENHANCE"} \
             "${CATALYTIC_RESNOS_CLI[@]}" \
+            "${CHAIN_CLI[@]}" \
+            "${REQUIRE_CAT_HIS_CLI[@]}" \
             "${CONSERVE_CLI[@]}" \
             "${EXPERTS_CLI[@]}" \
             "${PLM_DTYPE_CLI[@]}" \

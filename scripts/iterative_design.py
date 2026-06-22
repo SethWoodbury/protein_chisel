@@ -113,6 +113,16 @@ def _filter_active(name: str) -> bool:
     return _ACTIVE_FILTERS is None or name in _ACTIVE_FILTERS
 
 
+# Catalytic-HIS H-bond structural requirement (any-enzyme generalization). The
+# default struct filter rejects a design with 0 side-chain H-bonds to a catalytic
+# HIS. That is correct for a His-containing active site but rejects EVERY design
+# for an enzyme whose mechanism has no catalytic His. Set in main() from
+# ``not args.no_require_cat_his_hbond`` (kept as a module global like
+# DEFAULT_CATRES so the threaded struct-filter worker reads it without threading
+# through its positional-tuple). Default True => byte-identical (criterion ON).
+REQUIRE_CAT_HIS_HBOND = True
+
+
 # ---- Decode-time PoE backend (add-on, opt-in --mpnn_backend poe) ----------
 # Nested apptainer is blocked inside the stage-3 container, so the PoE sampler runs
 # as a SEPARATE HOST stage and its candidates feed the driver's score/rank one-shot.
@@ -2792,8 +2802,11 @@ def _struct_filter_worker(args: tuple) -> tuple:
         }
 
     # Filter reasons (gated by --filters via _filter_active; all on => identical).
+    # The cat-HIS H-bond requirement is ADDITIONALLY gated by REQUIRE_CAT_HIS_HBOND
+    # (--no_require_cat_his_hbond): an enzyme with no catalytic His can never satisfy
+    # it, so opt out of just this criterion. Default True => byte-identical.
     reasons: list[str] = []
-    if _filter_active("cat_his_hbonds") and len(hbonds) < 1:
+    if REQUIRE_CAT_HIS_HBOND and _filter_active("cat_his_hbonds") and len(hbonds) < 1:
         reasons.append("no h-bonds to catalytic HIS")
     if _filter_active("sap") and sap_max == sap_max and sap_max > sap_max_thr:
         reasons.append(f"sap_max={sap_max:.2f} > {sap_max_thr}")
@@ -5208,6 +5221,20 @@ def main() -> None:
                         "scaffold whose seed lacks REMARK 666 — otherwise the run "
                         "falls back to the PTE positions (with a loud warning) "
                         "and pins the wrong residues.")
+    p.add_argument("--chain", type=str, default="A", metavar="CHAIN_ID",
+                   help="Single-character chain id of the catalytic/design chain "
+                        "in the seed PDB. Default 'A' (byte-identical). Set this "
+                        "for any scaffold whose design chain is not 'A' (e.g. "
+                        "'--chain B'). All structural reads (H-bond/clash/preorg/"
+                        "interaction detection, sequence extraction, secondary "
+                        "structure, tunnel lining) use this chain.")
+    p.add_argument("--no_require_cat_his_hbond", action="store_true",
+                   help="Disable ONLY the structural filter criterion that "
+                        "requires >=1 side-chain H-bond to a catalytic HIS. "
+                        "Default OFF => the requirement stays ON (byte-identical). "
+                        "Set this for an enzyme whose mechanism has NO catalytic "
+                        "His — otherwise that criterion rejects every design. "
+                        "Other struct-filter criteria (SAP, clash) are unaffected.")
     p.add_argument("--expression_profile", type=str,
                    default="bl21_cytosolic_streptag",
                    choices=["bl21_cytosolic_streptag", "k12_cytosolic",
@@ -5847,6 +5874,20 @@ def main() -> None:
     # positions for the filter / fixed-residue / catres-aware code paths. The
     # builtin-fallback path (no override AND no REMARK 666) is loudly warned
     # inside _resolve_catalytic_resnos — those PTE positions are wrong off-PTE.
+    # Design/catalytic chain (any-enzyme generalization). Validate a single,
+    # non-space chain id, then set the module CHAIN global from args.chain so all
+    # structural reads (H-bond/clash/preorg/interaction/SS/sequence/tunnel) target
+    # it. Default 'A' leaves the global unchanged => byte-identical. Mirrors the
+    # DEFAULT_CATRES/CATALYTIC_HIS_RESNOS global-set idiom below.
+    global CHAIN
+    _chain_arg = str(args.chain)
+    if len(_chain_arg) != 1 or _chain_arg.isspace():
+        p.error("--chain must be a single non-space chain id (e.g. 'A', 'B')")
+    if _chain_arg != CHAIN:
+        LOGGER.info("design/catalytic chain set to %r (was default %r)",
+                    _chain_arg, CHAIN)
+    CHAIN = _chain_arg
+
     global DEFAULT_CATRES, CATALYTIC_HIS_RESNOS
     _orig_default_catres, _orig_default_his = DEFAULT_CATRES, CATALYTIC_HIS_RESNOS
     derived_catres, derived_his, catres_source = _resolve_catalytic_resnos(
@@ -5861,6 +5902,24 @@ def main() -> None:
         )
     DEFAULT_CATRES = derived_catres
     CATALYTIC_HIS_RESNOS = derived_his
+
+    # Catalytic-HIS H-bond requirement (any-enzyme generalization). Default ON
+    # (byte-identical). --no_require_cat_his_hbond disables just this criterion.
+    # Bonus auto-relax: if the resolved catalytic set has NO His at all, the
+    # requirement is unsatisfiable and would reject every design, so turn it off
+    # with a loud warning (an explicit --no_require_cat_his_hbond stays off too).
+    global REQUIRE_CAT_HIS_HBOND
+    REQUIRE_CAT_HIS_HBOND = not bool(args.no_require_cat_his_hbond)
+    if REQUIRE_CAT_HIS_HBOND and catres_source != "builtin" and not derived_his:
+        LOGGER.warning(
+            "Resolved catalytic set (source=%s) contains NO His: the cat-HIS "
+            "H-bond struct filter is unsatisfiable and would reject EVERY design. "
+            "Auto-relaxing it for this run (equivalent to --no_require_cat_his_hbond). "
+            "Pass --no_require_cat_his_hbond explicitly to silence this, or "
+            "--catalytic_resnos with a His if your active site has one.",
+            catres_source,
+        )
+        REQUIRE_CAT_HIS_HBOND = False
 
     # ---- Conserved-hbond + REMARK-transfer config (Features 1 & 2) -------
     global CONSERVE_HBONDS, CONSERVE_HBOND_PROB, CONSERVE_HBOND_MAX_DIST
