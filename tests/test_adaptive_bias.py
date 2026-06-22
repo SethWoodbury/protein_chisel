@@ -741,3 +741,267 @@ def test_gain_estimate_ignores_tiny_du():
     hist = [(0.55, -0.16), (0.5501, -0.10)]   # |du|=1e-4 < du_min
     corr, wrong = ab.estimate_gain_correction(hist, cfg, GRAVY_AXIS.error_scale)
     assert corr == 1.0 and not wrong
+
+
+# ===========================================================================
+# OPT-IN control-law DAMPING (measurement EWMA / derivative / slew / soft band)
+# All defaults reproduce the current under-damped law byte-identically.
+# ===========================================================================
+def _make_charge_pool(mean, *, n=200, std=2.0, seed=0):
+    """Charge-axis pool at a given mean, with the two one-sided gap columns."""
+    rng = np.random.default_rng(seed)
+    vals = rng.normal(mean, std, n)
+    df = pd.DataFrame({CHARGE_AXIS.metric_column: vals})
+    scale = max(1e-9, abs(CHARGE_AXIS.error_scale))
+    df[CHARGE_AXIS.fail_high_column] = np.maximum(0.0, vals - CHARGE_AXIS.band_hi) / scale
+    df[CHARGE_AXIS.fail_low_column] = np.maximum(0.0, CHARGE_AXIS.band_lo - vals) / scale
+    return df
+
+
+def test_damping_config_defaults_reproduce_current_law():
+    """The four new fields default to no-op values (EWMA off, no D, no slew, hard
+    band) so an AdaptiveBiasConfig() is the legacy controller."""
+    cfg = AdaptiveBiasConfig()
+    assert cfg.measurement_ewma_alpha == 1.0
+    assert cfg.derivative_gain == 0.0
+    assert cfg.slew_limit_frac is None
+    assert cfg.deadband_mode == "hard"
+
+
+# (a) BYTE-IDENTITY GUARD ---------------------------------------------------
+def test_byte_identity_step_axis_defaults_match_explicit_legacy_fields():
+    """step_axis output (u, gate, reason, e_norm, ...) is IDENTICAL whether the new
+    damping fields are at their defaults or absent — for a fixed pool and a carried
+    state (incl. a held last_u)."""
+    rng = np.random.default_rng(101)
+    for mean in (-6.0, -9.6, -2.0, 0.5, -22.0):
+        pool = _make_charge_pool(mean, seed=int(abs(mean) * 7) + 1)
+        st = AxisState(last_u=0.23, history=[(0.0, mean + 1.0), (0.23, mean)])
+        legacy_cfg = AdaptiveBiasConfig()
+        damp_default_cfg = AdaptiveBiasConfig(
+            measurement_ewma_alpha=1.0, derivative_gain=0.0,
+            slew_limit_frac=None, deadband_mode="hard")
+        oc_a, st_a = step_axis(pool, CHARGE_AXIS, st, legacy_cfg)
+        oc_b, st_b = step_axis(pool, CHARGE_AXIS, st, damp_default_cfg)
+        assert oc_a.u == oc_b.u
+        assert oc_a.gate_open == oc_b.gate_open
+        assert oc_a.reason == oc_b.reason
+        assert oc_a.e_norm == oc_b.e_norm
+        assert oc_a.signed_error == oc_b.signed_error
+        assert st_a.last_u == st_b.last_u
+
+
+def test_axisstate_roundtrip_without_m_smooth_is_current_behavior():
+    """A from_dict on a legacy state dict (no m_smooth_prev) yields m_smooth_prev=None
+    and behaves exactly as today; to_dict/from_dict round-trips the new field."""
+    legacy = {"last_u": 0.3, "history": [[0.0, -6.0]]}
+    st = AxisState.from_dict(legacy)
+    assert st.m_smooth_prev is None
+    rng = np.random.default_rng(7)
+    pool = _make_charge_pool(-2.0, seed=3)
+    oc_legacy, _ = step_axis(pool, CHARGE_AXIS, AxisState.from_dict(legacy),
+                             AdaptiveBiasConfig())
+    oc_new, _ = step_axis(pool, CHARGE_AXIS, st, AdaptiveBiasConfig())
+    assert oc_legacy.u == oc_new.u
+    # round-trip carries m_smooth_prev
+    st2 = AxisState(last_u=0.1, history=[], m_smooth_prev=-7.5)
+    d = st2.to_dict()
+    assert d["m_smooth_prev"] == -7.5
+    assert AxisState.from_dict(d).m_smooth_prev == -7.5
+
+
+# (b) EWMA smooths a noisy mean sequence ------------------------------------
+def test_ewma_smooths_noisy_mean_sequence():
+    """With measurement_ewma_alpha<1 the axis acts on a smoothed mean: a noisy mean
+    sequence drives a less-variable signed_error than alpha=1 (raw)."""
+    means = [-6.0, -9.6, -2.0, -8.0, -3.0]
+    raw_cfg = AdaptiveBiasConfig()
+    smooth_cfg = AdaptiveBiasConfig(measurement_ewma_alpha=0.5)
+    raw_errs, smooth_errs = [], []
+    st_raw = st_smooth = None
+    for i, m in enumerate(means):
+        pool = _make_charge_pool(m, seed=i)
+        st_raw = AxisState() if st_raw is None else st_raw
+        st_smooth = AxisState() if st_smooth is None else st_smooth
+        oc_r, st_raw = step_axis(pool, CHARGE_AXIS, st_raw, raw_cfg)
+        oc_s, st_smooth = step_axis(pool, CHARGE_AXIS, st_smooth, smooth_cfg)
+        raw_errs.append(oc_r.signed_error)
+        smooth_errs.append(oc_s.signed_error)
+    # the smoothed acted-on error is strictly less jittery than the raw one
+    assert np.std(np.diff(smooth_errs)) < np.std(np.diff(raw_errs))
+    # and the EWMA value is carried in state
+    assert st_smooth.m_smooth_prev is not None
+
+
+def test_ewma_recursion_matches_formula():
+    """m_smooth = alpha*m_now + (1-alpha)*m_smooth_prev, seeded to m_now on cycle 0."""
+    alpha = 0.5
+    cfg = AdaptiveBiasConfig(measurement_ewma_alpha=alpha)
+    seq = [-6.0, -9.6, -2.0]
+    st = AxisState()
+    expected_prev = None
+    for i, m in enumerate(seq):
+        pool = _make_charge_pool(m, seed=i, std=0.0)   # zero-variance => mean == m
+        _, st = step_axis(pool, CHARGE_AXIS, st, cfg)
+        expected = m if expected_prev is None else alpha * m + (1 - alpha) * expected_prev
+        assert st.m_smooth_prev == pytest.approx(expected)
+        expected_prev = expected
+
+
+# (c) slew-limit bounds |Δu| ------------------------------------------------
+def test_slew_limit_bounds_delta_u():
+    """slew_limit_frac caps |u_new - last_u| at slew*max_nats, BEFORE the max_nats
+    clamp; the same pool without slew moves more."""
+    pool = _make_charge_pool(2.0, seed=5)        # well above band_hi -> big drive
+    st = AxisState(last_u=0.0)
+    slew = 0.15
+    cfg_slew = AdaptiveBiasConfig(slew_limit_frac=slew)
+    cfg_free = AdaptiveBiasConfig()
+    oc_s, _ = step_axis(pool, CHARGE_AXIS, st, cfg_slew)
+    oc_f, _ = step_axis(pool, CHARGE_AXIS, st, cfg_free)
+    assert abs(oc_s.u - st.last_u) <= slew * cfg_slew.max_nats + 1e-9
+    assert abs(oc_f.u - st.last_u) > abs(oc_s.u - st.last_u)   # unbounded moved more
+
+
+def test_slew_limit_applies_on_reversal_too():
+    """A reversal (held +u, pool now overshot the other way) is also slew-bounded."""
+    pool = _make_charge_pool(-26.0, seed=6)      # below band_lo -18 -> wants u<0
+    st = AxisState(last_u=0.5)
+    slew = 0.1
+    oc, _ = step_axis(pool, CHARGE_AXIS, st, AdaptiveBiasConfig(slew_limit_frac=slew))
+    assert abs(oc.u - st.last_u) <= slew * 0.6 + 1e-9
+
+
+# (d) derivative: a rising-measurement trend adds opposing drive -------------
+def test_derivative_opposes_rising_measurement_trend():
+    """Two pools at the SAME current mean but different prior smoothed means: the one
+    whose measurement is RISING toward the 'too positive' side gets MORE corrective
+    drive (the D term anticipates the drift), vs a flat trend."""
+    # charge axis: drive is positive (acidify) when mean > target. A measurement that
+    # rose from -10 to -4 (toward 0, the too-positive side) should add drive vs flat.
+    cfg = AdaptiveBiasConfig(measurement_ewma_alpha=1.0, derivative_gain=0.5)
+    pool = _make_charge_pool(-4.0, seed=8)
+    rising = AxisState(last_u=0.0, m_smooth_prev=-10.0)   # was -10, now -4 -> rising
+    flat = AxisState(last_u=0.0, m_smooth_prev=-4.0)      # already at -4 -> no trend
+    oc_rise, _ = step_axis(pool, CHARGE_AXIS, rising, cfg)
+    oc_flat, _ = step_axis(pool, CHARGE_AXIS, flat, cfg)
+    assert oc_rise.u > oc_flat.u            # rising trend -> extra anticipatory drive
+
+
+def test_derivative_zero_gain_is_noop():
+    """derivative_gain=0 leaves the drive untouched regardless of m_smooth_prev."""
+    pool = _make_charge_pool(-4.0, seed=8)
+    base = AxisState(last_u=0.0)
+    trend = AxisState(last_u=0.0, m_smooth_prev=-10.0)
+    oc_base, _ = step_axis(pool, CHARGE_AXIS, base, AdaptiveBiasConfig())
+    oc_trend, _ = step_axis(pool, CHARGE_AXIS, trend, AdaptiveBiasConfig())
+    assert oc_base.u == oc_trend.u
+
+
+# soft (ramp) deadband ------------------------------------------------------
+def test_ramp_deadband_has_no_dead_zone():
+    """deadband_mode='ramp' drives proportionally inside the deadband (where 'hard'
+    returns 0), continuous through target."""
+    mean_in_db = GRAVY_AXIS.target + 0.5 * GRAVY_AXIS.deadband   # inside the deadband
+    e_hard = ab.signed_deadband_error(mean_in_db, GRAVY_AXIS)
+    e_ramp = ab.signed_deadband_error(mean_in_db, GRAVY_AXIS, mode="ramp")
+    assert e_hard == 0.0
+    assert e_ramp > 0.0                                          # ramp drives
+    # at exactly target both are 0; far outside the deadband ramp returns the FULL
+    # signed error (no subtraction)
+    assert ab.signed_deadband_error(GRAVY_AXIS.target, GRAVY_AXIS, mode="ramp") == 0.0
+    far = GRAVY_AXIS.target + 3.0 * GRAVY_AXIS.deadband
+    assert ab.signed_deadband_error(far, GRAVY_AXIS, mode="ramp") == pytest.approx(
+        far - GRAVY_AXIS.target)
+
+
+# (e) REGRESSION: damped law has a smaller swing on the live trace ----------
+def _run_charge_trace(cfg, means, *, seeds=None):
+    seeds = seeds if seeds is not None else list(range(len(means)))
+    st = AxisState()
+    us = []
+    for m, s in zip(means, seeds):
+        pool = _make_charge_pool(m, seed=s)
+        oc, st = step_axis(pool, CHARGE_AXIS, st, cfg)
+        us.append(oc.u)
+    return us
+
+
+def test_regression_damped_law_reduces_drive_swing_on_live_trace():
+    """The diagnosed pathology: means -6.0 -> -9.6 -> -2.0 (target -10). The current
+    law under-corrects, HOLDS through the momentary in-band -9.6, then ramps hard on
+    the -2.0 drift-back. The DAMPED config yields a smaller cycle-2 |Δu| and a smaller
+    overall drive swing (less reversal/ramp)."""
+    means = [-6.0, -9.6, -2.0]
+    current = AdaptiveBiasConfig()
+    damped = AdaptiveBiasConfig(
+        measurement_ewma_alpha=0.5,
+        derivative_gain=0.5 * AdaptiveBiasConfig().gain,
+        slew_limit_frac=0.15,
+        deadband_mode="ramp",
+    )
+    us_cur = _run_charge_trace(current, means)
+    us_damp = _run_charge_trace(damped, means)
+    swing_cur = max(us_cur) - min(us_cur)
+    swing_damp = max(us_damp) - min(us_damp)
+    du2_cur = abs(us_cur[2] - us_cur[1])
+    du2_damp = abs(us_damp[2] - us_damp[1])
+    # quantified: damped cycle-2 step is smaller, and the whole swing is smaller
+    assert du2_damp < du2_cur
+    assert swing_damp < swing_cur
+    # the slew limit hard-caps the cycle-2 step under damping
+    assert du2_damp <= 0.15 * damped.max_nats + 1e-9
+
+
+def test_no_pool_hold_preserves_ewma_memory():
+    """codex: a missed/empty pool cycle must HOLD the damping memory (m_smooth_prev),
+    not reset it — otherwise the next measured cycle restarts its EWMA from scratch."""
+    damp = AdaptiveBiasConfig(measurement_ewma_alpha=0.5)
+    # prior state carries last_u + a smoothed mean from earlier cycles
+    state = {"charge": AxisState(last_u=0.3, history=[(0.3, -6.0)],
+                                 m_smooth_prev=-7.5).to_dict()}
+    res = compute_adaptive_bias(
+        pool_df=None, axes=[CHARGE_AXIS], cfg=damp, state=state, L=4,
+        position_classes=["distal_surface"] * 4, sasa_fraction=np.ones(4),
+        fixed_idx=set())
+    assert res.outcomes[0].reason.startswith("no pool")
+    # held: last_u kept AND the EWMA memory carried forward intact
+    assert AxisState.from_dict(res.new_state["charge"]).last_u == pytest.approx(0.3)
+    assert AxisState.from_dict(res.new_state["charge"]).m_smooth_prev == pytest.approx(-7.5)
+
+
+def test_no_pool_hold_default_state_dict_byte_identical():
+    """Default config: the no-pool hold path still emits a legacy state dict with NO
+    m_smooth_prev key (byte-identical)."""
+    state = {"charge": AxisState(last_u=0.3, history=[(0.3, -6.0)]).to_dict()}
+    res = compute_adaptive_bias(
+        pool_df=None, axes=[CHARGE_AXIS], cfg=AdaptiveBiasConfig(), state=state, L=4,
+        position_classes=["distal_surface"] * 4, sasa_fraction=np.ones(4),
+        fixed_idx=set())
+    assert "m_smooth_prev" not in res.new_state["charge"]
+    assert res.new_state["charge"] == {"last_u": 0.3, "history": [[0.3, -6.0]]}
+
+
+def test_seed_warmstart_honors_ramp_deadband_and_seeds_ewma_prior():
+    """codex: with damping (ramp deadband) a seed off target but inside the HARD
+    deadband still warm-starts; and the seed value is carried as the cycle-1 EWMA
+    prior. Default (hard) seed warm-start stays byte-identical."""
+    axes = default_axes(axes=["charge"])
+    ch = axes[0]                              # target -10, deadband 2 (hard band [-12,-8])
+    seed_in_hard_db = ch.target + 0.5 * ch.deadband     # -9.0: inside the hard deadband
+    damp = AdaptiveBiasConfig(measurement_ewma_alpha=0.5, derivative_gain=0.3,
+                              deadband_mode="ramp")
+    g, _delta, state, _t = ab.seed_warmstart(
+        seed_metrics={"net_charge_full_HH": seed_in_hard_db}, axes=axes, cfg=damp,
+        L=4, position_classes=["distal_surface"] * 4, sasa_fraction=np.ones(4),
+        fixed_idx=set())
+    # ramp mode warm-starts off-target seeds the hard mode would zero
+    assert g.get("D", 0) > 0 and g.get("E", 0) > 0
+    assert state["charge"]["m_smooth_prev"] == pytest.approx(seed_in_hard_db)
+    # hard (default) leaves that same seed in-deadband -> no warm-start, legacy state
+    g2, _d2, state2, _t2 = ab.seed_warmstart(
+        seed_metrics={"net_charge_full_HH": seed_in_hard_db}, axes=axes,
+        cfg=AdaptiveBiasConfig(), L=4, position_classes=["distal_surface"] * 4,
+        sasa_fraction=np.ones(4), fixed_idx=set())
+    assert g2 == {}
+    assert "charge" not in state2 or "m_smooth_prev" not in state2.get("charge", {})

@@ -468,6 +468,9 @@ METRICS_CLI=()
 # surface hydrophobicity toward target across cycles (only when statistically out
 # of target; holds once in-band; reverses on overshoot). Sub-knobs are emitted only
 # when set, so the default driver command is unchanged.
+#   CONTROLLER_DAMPING=1   opt-in control-law damping (EWMA + derivative + slew +
+#                          soft deadband) for holding setpoint vs a drifting plant;
+#                          default OFF => byte-identical legacy (under-damped) law.
 ADAPTIVE_BIAS="${ADAPTIVE_BIAS:-0}"
 ADAPTIVE_BIAS_CLI=()
 if [[ "$ADAPTIVE_BIAS" != "0" ]]; then
@@ -493,6 +496,11 @@ if [[ "$ADAPTIVE_BIAS" != "0" ]]; then
     # CF-5 opt-in verbose controller trace (default OFF => byte-identical). Truthy on
     # 1/true/yes/on; writes <run_dir>/controller_trace.tsv + per-cycle CONTROLLER REPORT.
     [[ "${CONTROLLER_VERBOSE:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]] && ADAPTIVE_BIAS_CLI+=( --controller_verbose )
+    # OPT-IN control-law damping (default OFF => byte-identical to the legacy under-
+    # damped controller). Truthy on 1/true/yes/on; bundles measurement-EWMA (0.5),
+    # derivative-on-measurement (0.5*gain), per-cycle slew limit (0.15*max_nats), and
+    # the soft 'ramp' deadband — for holding setpoint against a drifting/lagging plant.
+    [[ "${CONTROLLER_DAMPING:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]] && ADAPTIVE_BIAS_CLI+=( --controller_damping )
 fi
 
 # Hard solubility veto (opt-in; default OFF => byte-identical). SHIP_SOLUBILITY_VETO=1

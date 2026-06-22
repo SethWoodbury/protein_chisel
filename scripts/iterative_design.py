@@ -5419,6 +5419,20 @@ def main() -> None:
                         "'charge,surface_hydrophobicity'). Restrict (e.g. 'charge') "
                         "or, as future registry entries land, extend. An unknown "
                         "axis name is rejected.")
+    p.add_argument("--controller_damping", action="store_true", default=False,
+                   help="OPT-IN control-law DAMPING (default OFF => byte-identical to "
+                        "the legacy under-damped controller). The base law under-"
+                        "corrects against a drifting/lagging plant, relaxes its "
+                        "integral the moment the pool is momentarily in-band, then "
+                        "ramps hard when the pool drifts back. This bundle adds four "
+                        "stabilizers in one switch: act on an EWMA of the pool mean "
+                        "(measurement_ewma_alpha=0.5, filters per-cycle noise), a "
+                        "derivative-on-measurement term (derivative_gain=0.5*gain, "
+                        "anticipates drift before the hard ramp), a per-cycle slew "
+                        "limit (slew_limit_frac=0.15 of max_nats, no full-range "
+                        "lurch), and a soft 'ramp' deadband (continuous drive through "
+                        "target, kills the stick-slip of the hard band). No effect "
+                        "without --adaptive_bias.")
     p.add_argument("--controller_verbose", action="store_true", default=False,
                    help="CF-5 opt-in observability (default OFF => byte-identical). "
                         "With --adaptive_bias, after each cycle append one row per "
@@ -6556,11 +6570,21 @@ def main() -> None:
         from protein_chisel.sampling.adaptive_bias import (
             AdaptiveBiasConfig, compute_adaptive_bias, default_axes,
         )
+        # OPT-IN control-law damping bundle (default OFF => the four damping fields
+        # keep their no-op defaults => byte-identical to the legacy controller). When
+        # --controller_damping is set: act on an EWMA of the pool mean (alpha=0.5),
+        # add a derivative-on-measurement term (gain 0.5*the integral gain), slew-limit
+        # |Δu| to 0.15*max_nats/cycle, and use the soft 'ramp' deadband.
+        _ab_damp = dict(measurement_ewma_alpha=0.5,
+                        derivative_gain=0.5 * args.adaptive_bias_gain,
+                        slew_limit_frac=0.15,
+                        deadband_mode="ramp") if args.controller_damping else {}
         _ab_cfg = AdaptiveBiasConfig(
             gain=args.adaptive_bias_gain, max_nats=args.adaptive_bias_max_nats,
             carry=args.adaptive_bias_carry, t_min=args.adaptive_bias_tmin,
             f_min=args.adaptive_bias_fmin, min_n=args.adaptive_bias_min_n,
             mode=args.adaptive_bias_mode, max_odds=args.adaptive_bias_max_odds,
+            **_ab_damp,
         )
         try:
             _ab_r2s = dict(zip(pt.df["resno"].astype(int),
@@ -6613,6 +6637,11 @@ def main() -> None:
                     "tmin=%.1f fmin=%.2f min_n=%d mode=%s)",
                     _ab_cfg.gain, _ab_cfg.max_nats, _ab_cfg.carry, _ab_cfg.t_min,
                     _ab_cfg.f_min, _ab_cfg.min_n, _ab_cfg.mode)
+        if args.controller_damping:
+            LOGGER.info("controller DAMPING ENABLED (ewma_alpha=%.2f derivative_gain=%.3f "
+                        "slew_limit_frac=%.2f deadband_mode=%s)",
+                        _ab_cfg.measurement_ewma_alpha, _ab_cfg.derivative_gain,
+                        _ab_cfg.slew_limit_frac, _ab_cfg.deadband_mode)
         # Optional cycle-0 warm-start from the input scaffold's own properties.
         if args.adaptive_bias_seed_from_input and _seed_gravy is not None:
             from protein_chisel.sampling.adaptive_bias import seed_warmstart

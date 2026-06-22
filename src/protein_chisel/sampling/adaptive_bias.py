@@ -285,6 +285,32 @@ class AdaptiveBiasConfig:
     gain_correction_clip: float = 6.0   # cap range [1/c, c] for the online gain est;
     #                                     wide enough to attenuate a ~6x-too-strong
     #                                     plant to near-deadbeat (g_eff*|K| ~ 1).
+    # ---- OPT-IN control-law DAMPING (each default reproduces the current law) ----
+    # The base law is *under-damped*: against a drifting/lagging plant it under-
+    # corrects, then the gate closes the instant the pool is momentarily in-band
+    # (relaxing the integral), the pool drifts back out, and it ramps hard. These
+    # four knobs add damping; every default is a no-op so AdaptiveBiasConfig() is
+    # byte-identical to the legacy controller.
+    measurement_ewma_alpha: float = 1.0   # <1 => act on an EWMA of the pool mean
+    #   across cycles (m_smooth = a*m_now + (1-a)*m_smooth_prev); 1.0 = no smoothing
+    #   (m_smooth == m_now exactly). Damped: 0.5. Filters per-cycle measurement noise
+    #   so the gate/drive do not chase a single jittery cycle.
+    derivative_gain: float = 0.0          # >0 => add a derivative-ON-MEASUREMENT term
+    #   derivative_gain*(m_smooth - m_smooth_prev)/error_scale to the drive (D on the
+    #   measurement, NOT the error, so a setpoint move never kicks it). It is applied
+    #   with the SAME sign as this controller's proportional drive (error =
+    #   measurement-target; the textbook "subtract" assumes error = target-measurement),
+    #   so a measurement drifting further into trouble anticipatorily ADDS corrective
+    #   drive — damping the over/under-shoot. 0.0 = no D term. Damped: ~0.5*gain.
+    #   See step_axis for the full sign reconciliation.
+    slew_limit_frac: Optional[float] = None   # set => bound the per-cycle change
+    #   |u_new - last_u| <= slew_limit_frac*max_nats BEFORE the max_nats clamp, so a
+    #   single cycle cannot lurch the actuator the full range (the ~49x ramp). None =
+    #   no limit. Damped: 0.15.
+    deadband_mode: str = "hard"           # "hard" (current: zero drive inside the
+    #   deadband) | "ramp" (drive the FULL signed error through target, i.e. drop the
+    #   deadband subtraction — a continuous, no-dead-zone response that kills the
+    #   stick-slip of the hard band relaxing/re-engaging at the edge).
 
 
 @dataclass
@@ -292,16 +318,28 @@ class AxisState:
     """Cross-cycle memory for one axis (small; carried like throat_bias_prev)."""
     last_u: float = 0.0                       # u applied to produce the CURRENT pool
     history: list = field(default_factory=list)  # [(u_applied, resulting_mean), ...]
+    # OPT-IN damping: the previous cycle's *smoothed* pool mean, for the measurement
+    # EWMA and the derivative-on-measurement term. None (default / absent from a legacy
+    # state dict) => no prior smoothed value yet, so the EWMA seeds to m_now and the D
+    # term is 0 — i.e. byte-identical to the legacy controller.
+    m_smooth_prev: Optional[float] = None
 
     def to_dict(self) -> dict:
-        return {"last_u": self.last_u, "history": [list(p) for p in self.history]}
+        d = {"last_u": self.last_u, "history": [list(p) for p in self.history]}
+        # Only emit m_smooth_prev when it carries a value, so a legacy run's state
+        # dict is byte-identical (the key is simply absent => from_dict yields None).
+        if self.m_smooth_prev is not None:
+            d["m_smooth_prev"] = self.m_smooth_prev
+        return d
 
     @classmethod
     def from_dict(cls, d: Optional[dict]) -> "AxisState":
         if not d:
             return cls()
+        msp = d.get("m_smooth_prev")            # absent in legacy dicts => None
         return cls(last_u=float(d.get("last_u", 0.0)),
-                   history=[tuple(p) for p in d.get("history", [])])
+                   history=[tuple(p) for p in d.get("history", [])],
+                   m_smooth_prev=(float(msp) if msp is not None else None))
 
 
 @dataclass
@@ -426,13 +464,26 @@ def estimate_gain_correction(history: list, cfg: AdaptiveBiasConfig,
 # ---------------------------------------------------------------------------
 # Per-axis drive
 # ---------------------------------------------------------------------------
-def signed_deadband_error(mean: float, axis: ControlAxis) -> float:
+def signed_deadband_error(mean: float, axis: ControlAxis,
+                          mode: str = "hard") -> float:
     """Signed physical error of the pool mean vs target, with a deadband.
 
     Positive = pool is on the "too hydrophobic / too positive" side of target.
-    Zero inside the deadband (so a pool already near target is left alone).
+
+    ``mode='hard'`` (default, CURRENT behavior, byte-identical): zero inside the
+    deadband; ``sign(e)*(|e|-deadband)`` outside (so a pool already near target is
+    left alone, then the drive ramps with slope 1 beyond the band edge).
+
+    ``mode='ramp'`` (opt-in): drop the deadband subtraction entirely and return the
+    FULL signed error ``e`` everywhere. The drive magnitude then ramps linearly from
+    0 at target out to ``deadband`` at the deadband distance and continues linearly
+    beyond — a continuous, no-dead-zone response. This removes the stick-slip of the
+    hard band (drive snapping off inside the deadband, then re-engaging at the edge)
+    that lets the pool drift to the edge before the controller reacts.
     """
     e = mean - axis.target
+    if mode == "ramp":
+        return e
     if abs(e) <= axis.deadband:
         return 0.0
     return math.copysign(abs(e) - axis.deadband, e)
@@ -449,6 +500,18 @@ def step_axis(pool_df: pd.DataFrame, axis: ControlAxis, state: AxisState,
     stats = axis_pool_stats(pool_df, axis)
     n, mean, se, f = stats["n"], stats["mean"], stats["se"], stats["fail_fraction"]
 
+    # ---- OPT-IN measurement EWMA (damping). alpha=1.0 (default) => m_smooth is the
+    # raw pool mean, EXACTLY (special-cased, never touches m_smooth_prev), so the gate
+    # and drive below see the same value they do today -> byte-identical. alpha<1 acts
+    # on a smoothed mean (seeded to m_now on the first cycle when there is no prior).
+    alpha = cfg.measurement_ewma_alpha
+    if not math.isfinite(mean):
+        m_smooth = mean
+    elif alpha >= 1.0 or state.m_smooth_prev is None or not math.isfinite(state.m_smooth_prev):
+        m_smooth = mean
+    else:
+        m_smooth = alpha * mean + (1.0 - alpha) * float(state.m_smooth_prev)
+
     # Close the loop on the PREVIOUS action: pair the u we applied last cycle with
     # the pool mean it produced (observed now). This is what the secant estimate
     # of plant gain consumes.
@@ -463,13 +526,14 @@ def step_axis(pool_df: pd.DataFrame, axis: ControlAxis, state: AxisState,
         gain_corr, wrong_sign = 1.0, False
 
     # ---- GATE (binary, statistical) ----
-    # A zero-variance pool (all designs identical) has se=0; if it is also out of
-    # band that is the WORST case (collapsed/deadbeat to a wrong value), so treat
-    # |t| as infinite rather than 0 (which would fool the gate into closing).
+    # The axis acts on m_smooth (== mean at the default alpha=1.0). A zero-variance
+    # pool (all designs identical) has se=0; if it is also out of band that is the
+    # WORST case (collapsed/deadbeat to a wrong value), so treat |t| as infinite
+    # rather than 0 (which would fool the gate into closing).
     if se and math.isfinite(se) and se > 0:
-        t_stat = (mean - axis.target) / se
-    elif math.isfinite(mean) and abs(mean - axis.target) > 1e-9:
-        t_stat = math.copysign(float("inf"), mean - axis.target)
+        t_stat = (m_smooth - axis.target) / se
+    elif math.isfinite(m_smooth) and abs(m_smooth - axis.target) > 1e-9:
+        t_stat = math.copysign(float("inf"), m_smooth - axis.target)
     else:
         t_stat = 0.0
     reasons = []
@@ -482,8 +546,35 @@ def step_axis(pool_df: pd.DataFrame, axis: ControlAxis, state: AxisState,
     gate_open = len(reasons) == 0
 
     # ---- DRIVE (continuous, physical) ----
-    se_err = signed_deadband_error(mean, axis) if math.isfinite(mean) else 0.0
+    se_err = (signed_deadband_error(m_smooth, axis, mode=cfg.deadband_mode)
+              if math.isfinite(m_smooth) else 0.0)
     e_norm = se_err / axis.error_scale if axis.error_scale else 0.0
+
+    # Derivative-ON-MEASUREMENT term (opt-in, default derivative_gain=0.0 => 0). Uses
+    # the *change in the smoothed measurement* (NOT the error, so a setpoint move never
+    # kicks it — no derivative setpoint-kick). The textbook PID writes this with a
+    # MINUS sign under the convention error = setpoint - measurement; this controller's
+    # proportional drive instead uses error = measurement - target (its plant gain is
+    # negative and is handled by gain_correction / charge_weights), so to STAY
+    # consistent with the proportional sign the derivative reinforces it: a measurement
+    # drifting further into trouble (|mean-target| growing) adds drive in the same sign
+    # as the proportional term, anticipating the drift before the gate would otherwise
+    # have to ramp hard; a recovering measurement backs the drive off. Skipped entirely
+    # (no state dependence) at the 0.0 default and on the first cycle (no prior value).
+    d_term = 0.0
+    if (cfg.derivative_gain != 0.0 and state.m_smooth_prev is not None
+            and math.isfinite(state.m_smooth_prev) and math.isfinite(m_smooth)
+            and axis.error_scale):
+        d_term = cfg.derivative_gain * (m_smooth - float(state.m_smooth_prev)) / axis.error_scale
+
+    def _slewed_clip(u_target: float) -> float:
+        """Bound |u_target - last_u| to slew_limit_frac*max_nats (opt-in) BEFORE the
+        ±max_nats clamp, so one cycle cannot lurch the actuator the full range."""
+        if cfg.slew_limit_frac is not None:
+            step_cap = float(cfg.slew_limit_frac) * cfg.max_nats
+            u_target = float(np.clip(u_target, state.last_u - step_cap,
+                                     state.last_u + step_cap))
+        return float(np.clip(u_target, -cfg.max_nats, cfg.max_nats))
 
     if wrong_sign:
         # Plant responded the wrong way -> stop biasing this axis entirely.
@@ -498,16 +589,17 @@ def step_axis(pool_df: pd.DataFrame, axis: ControlAxis, state: AxisState,
         reason = "gate closed (hold): " + "; ".join(reasons)
     elif e_norm == 0.0:
         # In trouble overall but within the deadband of target -> hold, don't chase.
+        # (Unreachable under deadband_mode='ramp', where e_norm is 0 only exactly at
+        # target.)
         u_new = float(np.clip(state.last_u, -cfg.max_nats, cfg.max_nats))
         reason = "in deadband (hold)"
     elif cfg.mode == "bangbang":
         step = math.copysign(cfg.bangbang_step, e_norm)
-        u_new = float(np.clip(cfg.carry * state.last_u + step, -cfg.max_nats, cfg.max_nats))
+        u_new = _slewed_clip(cfg.carry * state.last_u + step + d_term)
         reason = "active (bangbang integrate)"
     else:
         g_eff = cfg.gain * gain_corr
-        u_new = float(np.clip(cfg.carry * state.last_u + g_eff * e_norm,
-                              -cfg.max_nats, cfg.max_nats))
+        u_new = _slewed_clip(cfg.carry * state.last_u + g_eff * e_norm + d_term)
         reason = "active (integral)"
 
     outcome = AxisOutcome(
@@ -519,7 +611,19 @@ def step_axis(pool_df: pd.DataFrame, axis: ControlAxis, state: AxisState,
     # On a wrong-sign freeze, clear history so recovery is deterministic (the next
     # cycle re-estimates from fresh points) rather than relying on stale pairings.
     new_history = [] if wrong_sign else history
-    return outcome, AxisState(last_u=u_new, history=new_history)
+    # Carry the smoothed mean forward ONLY when a damping feature consumes it (EWMA
+    # or derivative). Otherwise leave it None so the state dict stays byte-identical
+    # to the legacy controller (to_dict omits a None m_smooth_prev). A finite m_smooth
+    # is required (a NaN-pool cycle preserves the prior smoothed value).
+    damping_on = (cfg.measurement_ewma_alpha < 1.0) or (cfg.derivative_gain != 0.0)
+    if damping_on and math.isfinite(m_smooth):
+        next_m_smooth_prev: Optional[float] = float(m_smooth)
+    elif damping_on:
+        next_m_smooth_prev = state.m_smooth_prev   # NaN pool -> keep prior
+    else:
+        next_m_smooth_prev = None
+    return outcome, AxisState(last_u=u_new, history=new_history,
+                              m_smooth_prev=next_m_smooth_prev)
 
 
 # ---------------------------------------------------------------------------
@@ -802,14 +906,19 @@ def compute_adaptive_bias(*, pool_df: Optional[pd.DataFrame] = None,
         have_pool = primary is not None and len(primary) > 0
         if not have_pool or axis.metric_column not in primary.columns:
             # No measurement this cycle: HOLD the previously-applied bias (keep
-            # last_u and emit it) rather than dropping it. History is preserved.
+            # last_u and emit it) rather than dropping it. History AND the damping
+            # EWMA memory (m_smooth_prev) are preserved — a missed/empty pool cycle
+            # must not reset the smoothed-mean state the next measured cycle resumes
+            # from. (m_smooth_prev is None when damping is off => byte-identical.)
             held = AxisOutcome(
                 name=axis.name, gate_open=False, reason="no pool (hold)", n=0,
                 mean=float("nan"), t_stat=0.0, fail_fraction=0.0, signed_error=0.0,
                 e_norm=0.0, gain_correction=1.0, frozen_wrong_sign=False,
                 u=float(st.last_u), scope=axis.scope)
             outcomes.append(held)
-            new_state[axis.name] = AxisState(last_u=st.last_u, history=st.history).to_dict()
+            new_state[axis.name] = AxisState(
+                last_u=st.last_u, history=st.history,
+                m_smooth_prev=st.m_smooth_prev).to_dict()
             if axis.scope == "surface":
                 delta = delta + build_surface_delta(
                     held, L=L, position_classes=position_classes,
@@ -898,13 +1007,25 @@ def seed_warmstart(*, seed_metrics: dict, axes: list, cfg: AdaptiveBiasConfig,
     outcomes: list = []
     tele: dict = {}
     state: dict = {}
+    # Carry the seed's own value forward as the cycle-1 EWMA/derivative prior, but
+    # only when a damping feature consumes it (else None => byte-identical state dict).
+    damping_on = (cfg.measurement_ewma_alpha < 1.0) or (cfg.derivative_gain != 0.0)
     for axis in axes:
         val = seed_metrics.get(axis.metric_column)
         if val is None or not math.isfinite(val):
             continue
-        e = signed_deadband_error(float(val), axis)
+        seed_msp = float(val) if damping_on else None
+        # Honor the soft 'ramp' deadband when --controller_damping is on, so a seed
+        # off target (but inside the hard deadband) still warm-starts. Default 'hard'
+        # => byte-identical.
+        e = signed_deadband_error(float(val), axis, mode=cfg.deadband_mode)
         if e == 0.0:
             tele[axis.name] = {"seed_value": val, "u": 0.0, "in_deadband": True}
+            # Still seed the damping prior (the loop yields no AxisOutcome here, but
+            # cycle 1 needs m_smooth_prev to start its EWMA/derivative from the seed).
+            if damping_on:
+                state[axis.name] = AxisState(
+                    last_u=0.0, history=[], m_smooth_prev=seed_msp).to_dict()
             continue
         u = float(np.clip(strength * cfg.gain * (e / axis.error_scale),
                           -cfg.max_nats, cfg.max_nats))
@@ -914,7 +1035,8 @@ def seed_warmstart(*, seed_metrics: dict, axes: list, cfg: AdaptiveBiasConfig,
                          gain_correction=1.0, frozen_wrong_sign=False, u=u,
                          scope=axis.scope)
         outcomes.append(oc)
-        state[axis.name] = AxisState(last_u=u, history=[]).to_dict()
+        state[axis.name] = AxisState(last_u=u, history=[],
+                                     m_smooth_prev=seed_msp).to_dict()
         tele[axis.name] = {"seed_value": val, "u": round(u, 4)}
         if axis.scope == "surface":
             delta = delta + build_surface_delta(
