@@ -538,6 +538,16 @@ if [[ "${COMPOSITION_SOFT_BIAS:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|
         && COMPOSITION_CLI+=( --composition_soft_bias_nats "$COMPOSITION_SOFT_BIAS_NATS" )
 fi
 
+# AA-composition baseline reference (opt-in; unset => byte-identical default of
+# the EC-3 hydrolase distribution). AA_REFERENCE=<key> selects which Swiss-Prot
+# distribution the over-representation checks (class-balanced bias_AA + the
+# adaptive hydrophobic over-rep mask) score against — set it to the design's own
+# EC class for a non-hydrolase enzyme (e.g. swissprot_ec2_transferases_2026_01).
+# Validated at parse time by iterative_design.py against REFERENCE_DISTRIBUTIONS.
+AA_REFERENCE_CLI=()
+[[ -n "${AA_REFERENCE:-}" ]] \
+    && AA_REFERENCE_CLI+=( --aa_reference "$AA_REFERENCE" )
+
 # WS-E sampling-core safety (opt-in; unset => byte-identical):
 #   BIAS_TOTAL_CLAMP=<nats>          bound the effective bias_k+bias_AA (suggest 3.0)
 #   BIAS_TOTAL_CLAMP_ODDS=<X>        CF-3a: same bound in ODDS space (T-invariant,
@@ -867,6 +877,7 @@ run_stage3_driver() {
             "${SHIP_SOLUBILITY_VETO_CLI[@]}" \
             "${SAP_CORRECTED_CLI[@]}" \
             "${COMPOSITION_CLI[@]}" \
+            "${AA_REFERENCE_CLI[@]}" \
             "${WS_E_CLI[@]}" \
             "${PLM_AUTOSKIP_CLI[@]}" \
             "$@" \

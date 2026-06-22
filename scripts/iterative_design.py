@@ -211,6 +211,32 @@ def _nonneg_finite_arg(value: str, *, max_value: Optional[float] = None) -> floa
     return v
 
 
+def _aa_reference_arg(value: str) -> str:
+    """Validate ``--aa_reference NAME`` against the bundled baseline keys.
+
+    NAME selects which Swiss-Prot AA-composition distribution the over-
+    representation baseline is scored against (z-scores / class-balance / the
+    hydrophobic over-rep mask). The default is the EC-3 hydrolase baseline; a
+    non-hydrolase enzyme should select its own EC class (e.g.
+    ``swissprot_ec2_transferases_2026_01``) so designs are compared to the
+    right distribution rather than the wrong one.
+
+    Fail-fast at parse time on an unknown key, listing the valid keys, so a
+    typo can never silently fall through to the wrong reference. The import is
+    deliberately LAZY (inside the function body): ``type=`` callables are only
+    invoked when a value is actually supplied, never for ``--help``, so this
+    keeps ``--help`` working even without ``protein_chisel`` on the path.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from protein_chisel.expression.aa_composition import REFERENCE_DISTRIBUTIONS
+    if value not in REFERENCE_DISTRIBUTIONS:
+        raise argparse.ArgumentTypeError(
+            f"unknown --aa_reference {value!r}; choose from "
+            f"{sorted(REFERENCE_DISTRIBUTIONS)}",
+        )
+    return value
+
+
 def _parse_charge_band_arg(s: str) -> tuple:
     """Parse ``--adaptive_charge_band 'LO,HI'`` -> ``(lo, hi)`` floats.
 
@@ -4539,6 +4565,7 @@ def run_cycle(
     position_table_df=None,           # for first-shell diversity injection
     omit_AA_per_residue: Optional[dict[str, str]] = None,
     catalytic_his_resnos: Optional[Iterable[int]] = None,
+    aa_reference: str = "swissprot_ec3_hydrolases_2026_01",
     balance_z_threshold: float = 2.0,
     design_ph: float = 7.5,
     instability_max: float = 60.0,
@@ -4758,7 +4785,7 @@ def run_cycle(
             )
         balance_telem = compute_class_balanced_bias_AA(
             pool_seq,
-            reference="swissprot_ec3_hydrolases_2026_01",
+            reference=aa_reference,
             exclude_aas=excl,
             suppress_all_overrep=composition_suppress_all_overrep,
             # Threshold 2.0: only fire swaps when BOTH ends of the
@@ -5249,6 +5276,21 @@ def main() -> None:
                         "exposed polar residues. Legacy sap_* are unchanged. (Rescued "
                         "backfill rows carry NaN sap_corr_* — they are not re-scored "
                         "for it.)")
+    # ---- AA-composition baseline reference (opt-in; default == legacy) -----------
+    p.add_argument("--aa_reference", type=_aa_reference_arg,
+                   default="swissprot_ec3_hydrolases_2026_01",
+                   metavar="NAME",
+                   help="AA-composition baseline distribution that the over-"
+                        "representation checks score against — the per-cycle "
+                        "class-balanced bias_AA and the adaptive-bias hydrophobic "
+                        "over-rep mask. Default 'swissprot_ec3_hydrolases_2026_01' "
+                        "(EC-3 hydrolases) is unchanged, so an un-passed flag is "
+                        "BYTE-IDENTICAL. Select the design's own EC class for a "
+                        "non-hydrolase enzyme (e.g. 'swissprot_ec2_transferases_"
+                        "2026_01', 'swissprot_enzyme_2026_01') so compositions are "
+                        "compared to the right distribution. Validated at parse "
+                        "time against the bundled REFERENCE_DISTRIBUTIONS keys "
+                        "(unknown -> error listing the valid keys).")
     # ---- WS-C composition control (opt-in, default OFF/None → byte-identical) ----
     p.add_argument("--composition_suppress_all_overrep", action="store_true",
                    help="Opt-in (default OFF → byte-identical). In the per-cycle "
@@ -6692,6 +6734,7 @@ def main() -> None:
             wt_fitness=wt_fitness,
             position_table_df=pt.df,
             omit_AA_per_residue=omit_AA_per_residue,
+            aa_reference=args.aa_reference,
             balance_z_threshold=args.balance_z_threshold,
             design_ph=args.design_ph,
             # Per-cycle filter thresholds: in 'annealing' strategy these
@@ -6756,7 +6799,8 @@ def main() -> None:
                 )
                 from protein_chisel.sampling.adaptive_bias import hydrophobic_over_rep_mask
                 _ab_overrep = (hydrophobic_over_rep_mask(
-                    seq_stage_df["sequence"].astype(str).tolist())
+                    seq_stage_df["sequence"].astype(str).tolist(),
+                    reference=args.aa_reference)
                     if "sequence" in seq_stage_df.columns else None)
                 ab_res = compute_adaptive_bias(
                     pool_df=seq_stage_df, axes=ab_axes, cfg=_ab_cfg, state=adaptive_state,

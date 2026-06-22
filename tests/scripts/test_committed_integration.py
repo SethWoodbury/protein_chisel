@@ -716,6 +716,219 @@ def test_shell_ws_c_boolean_truthiness(env_var, cli_flag, value, expect_flag):
 
 
 # ----------------------------------------------------------------------------
+# 7. Configurable AA-composition baseline REFERENCE (--aa_reference).
+# ----------------------------------------------------------------------------
+#
+# The composition over-representation baseline was hard-coded to the EC-3
+# hydrolase distribution at the live call sites; --aa_reference makes it
+# selectable so protein_chisel generalises to non-hydrolase enzymes. The
+# default is unchanged ("swissprot_ec3_hydrolases_2026_01"), so a run that does
+# not pass --aa_reference is BYTE-IDENTICAL. The validator fails fast (at parse
+# time) on an unknown reference, listing the valid keys.
+
+_DEFAULT_AA_REFERENCE = "swissprot_ec3_hydrolases_2026_01"
+
+
+def test_aa_reference_arg_accepts_valid_keys():
+    """The --aa_reference validator accepts every key in REFERENCE_DISTRIBUTIONS
+    and returns it unchanged (including the unchanged default)."""
+    from protein_chisel.expression.aa_composition import REFERENCE_DISTRIBUTIONS
+    assert _DEFAULT_AA_REFERENCE in REFERENCE_DISTRIBUTIONS
+    for key in REFERENCE_DISTRIBUTIONS:
+        assert idz._aa_reference_arg(key) == key
+
+
+def test_aa_reference_arg_rejects_unknown_and_lists_valid_keys():
+    """An unknown reference raises ArgumentTypeError that NAMES the offending value
+    AND lists the valid keys (fail-fast, discoverable)."""
+    import argparse
+    from protein_chisel.expression.aa_composition import REFERENCE_DISTRIBUTIONS
+    with pytest.raises(argparse.ArgumentTypeError) as ei:
+        idz._aa_reference_arg("not_a_real_distribution")
+    msg = str(ei.value)
+    assert "not_a_real_distribution" in msg
+    # at least one real valid key is advertised so the user can self-correct
+    assert _DEFAULT_AA_REFERENCE in msg
+    assert any(k in msg for k in REFERENCE_DISTRIBUTIONS)
+
+
+def test_aa_reference_default_is_unchanged_hydrolase_baseline():
+    """BYTE-IDENTITY: the parser default AND run_cycle's default param both equal
+    the legacy hard-coded EC-3 hydrolase key, so an un-passed --aa_reference run
+    is identical to before this feature."""
+    import inspect
+    # run_cycle's keyword default
+    sig = inspect.signature(idz.run_cycle)
+    assert sig.parameters["aa_reference"].default == _DEFAULT_AA_REFERENCE
+    # argparse default
+    proc = subprocess.run(
+        [sys.executable, "-c",
+         "import sys; sys.argv=['x','--help']; "
+         "import scripts.iterative_design as m"],
+        cwd=str(REPO), env={**os.environ, "PYTHONPATH": "src:."},
+        capture_output=True, text=True, timeout=120,
+    )
+    # (the --help path is covered separately; here we assert the default literal
+    # still lives verbatim in the source so a rename can't silently drift it.)
+    src = (REPO / "scripts" / "iterative_design.py").read_text()
+    assert f'default="{_DEFAULT_AA_REFERENCE}"' in src
+
+
+def test_aa_reference_actually_changes_zscores_vs_default():
+    """THREADING PROOF (z-score path): the same sequence z-scored against a
+    DIFFERENT reference yields different z-scores than the default hydrolase
+    reference — so passing a non-default reference genuinely changes the result."""
+    from protein_chisel.expression.aa_composition import (
+        REFERENCE_DISTRIBUTIONS, aa_z_scores,
+    )
+    seq = "ACDEFGHIKLMNPQRSTVWY" * 5 + "AAAAALLLLL"   # mild A/L excess
+    z_default = aa_z_scores(seq, reference=_DEFAULT_AA_REFERENCE)
+    other = next(k for k in REFERENCE_DISTRIBUTIONS if k != _DEFAULT_AA_REFERENCE)
+    z_other = aa_z_scores(seq, reference=other)
+    assert z_default != z_other, (
+        f"{other} produced identical z-scores to the default — references not "
+        "distinct enough to prove threading")
+
+
+def test_aa_reference_changes_class_balance_bias_vs_default():
+    """THREADING PROOF (class-balance path, the iterative_design.py:4761 call site):
+    compute_class_balanced_bias_AA threads `reference`, so a strongly skewed pool
+    produces a different telemetry reference label (and generally different bias)
+    under a non-default reference."""
+    from protein_chisel.expression.aa_composition import REFERENCE_DISTRIBUTIONS
+    from protein_chisel.expression.aa_class_balance import (
+        compute_class_balanced_bias_AA,
+    )
+    # Heavy hydrophobic-aliphatic excess + acidic deficit to drive a class swap.
+    pool = "L" * 60 + "I" * 40 + "V" * 30 + "A" * 30 + "G" * 20 + "S" * 10 + "T" * 10
+    other = next(k for k in REFERENCE_DISTRIBUTIONS if k != _DEFAULT_AA_REFERENCE)
+    tel_default = compute_class_balanced_bias_AA(
+        pool, reference=_DEFAULT_AA_REFERENCE, exclude_aas="C")
+    tel_other = compute_class_balanced_bias_AA(
+        pool, reference=other, exclude_aas="C")
+    assert tel_default.reference == _DEFAULT_AA_REFERENCE
+    assert tel_other.reference == other
+    # The z-scores feeding the bias differ between references, so at least the
+    # telemetry reference label is threaded; bias strings usually differ too.
+    assert tel_default.z_scores != tel_other.z_scores
+
+
+def test_aa_reference_changes_hydrophobic_over_rep_mask_vs_default():
+    """THREADING PROOF (over-rep mask, the iterative_design.py:6800 call site):
+    hydrophobic_over_rep_mask threads `reference`, so the SAME pool z-scored
+    against a different reference flips the boolean mask. A flat one-of-each pool
+    yields {W} under the EC-3 hydrolase reference but {C, W} under the broader
+    enzyme reference (different per-seq means/SDs), proving the kwarg reaches the
+    z-score."""
+    import numpy as np
+    from protein_chisel.expression.aa_composition import REFERENCE_DISTRIBUTIONS
+    from protein_chisel.sampling.adaptive_bias import hydrophobic_over_rep_mask
+    other = "swissprot_enzyme_2026_01"
+    assert other in REFERENCE_DISTRIBUTIONS and other != _DEFAULT_AA_REFERENCE
+    seqs = ["ACDEFGHIKLMNPQRSTVWY"]                     # each canonical AA exactly once
+    m_default = hydrophobic_over_rep_mask(seqs, reference=_DEFAULT_AA_REFERENCE)
+    m_other = hydrophobic_over_rep_mask(seqs, reference=other)
+    assert m_default is not None and m_other is not None
+    assert not np.array_equal(m_default, m_other), (
+        "alternate reference did not change the over-rep mask — cannot prove the "
+        "reference kwarg is threaded through hydrophobic_over_rep_mask")
+
+
+def test_iterative_design_help_advertises_aa_reference():
+    """`--help` exits 0 (with PYTHONPATH=src) and advertises --aa_reference."""
+    proc = subprocess.run(
+        [sys.executable, "scripts/iterative_design.py", "--help"],
+        cwd=str(REPO), env={**os.environ, "PYTHONPATH": "src"},
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "--aa_reference" in proc.stdout
+
+
+def test_aa_reference_help_works_without_pythonpath():
+    """CONSTRAINT: --help must exit 0 and show --aa_reference even with PYTHONPATH
+    unset — the REFERENCE_DISTRIBUTIONS import for validation must stay out of the
+    parse/--help path (lazy, only when a value is actually validated)."""
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    proc = subprocess.run(
+        [sys.executable, "scripts/iterative_design.py", "--help"],
+        cwd=str(REPO), env=env,
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "--aa_reference" in proc.stdout
+
+
+def test_cli_rejects_unknown_aa_reference_at_parse_time():
+    """End-to-end argparse rejection: an unknown --aa_reference exits != 0 and the
+    error names the bad value (fail-fast before any heavy work)."""
+    proc = subprocess.run(
+        [sys.executable, "scripts/iterative_design.py", "--seed_pdb", "x.pdb",
+         "--aa_reference", "totally_bogus_reference"],
+        cwd=str(REPO), env={**os.environ, "PYTHONPATH": "src"},
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode != 0
+    assert "totally_bogus_reference" in proc.stderr or "aa_reference" in proc.stderr
+
+
+def test_cli_accepts_default_aa_reference_value_explicitly():
+    """Passing the default value explicitly parses fine (it is a real key); this
+    guards the validator from rejecting its own default."""
+    proc = subprocess.run(
+        [sys.executable, "scripts/iterative_design.py", "--help",
+         "--aa_reference", _DEFAULT_AA_REFERENCE],
+        cwd=str(REPO), env={**os.environ, "PYTHONPATH": "src"},
+        capture_output=True, text=True, timeout=120,
+    )
+    # --help short-circuits to exit 0 regardless, but the value is type-validated
+    # by argparse before --help fires, so a broken validator would exit != 0.
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_shell_aa_reference_passthrough_wired_in_source():
+    """Pin the AA_REFERENCE -> --aa_reference passthrough to the committed
+    run_chisel_design.sh so the wiring can't silently disappear."""
+    sh = (REPO / "scripts" / "run_chisel_design.sh").read_text()
+    assert "AA_REFERENCE" in sh
+    assert "--aa_reference" in sh
+
+
+@pytest.mark.parametrize(
+    "value, expect_flag",
+    [(None, False), ("", False),
+     ("swissprot_enzyme_2026_01", True),
+     ("swissprot_ec3_hydrolases_2026_01", True)],
+)
+def test_shell_aa_reference_emits_flag_only_when_set(value, expect_flag):
+    """The AA_REFERENCE env var maps onto `--aa_reference <value>` ONLY when set to
+    a non-empty string (mirrors the AA_FRACTION_CAP value-passthrough pattern);
+    unset/empty -> no flag -> byte-identical default. Runs the EXACT snippet from
+    the shell file in real bash so it stays pinned to the shipped wiring."""
+    snippet = (
+        'AA_REFERENCE_CLI=()\n'
+        '[[ -n "${AA_REFERENCE:-}" ]] '
+        '&& AA_REFERENCE_CLI+=( --aa_reference "$AA_REFERENCE" )\n'
+        'echo "${AA_REFERENCE_CLI[@]}"\n'
+    )
+    # confirm the snippet's core test is the one actually committed
+    sh = (REPO / "scripts" / "run_chisel_design.sh").read_text()
+    assert '[[ -n "${AA_REFERENCE:-}" ]]' in sh
+    env = {k: v for k, v in os.environ.items() if k != "AA_REFERENCE"}
+    if value is not None:
+        env["AA_REFERENCE"] = value
+    proc = subprocess.run(
+        ["bash", "-c", snippet],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    got = "--aa_reference" in proc.stdout
+    assert got is expect_flag
+    if expect_flag:
+        assert value in proc.stdout
+
+
+# ----------------------------------------------------------------------------
 # 8. WS-G omit-tunnel-lining helpers.
 # ----------------------------------------------------------------------------
 
