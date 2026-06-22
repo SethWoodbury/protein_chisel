@@ -62,6 +62,15 @@ flowchart LR
 
 Bind-mount pattern: `--bind <REPO>:/code --env PYTHONPATH=/code/src` (where `<REPO>` is the auto-detected git checkout) lets every container import the package without a host-side `pip install`. See `scripts/run_chisel_design.sh` for the canonical bind set.
 
+### Cross-enzyme generalizability
+
+The pipeline was originally hard-wired to the PTE_i1 scaffold; four opt-in flags (defaults reproduce the PTE behavior) make it run on **any enzyme** (full descriptions in `docs/cli_reference.md` §13):
+
+- **`--chain CHAIN_ID`** (env `CHAIN`, default `"A"`) — the catalytic/design chain id used by *every* structural read (H-bond / clash / preorganization / interaction detection, sequence extraction, secondary structure, tunnel lining). The chain was previously hard-coded to `"A"`; the env passthrough forwards the flag only when `CHAIN != "A"`, so the default is byte-identical.
+- **`--catalytic_resnos R1,R2,…`** (env `CATALYTIC_RESNOS`) — fixed/protected catalytic residues, resolved **this flag > the seed's `REMARK 666` motif block > the hard-coded PTE_i1 builtin (`60,64,128,131,132,157`)**. Falling through to the builtin (no flag *and* no REMARK 666) emits a **loud warning** that the PTE residues are almost certainly wrong for a non-PTE scaffold — set the flag for any non-PTE seed without REMARK 666.
+- **`--no_require_cat_his_hbond`** (env `REQUIRE_CAT_HIS=0`, default ON) — disables **only** the struct-filter criterion requiring ≥1 side-chain H-bond to a catalytic His, for enzymes whose mechanism has no catalytic His (otherwise that criterion rejects every design). SAP-proxy and clash criteria are unaffected.
+- **`--aa_reference NAME`** (env `AA_REFERENCE`, default `swissprot_ec3_hydrolases_2026_01`) — the AA-composition baseline the over-representation checks (class-balanced `bias_AA` + the adaptive hydrophobic over-rep mask) score against. Select the design's own EC class for a non-hydrolase enzyme so z-scores compare to the right natural distribution; validated at parse time against `REFERENCE_DISTRIBUTIONS`.
+
 ## Per-cycle data flow
 
 A single cycle takes the previous cycle's `survivors_prev` DataFrame (columns from the same per-cycle rank step) and feeds it into two independent priors that compose with the PLM bias:
@@ -96,9 +105,9 @@ flowchart TD
 `src/protein_chisel/sampling/iterative_fusion.py::build_iteration_bias` builds `bias_{k+1} = base_bias + consensus_delta` where:
 
 - For each protein position whose class is in `{secondary_sphere, nearby_surface, distal_buried, distal_surface}` (legacy: `{first_shell, pocket, buried, surface}`) AND not in `fixed_resnos` (catalytic),
-- empirical per-position AA frequency over `survivor_sequences` — if the top AA's frequency `≥ consensus_threshold` (default 0.85), add `+consensus_strength` nats (default 2.0) to that AA's bias entry.
-- Cap: `max_augmented_fraction * L` positions augmented per cycle (default 0.30, ≈ 60 positions on PTE_i1 L=200). Top-agreement positions are kept when capped.
-- All three knobs are CLI-tunable (`--consensus_threshold/--consensus_strength/--consensus_max_fraction`); telemetry is written to `cycle_NN/00_bias/telemetry.json` (n_eligible, n_augmented, augmented_resnos_1idx, capped).
+- empirical per-position AA frequency over `survivor_sequences` — if the top AA's frequency `≥ consensus_threshold`, add `+consensus_strength` nats to that AA's bias entry.
+- Cap: `max_augmented_fraction * L` positions augmented per cycle (≈ 60 positions on PTE_i1 L=200 at the 0.30 `IterationConfig` default). Top-agreement positions are kept when capped.
+- All three knobs are CLI-tunable (`--consensus_threshold/--consensus_strength/--consensus_max_fraction`). The `IterationConfig` dataclass defaults are `0.85 / 2.0 / 0.30`, but the **driver's argparse defaults override them to `0.90 / 1.0 / 0.15`** (the production schedule — see `docs/cli_reference.md` §4). Telemetry is written to `cycle_NN/00_bias/telemetry.json` (n_eligible, n_augmented, augmented_resnos_1idx, capped).
 
 This was silently broken before the 2026-05-04 rewrite (a class-name mismatch made `n_positions_eligible = 0`); restoring it cost ~50 % of pairwise Hamming diversity in a parameter sweep, motivating the diversity-tunable knobs.
 
@@ -159,8 +168,17 @@ All steering — PLM fusion, consensus reinforcement, class balance, the adaptiv
 solubility controller, the composition levers — composes as **additive logit bias**
 that MPNN folds into its per-position softmax. The design synthesis is
 `docs/plans/controller_framework.md`; the shipped closed-loop controller is documented
-in `docs/adaptive_bias.md`. This section records the one principle that governs how all
-of these knobs *scale*.
+in `docs/adaptive_bias.md`. This section records the principle that governs how all of
+these knobs *scale*, the **damped control law** that became the default in 1.2.0, and the
+**independent math review** that validated the additive-log-odds combination and fixed
+the controller's scope.
+
+The **actuating** controller set is deliberately small and orthogonal —
+**{charge, surface (GRAVY), composition, throat}** — and is *not* expanded by the
+redundant solubility objectives (see *Independent math review* below). Each axis is a
+declarative `ControlAxis` (metric → target/band → per-AA actuator) in
+`src/protein_chisel/sampling/adaptive_bias.py`; only `charge` + `surface_hydrophobicity`
+are active by default, and the controller runs only under the opt-in `--adaptive_bias`.
 
 ### The odds-space scaling principle (why CF-1 exists)
 
@@ -185,9 +203,72 @@ The fix is to express clamps in **odds space**: `--adaptive_bias_max_odds X` (CF
 regardless of where the annealing schedule has `T` (helpers `nats_for_odds` /
 `odds_for_nats` live in `src/protein_chisel/sampling/bias_scale.py`). The same arithmetic
 explains the `--composition_soft_bias_nats` help text (a 0.5-nat penalty is ~12–28× at
-`T ≈ 0.15–0.20`) and motivates the `--bias_total_clamp` overflow guard on the combined
-effective bias. `--controller_verbose` (CF-5) logs each axis's `effective_odds = exp(u/T)`
-to `controller_trace.tsv` so this can be validated cycle-by-cycle.
+`T ≈ 0.15–0.20`) and motivates the `--bias_total_clamp` / `--bias_total_clamp_odds`
+(CF-3a) overflow guard on the **combined** effective bias (`--bias_total_clamp_odds X`
+clamps the whole stack at `T · ln(X)` per cycle, the same temperature-invariant principle
+applied to the sum rather than the controller's contribution alone).
+`--controller_verbose` (CF-5) logs each axis's `effective_odds = exp(u/T)` to
+`controller_trace.tsv` so this can be validated cycle-by-cycle.
+
+### Damped control law (ON by default as of 1.2.0)
+
+The controller's base law is a **gated leaky-integral PID with an online secant gain**
+(`step_axis`, treated as sound and left untouched — see the review below). In closed-loop
+testing on the cluster, that base law **under-damped against a *drifting* plant**: the
+survivor-pool mean is not a static target but drifts cycle-to-cycle as the bias and the
+upstream PLM/consensus interact, and the legacy law under-corrected, relaxed its integral
+the moment the pool was momentarily in-band, then ramped hard when the pool drifted back.
+A live trace **limit-cycled net charge −6.8 → −8.8 → −1.3** (a 49× drive ramp). As of
+**1.2.0 the damping is ON by default** (`--no_controller_damping` / `CONTROLLER_DAMPING=0`
+reverts to the legacy under-damped law); it bundles four classical stabilizers in one
+switch:
+
+- **EWMA of the measured pool mean** (`measurement_ewma_alpha = 0.5`) — react to the
+  filtered trend, not per-cycle sampling noise.
+- **derivative-on-measurement** (`derivative_gain = 0.5 · gain`) — anticipate the drift
+  and begin correcting *before* the hard ramp. Differentiating the measurement (not the
+  setpoint) avoids a derivative kick when the target/band changes.
+- **per-cycle slew limit** (`slew_limit_frac = 0.15` of `max_nats`) — bound how far the
+  drive can move in a single cycle, so no full-range lurch.
+- **soft 'ramp' deadband** — a continuous drive *through* target replacing the hard on/off
+  deadband, which kills the stick-slip that produced the limit cycle.
+
+The damped law **held charge stable at the −10 target across mid and hard seeds**
+(regression: the per-cycle drive swing fell 0.434 → 0.090, ~4.8×, vs the legacy 49× ramp).
+This is a **deliberate default-path change** — but it only affects runs that already pass
+`--adaptive_bias`; the `AdaptiveBiasConfig` library defaults remain no-op so the controller
+unit tests are byte-identical, and the legacy law is one flag away.
+
+### Independent math review (codex + subagent)
+
+Before shipping 1.2.0 the controller / MPNN-biasing math was put through an independent
+review (codex + a subagent). Three findings shaped the release:
+
+1. **The additive log-odds combination is sound.** Summing per-source biases in logit
+   space and folding them into `softmax((logits + bias)/T)` is exactly a
+   **product-of-experts** over the per-source likelihoods — equivalently **Bayesian
+   log-evidence pooling**: each expert (PLM fusion, consensus, class balance, each
+   controller axis) contributes additive log-evidence and the softmax renormalizes. So the
+   *structure* of the combination needs no change.
+2. **The two genuinely unsound parts, both now fixed.** (a) The **under-damped control
+   law** against a drifting plant (fixed by the default-ON damping above). (b) The lack of
+   a cap on **correlated, same-direction priors**: PLM fusion, consensus, and class-balance
+   can all push the *same* residues the *same* way, and because they add in log space they
+   **multiply in odds space** (the ~10¹³× lock) and over-bias far past any single source's
+   intended authority. The fix is the **odds-space clamps** — per-controller
+   (`--adaptive_bias_max_odds`) and on the combined stack (`--bias_total_clamp_odds`) — not
+   a change to the additive form.
+3. **Most "new" solubility objectives are redundant and must NOT become bias controllers.**
+   The catalog reduces to the existing actuators: **pI ≡ net charge** (both move D/E/K/R),
+   **SAP ≡ GRAVY-on-the-surface** (both move surface hydrophobics), **aliphatic ⊂ GRAVY**
+   (A/V/L/I are a hydrophobicity subset), and **instability = a dipeptide metric** with no
+   clean per-AA projection. Adding a pI controller or a SAP controller would **double-lock
+   the shared residues** (two axes fighting over the same D/E/K/R or surface-hydrophobic
+   AAs), which is precisely the correlated-prior failure mode of finding (2). They are
+   therefore kept as **liberal band filters + low-weight TOPSIS targets** (catch extremes
+   only), *not* actuating controllers. This is why the actuating set stays
+   **{charge, surface, composition, throat}**. Full objective catalog and tiering:
+   `docs/plans/controller_framework.md`.
 
 ### Seed triage (`--plm_autoskip_bad_input`)
 
