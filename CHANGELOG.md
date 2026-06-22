@@ -3,6 +3,24 @@
 All notable changes to **protein_chisel** are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions use semver.
 
+## [1.2.0] — controller effectiveness (damping ON by default, ⚠️ default-path change)
+
+After cluster validation + an independent math review (codex + subagent) of the controller/MPNN
+biasing, the closed-loop control law's **damping is now ON by default** (`--no_controller_damping`
+reverts). The legacy integral law under-damped against a *drifting* plant — a live trace showed
+charge limit-cycling −6.8→−8.8→−1.3 with a 49× ramp; the damped law (EWMA measurement 0.5 +
+derivative-on-measurement 0.5·gain + slew-limit 0.15·max_nats + soft 'ramp' deadband) held charge
+**stable at the −10 target across mid and hard seeds** (regression test: drive swing 0.434→0.090,
+~4.8×). This is a **deliberate default-path change** (like the 790a48b clash fix) — it only affects
+runs that already use `--adaptive_bias`, the `AdaptiveBiasConfig` library defaults remain no-op
+(the 53 controller unit tests are byte-identical), and `--no_controller_damping` / `CONTROLLER_DAMPING=0`
+restores the old law. The independent math review confirmed the additive log-odds combination is
+sound (product-of-experts) and that the "extra" objectives (pI≡charge, SAP≡GRAVY, aliphatic⊂GRAVY,
+instability) are redundant with existing controllers / best left as liberal filters — so no new bias
+controllers were added (they would double-lock). Also adds `--aa_reference` (configurable AA-composition
+baseline for non-hydrolase enzymes) and `--catalytic_resnos` (catalytic-residue override + loud
+PTE-fallback warning) for cross-enzyme generality. Host suite: 909 passed.
+
 ## [Unreleased] — diverse-backbone effectiveness (post-1.1.0, opt-in, byte-identical)
 
 Root-cause work after cluster validation revealed two reasons steering under-performed on

@@ -5461,9 +5461,12 @@ def main() -> None:
                         "'charge,surface_hydrophobicity'). Restrict (e.g. 'charge') "
                         "or, as future registry entries land, extend. An unknown "
                         "axis name is rejected.")
-    p.add_argument("--controller_damping", action="store_true", default=False,
-                   help="OPT-IN control-law DAMPING (default OFF => byte-identical to "
-                        "the legacy under-damped controller). The base law under-"
+    p.add_argument("--controller_damping", action="store_true", default=True,
+                   dest="controller_damping",
+                   help="Control-law DAMPING (ON by default as of 1.2.0; validated to "
+                        "stabilize charge regulation — held charge at target across mid "
+                        "+ hard seeds vs the legacy law's −6.8→−8.8→−1.3 limit-cycle. "
+                        "Pass --no_controller_damping to revert). The base law under-"
                         "corrects against a drifting/lagging plant, relaxes its "
                         "integral the moment the pool is momentarily in-band, then "
                         "ramps hard when the pool drifts back. This bundle adds four "
@@ -5475,6 +5478,10 @@ def main() -> None:
                         "lurch), and a soft 'ramp' deadband (continuous drive through "
                         "target, kills the stick-slip of the hard band). No effect "
                         "without --adaptive_bias.")
+    p.add_argument("--no_controller_damping", action="store_false",
+                   dest="controller_damping",
+                   help="Disable the default control-law damping (revert to the legacy "
+                        "under-damped integral law). No effect without --adaptive_bias.")
     p.add_argument("--controller_verbose", action="store_true", default=False,
                    help="CF-5 opt-in observability (default OFF => byte-identical). "
                         "With --adaptive_bias, after each cycle append one row per "
