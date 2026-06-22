@@ -5,6 +5,15 @@ A closed-loop controller that, across design cycles, measures the candidate pool
 biases toward target solubility. **Opt-in and default OFF** — with `--adaptive_bias`
 absent the pipeline is byte-identical to before.
 
+> **As of v1.2.0**, when the controller *does* run, its control-law **damping is ON by
+> default** (EWMA measurement + derivative-on-measurement + slew-limit + soft 'ramp'
+> deadband): it *regulates* setpoint instead of limit-cycling against a drifting pool
+> (the legacy law swung charge −6.8→−8.8→−1.3). `--no_controller_damping` reverts to the
+> legacy under-damped law. The base law described below is the *un-damped* integral
+> controller; see `docs/cli_reference.md` (controller section) and `docs/architecture.md`
+> (adaptive-controller framework + the independent math review) for the damping and the
+> odds-space clamps (`--adaptive_bias_max_odds`, `--bias_total_clamp_odds`).
+
 Source: `src/protein_chisel/sampling/adaptive_bias.py` (pure, unit-tested) +
 integration in `scripts/iterative_design.py`. Env passthrough: `ADAPTIVE_BIAS*` in
 `scripts/run_chisel_design.sh`.
