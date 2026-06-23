@@ -8,8 +8,10 @@ All notable changes to **protein_chisel** are documented here. Format loosely fo
 Four committee-debated refinements (architect + skeptic + codex math/stats), all **reusing existing
 machinery**. Features 1 & 2 are **opt-in and byte-identical by default**; **Feature 3 is a deliberate
 default-path change** (like the 1.2.0 damping flip) — a 3-nat bias-sum safety cap is now ON by default.
-The lead runs the cluster validation (soft-vs-cliff, clamp non-regression) before flipping any further
-default; this release ships the plan's defaults (cliff default, 3-nat clamp). Host suite: 1099 passed.
+**Cluster-validated** (soft-vs-cliff, clamp non-regression — `docs/validation/solubility_steering_validation.md`):
+the 3-nat clamp does not regress (kept default-ON), soft is seed-dependent and does NOT universally win
+(cliff stays default, soft opt-in), and the z-gate's cycle-0 cap-bootstrap was REMOVED as harmful. Host
+suite: 1102 passed.
 
 ### Added — F1: distribution-aware z-score over-representation gate in seed triage (opt-in)
 - New opt-in `--plm_autoskip_aa_zmax Z` (+ `--plm_autoskip_aa_log2_floor`, default 0.25) adds a
@@ -21,9 +23,11 @@ default; this release ships the plan's defaults (cliff default, 3-nat clamp). Ho
   pass the design's own EC class via `--aa_reference` (the EC-3 default is wrong for non-hydrolases — see
   `docs/cli_reference.md`). The fold-change floor stops a rare-AA-at-high-z-but-trivial-% false trip; the
   one-sidedness ignores under-representation; `exclude_aas` drops an already-omitted Cys.
-- **Consequence (both, per the user):** flagged AAs both (a) contribute to `pathological` → drive the
-  triage PLM reduction, and (b) are logged prominently AND **armed into the cycle-0 composition
-  bootstrap** (the `expression_soft_bias` seed-map), so the composition cap targets them from cycle 0.
+- **Consequence:** flagged AAs (a) contribute to `pathological` → drive the triage PLM reduction, and
+  (b) are logged prominently and **capped per-cycle by the #29 `--composition_pool_fallback` cap**. (An
+  initial cycle-0 seed-bootstrap that force-armed them at *all* positions was REMOVED after cluster
+  validation showed it over-committed and degraded hard seeds — Chigh GRAVY −0.01→+0.46; #29 caps the
+  over-represented AAs correctly per-cycle from the sampled pool.)
 - Default `None` ⇒ the z-gate is off ⇒ byte-identical. Double opt-in (the whole triage is already behind
   `--plm_autoskip_bad_input`). Lazy-imported, so `--help` stays import-light.
 

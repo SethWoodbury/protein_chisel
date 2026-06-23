@@ -138,3 +138,49 @@ from them. Selecting `pi` without `CONTROLLER_COORDINATOR=1` is a deliberate sta
 double-count). For a *known-soluble* backbone, `PLM_AUTOSKIP_BAD_INPUT` is a no-op (it only fires on
 a pathological seed) and the PLM is kept. Seeds with GRAVY ≳ +1.4 (very hydrophobic *folds*) cannot
 be made soluble by surface design and should be pre-filtered upstream.
+
+## 7. v1.4.0 validation — z-gate, soft PLM, 3-nat clamp (`v14val/`)
+
+Same harness; 20 + 6 jobs. Seeds by **seed** GRAVY (which drives triage severity): severe
+Chigh/Bhigh (~+1.46), borderline Bmid (+0.68), soluble Blow/Clow (no GRAVY trip; triaged on over-rep).
+
+### 7.1 F3 — the 3-nat bias-sum clamp does NOT regress (kept default-ON)
+Clamp default-on vs `--no_bias_total_clamp`, identical otherwise:
+
+| seed | clamp ON (default) | clamp OFF |
+|---|---|---|
+| Blow (easy) | GRAVY −0.33, 16/16, fit −2.03 | −0.32, 16/16, −2.05 |
+| Clow (easy) | −0.57, 16/16 | −0.43, 16/16 |
+| Chigh (hard) | −0.01, 1/16 | −0.05, 0/16 |
+
+On/off match within noise on GRAVY *and* fitness — the 3-nat cap bounds the pathological lock without
+clipping a legit run. **Default-on confirmed.**
+
+### 7.2 F2 — soft PLM is seed-dependent; CLIFF stays default (soft opt-in)
+The first pass was confounded by the (now-removed) cap-bootstrap; the **clean** (bootstrap-off)
+soft-vs-cliff is decisive:
+
+| seed | cliff (plm→0) | soft (`soft_zero=3`) |
+|---|---|---|
+| Chigh (severe, sev≥3) | 0.01, 1/16, fit −3.33 | 0.03, 1/16 (plm→0, **tie**) |
+| Bmid (borderline) | **0.22, 16/16** | 0.33, **5/16**, fit −2.37 (plm 0.57) |
+| Clow (soluble) | −0.03, 16/16, fit −2.05 | −0.16, **16/16, fit −1.77** (plm 1.04) |
+
+Cliff ≥ soft on pass-rate everywhere (decisively on Bmid 16 vs 5); soft only trades pass for fitness.
+The codex math held: a partial PLM does not rescue a pathological seed, and on a borderline one it
+re-introduces enough hydrophobic preference to fail the band. **→ cliff default, soft opt-in.**
+
+### 7.3 F1 — z-gate trigger+log kept; the cap-bootstrap REMOVED as harmful
+The z-gate signal is sound (flags A z=+4.69 / L z=+7.45 over the hydrolase ref with the log2 floor).
+But its "arm the cap" consequence force-armed those AAs into the cycle-0 soft-bias at **all 210
+positions**, which backfired: Chigh GRAVY **−0.01 → +0.46** (A-dominant 27%), Clow **−0.57 → +0.03**.
+Removing it restored the z-gate to harmless (Chigh back to +0.01); **#29 `--composition_pool_fallback`
+caps the over-represented AAs per-cycle correctly.** So the z-gate keeps the triage contribution + the
+prominent log; the cap is #29's per-cycle job.
+
+### 7.4 Documented follow-up — GRAVY-primary triage
+On a *soluble* seed triaged on over-representation alone (Clow: no GRAVY trip), the cliff *drops a
+helpful PLM* and loses fitness (−2.05) for no pass benefit, while keeping it (soft, plm 1.04) ships the
+same 16/16 at **better fitness (−1.77)**. This is the math review's original GRAVY-primary insight:
+over-representation alone arguably should not amputate the PLM on a soluble seed. Not changed this
+release (the over-rep trip is the user's "redundant signal"); flagged as the next refinement to weigh.
