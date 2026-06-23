@@ -582,6 +582,18 @@ def default_cycles(
     consensus_threshold: float = 0.85,
     consensus_strength: float = 2.0,
     consensus_max_fraction: float = 0.30,
+    # Acceptance bands. Each default is the CURRENT hardcoded FINAL
+    # (cycle-2, strictest) value, so an unparameterised call reproduces
+    # the legacy per-cycle schedule byte-for-byte. CLI flags / env vars
+    # override these (see main()'s --net_charge_* / --gravy_* / etc.).
+    net_charge_min: float = -18.0,
+    net_charge_max: float = -4.0,
+    sap_max_threshold: float = 100.0,
+    instability_max: float = 60.0,
+    gravy_min: float = -0.8,
+    gravy_max: float = 0.3,
+    aliphatic_min: float = 40.0,
+    boman_max: float = 4.5,
 ) -> list[CycleConfig]:
     """Three-cycle exploration → exploitation schedule.
 
@@ -596,6 +608,16 @@ def default_cycles(
         filters (charge band, pi band) stay constant throughout per
         the user's preference; only the LIGHT filters (instability,
         GRAVY, aliphatic, boman) and TOPSIS weights anneal.
+
+    Acceptance bands (``net_charge_min/max``, ``sap_max_threshold``,
+    ``instability_max``, ``gravy_min/max``, ``aliphatic_min``,
+    ``boman_max``, ``pi_min/max``) are the FINAL (strictest) band:
+      - ``constant`` strategy applies each one to EVERY cycle directly.
+      - ``annealing`` strategy applies the value to cycle 2 (final) and
+        relaxes cycles 1 and 0 from it by the fixed legacy offsets; the
+        charge / pi / sap bands stay CONSTANT across cycles ("only the
+        light filters anneal"). With all bands at their defaults the
+        annealing schedule is byte-identical to the legacy hardcoded one.
     """
     if strategy not in ("constant", "annealing"):
         raise ValueError(f"strategy must be 'constant' or 'annealing', got {strategy!r}")
@@ -610,70 +632,78 @@ def default_cycles(
         consensus_strength=consensus_strength,
         consensus_max_fraction=consensus_max_fraction,
     )
-    # Charge band and pi band stay constant (user pref: "the current
-    # range should be the final one"). Annealing only relaxes the
-    # *light* filters (instability/GRAVY/aliphatic/boman) early and
-    # uses TOPSIS for survivor selection late.
+    # Charge / sap / pi bands stay CONSTANT across cycles (user pref:
+    # "the current range should be the final one") in BOTH strategies.
+    charge_sap = dict(
+        net_charge_max=net_charge_max, net_charge_min=net_charge_min,
+        sap_max_threshold=sap_max_threshold,
+    )
     if strategy == "constant":
         return [
             CycleConfig(
                 cycle_idx=0, n_samples=500, sampling_temperature=0.20,
-                net_charge_max=-4.0, net_charge_min=-18.0,
-                sap_max_threshold=100.0, **common,
+                instability_max=instability_max,
+                gravy_min=gravy_min, gravy_max=gravy_max,
+                aliphatic_min=aliphatic_min, boman_max=boman_max,
+                **charge_sap, **common,
             ),
             CycleConfig(
                 cycle_idx=1, n_samples=400, sampling_temperature=0.18,
-                net_charge_max=-4.0, net_charge_min=-18.0,
-                sap_max_threshold=100.0, **common,
+                instability_max=instability_max,
+                gravy_min=gravy_min, gravy_max=gravy_max,
+                aliphatic_min=aliphatic_min, boman_max=boman_max,
+                **charge_sap, **common,
             ),
             CycleConfig(
                 cycle_idx=2, n_samples=300, sampling_temperature=0.15,
-                net_charge_max=-4.0, net_charge_min=-18.0,
-                sap_max_threshold=100.0, **common,
+                instability_max=instability_max,
+                gravy_min=gravy_min, gravy_max=gravy_max,
+                aliphatic_min=aliphatic_min, boman_max=boman_max,
+                **charge_sap, **common,
             ),
         ]
-    # Annealing — gentle relaxation, never tighten beyond defaults.
+    # Annealing — gentle relaxation, never tighten beyond the passed FINAL
+    # value. The passed value is the cycle-2 (strictest) band; cycles 1 and
+    # 0 relax from it by the FIXED legacy offsets (with all bands at their
+    # defaults this reproduces the legacy hardcoded schedule byte-for-byte).
     # Cycle 0 (explore): light filters loose; TOPSIS heavy on fitness;
     #                    survivors picked by fitness (legacy).
     # Cycle 1 (transition): light filters slightly loose; balanced
     #                    TOPSIS weights (defaults).
-    # Cycle 2 (exploit): light filters at default; default TOPSIS
-    #                    weights; survivors picked by TOPSIS so the
-    #                    final pool reinforces multi-objective good.
+    # Cycle 2 (exploit): light filters at the final band; default TOPSIS
+    #                    weights; survivors picked by TOPSIS so the final
+    #                    pool reinforces multi-objective good.
     return [
         CycleConfig(
             cycle_idx=0, n_samples=500, sampling_temperature=0.20,
-            net_charge_max=-4.0, net_charge_min=-18.0,
-            sap_max_threshold=100.0,
-            instability_max=80.0, gravy_min=-1.0, gravy_max=0.4,
-            aliphatic_min=30.0, boman_max=5.5,
+            instability_max=instability_max + 20.0,
+            gravy_min=gravy_min - 0.20, gravy_max=gravy_max + 0.10,
+            aliphatic_min=aliphatic_min - 10.0, boman_max=boman_max + 1.0,
             topsis_weight_overrides={
                 "fitness": 3.0,            # explore aggressively on fitness
                 "instability": 0.1, "gravy": 0.1, "aliphatic": 0.1,
                 "boman": 0.1, "pocket_hydrophobicity": 0.1,
             },
             use_topsis_for_survivors=False,
-            **common,
+            **charge_sap, **common,
         ),
         CycleConfig(
             cycle_idx=1, n_samples=400, sampling_temperature=0.18,
-            net_charge_max=-4.0, net_charge_min=-18.0,
-            sap_max_threshold=100.0,
-            instability_max=70.0, gravy_min=-0.9, gravy_max=0.35,
-            aliphatic_min=35.0, boman_max=5.0,
+            instability_max=instability_max + 10.0,
+            gravy_min=gravy_min - 0.10, gravy_max=gravy_max + 0.05,
+            aliphatic_min=aliphatic_min - 5.0, boman_max=boman_max + 0.5,
             topsis_weight_overrides={},        # balanced (defaults)
             use_topsis_for_survivors=True,
-            **common,
+            **charge_sap, **common,
         ),
         CycleConfig(
             cycle_idx=2, n_samples=300, sampling_temperature=0.15,
-            net_charge_max=-4.0, net_charge_min=-18.0,
-            sap_max_threshold=100.0,
-            instability_max=60.0, gravy_min=-0.8, gravy_max=0.3,
-            aliphatic_min=40.0, boman_max=4.5,
+            instability_max=instability_max,
+            gravy_min=gravy_min, gravy_max=gravy_max,
+            aliphatic_min=aliphatic_min, boman_max=boman_max,
             topsis_weight_overrides={},        # balanced (defaults)
             use_topsis_for_survivors=True,
-            **common,
+            **charge_sap, **common,
         ),
     ]
 
@@ -690,6 +720,14 @@ def debug_short_test_cycles(
     consensus_threshold: float = 0.85,
     consensus_strength: float = 2.0,
     consensus_max_fraction: float = 0.30,
+    net_charge_min: float = -18.0,
+    net_charge_max: float = -4.0,
+    sap_max_threshold: float = 100.0,
+    instability_max: float = 60.0,
+    gravy_min: float = -0.8,
+    gravy_max: float = 0.3,
+    aliphatic_min: float = 40.0,
+    boman_max: float = 4.5,
 ) -> list[CycleConfig]:
     """Hardcoded fast smoke-test preset: 20/10/10 samples across 3 cycles.
 
@@ -697,7 +735,8 @@ def debug_short_test_cycles(
     ``args.target_k`` to 5 and ``args.cycles`` to 3, even if the caller
     set them to other values on the same command line; a WARNING is
     logged when that happens so it isn't silent. Intended for end-to-
-    end pipeline validation only — never use for production runs.
+    end pipeline validation only — never use for production runs. Band
+    overrides are forwarded so a debug run honors the same flags.
     """
     cycles = default_cycles(
         omit_AA=omit_AA,
@@ -711,6 +750,14 @@ def debug_short_test_cycles(
         consensus_threshold=consensus_threshold,
         consensus_strength=consensus_strength,
         consensus_max_fraction=consensus_max_fraction,
+        net_charge_min=net_charge_min,
+        net_charge_max=net_charge_max,
+        sap_max_threshold=sap_max_threshold,
+        instability_max=instability_max,
+        gravy_min=gravy_min,
+        gravy_max=gravy_max,
+        aliphatic_min=aliphatic_min,
+        boman_max=boman_max,
     )
     for cyc, n_samples in zip(cycles, (20, 10, 10)):
         cyc.n_samples = n_samples
@@ -5482,12 +5529,11 @@ def main() -> None:
     p.add_argument("--pi_min", type=float, default=5.0,
                    help="Minimum theoretical pI. Default 5.0 selects the "
                         "least-acidic ~1%% of cycle-0 designs under the "
-                        "cycle-0 net-charge band (which comes from the "
-                        "per-cycle strategy schedule, not a CLI flag). Low "
-                        "cycle-0 pass rate is fine: consensus-bias iteration "
-                        "in cycle 1+ pulls subsequent cycles toward "
-                        "less-acidic sequences. Relax to 4.7 for higher "
-                        "cycle-0 pass at the cost of weaker selection "
+                        "net-charge band (see --net_charge_min/--net_charge_max; "
+                        "constant across cycles). Low cycle-0 pass rate is fine: "
+                        "consensus-bias iteration in cycle 1+ pulls subsequent "
+                        "cycles toward less-acidic sequences. Relax to 4.7 for "
+                        "higher cycle-0 pass at the cost of weaker selection "
                         "pressure.")
     p.add_argument("--pi_max", type=float, default=7.5)
     p.add_argument("--fpocket_druggability_min", type=float, default=0.30,
@@ -5982,24 +6028,48 @@ def main() -> None:
                         "sequence Hamming. Default 0 (disabled). Set "
                         "≥ 2 to enforce active-site diversity even "
                         "between designs that differ globally.")
+    p.add_argument("--net_charge_min", type=float, default=-18.0,
+                   help="Acceptance band: drop designs with net_charge_full_HH "
+                        "<= this (too acidic). Default -18.0. This is the FINAL "
+                        "(strictest) band; it stays CONSTANT across cycles in "
+                        "both strategies (charge does not anneal).")
+    p.add_argument("--net_charge_max", type=float, default=-4.0,
+                   help="Acceptance band: drop designs with net_charge_full_HH "
+                        ">= this (not acidic enough). Default -4.0. FINAL band; "
+                        "constant across cycles.")
+    p.add_argument("--sap_max_threshold", type=float, default=100.0,
+                   help="Acceptance band: drop designs with SAP (freesasa-proxy "
+                        "scale) above this. Default 100.0 (effectively OFF for "
+                        "PTE_i1). FINAL band; constant across cycles.")
     p.add_argument("--instability_max", type=float, default=60.0,
                    help="Light filter on Guruprasad 1990 instability index. "
                         "Lit threshold for native E. coli expression is 40, "
                         "but de novo designs run higher; default 60 catches "
-                        "truly broken sequences only. Set 9999 to disable.")
+                        "truly broken sequences only. Set 9999 to disable. "
+                        "This sets the FINAL (strictest) band; under "
+                        "--strategy annealing the earlier cycles relax from it "
+                        "by the fixed legacy offsets (c1=+10, c0=+20).")
     p.add_argument("--gravy_min", type=float, default=-0.8,
                    help="Light filter on Kyte-Doolittle GRAVY. Typical "
                         "soluble proteins fall in [-0.4, 0]; default [-0.8, "
-                        "0.3] is generous.")
-    p.add_argument("--gravy_max", type=float, default=0.3)
+                        "0.3] is generous. FINAL band; annealing relaxes "
+                        "earlier cycles by the legacy offsets (c1=-0.10, "
+                        "c0=-0.20).")
+    p.add_argument("--gravy_max", type=float, default=0.3,
+                   help="Upper Kyte-Doolittle GRAVY acceptance bound (default "
+                        "0.3). FINAL band; annealing relaxes earlier cycles "
+                        "(c1=+0.05, c0=+0.10).")
     p.add_argument("--aliphatic_min", type=float, default=40.0,
                    help="Light filter on Ikai 1980 aliphatic index. "
                         "Thermostable native: ~85-100. Default lower bound "
-                        "40 catches only extremely low-aliphatic outliers.")
+                        "40 catches only extremely low-aliphatic outliers. "
+                        "FINAL band; annealing relaxes earlier cycles "
+                        "(c1=-5, c0=-10).")
     p.add_argument("--boman_max", type=float, default=4.5,
                    help="Light filter on Boman index (PPI/sticky propensity). "
                         "Boman 2003 threshold ~2.5; default 4.5 catches only "
-                        "extreme cases.")
+                        "extreme cases. FINAL band; annealing relaxes earlier "
+                        "cycles (c1=+0.5, c0=+1.0).")
     p.add_argument("--n_term_pad", type=str, default="MSG",
                    help="N-terminal sequence pad added to the design body "
                         "BEFORE computing sequence-only metrics (charge, "
@@ -6815,6 +6885,14 @@ def main() -> None:
         consensus_threshold=args.consensus_threshold,
         consensus_strength=args.consensus_strength,
         consensus_max_fraction=args.consensus_max_fraction,
+        net_charge_min=args.net_charge_min,
+        net_charge_max=args.net_charge_max,
+        sap_max_threshold=args.sap_max_threshold,
+        instability_max=args.instability_max,
+        gravy_min=args.gravy_min,
+        gravy_max=args.gravy_max,
+        aliphatic_min=args.aliphatic_min,
+        boman_max=args.boman_max,
     )
     if args.debug_short_test:
         LOGGER.info(
