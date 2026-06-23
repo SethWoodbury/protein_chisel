@@ -527,6 +527,13 @@ if [[ "$ADAPTIVE_BIAS" != "0" ]]; then
     # 0.15*max_nats, soft 'ramp' deadband). Set CONTROLLER_DAMPING=0 (or false/no/off)
     # to revert to the legacy under-damped law.
     [[ "${CONTROLLER_DAMPING:-1}" =~ ^(0|[Ff][Aa][Ll][Ss][Ee]|[Nn][Oo]|[Oo][Ff][Ff])$ ]] && ADAPTIVE_BIAS_CLI+=( --no_controller_damping )
+    # CF-2/CF-3 opt-in multi-objective controller COORDINATOR (default OFF =>
+    # byte-identical). Truthy on 1/true/yes/on; routes the controller bias through a
+    # weight-partitioned signed-sum-bounded joint odds budget (shared actuators collapse
+    # by sign-selected max/sum) and enables the pI axis to share the charge actuator.
+    # CONTROLLER_CEILING=<X> overrides the joint controller odds ceiling (default 8).
+    [[ "${CONTROLLER_COORDINATOR:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]] && ADAPTIVE_BIAS_CLI+=( --controller_coordinator )
+    [[ -n "${CONTROLLER_CEILING:-}"   ]] && ADAPTIVE_BIAS_CLI+=( --controller_ceiling "$CONTROLLER_CEILING" )
 fi
 
 # Hard solubility veto (opt-in; default OFF => byte-identical). SHIP_SOLUBILITY_VETO=1

@@ -1355,3 +1355,182 @@ def test_shell_bias_total_clamp_odds_value_passthrough():
         capture_output=True, text=True, timeout=30,
     )
     assert unset_proc.stdout.strip() == ""
+
+
+# ----------------------------------------------------------------------------
+# CF-2 / CF-3 controller COORDINATOR — driver-level wiring + byte-identical default.
+# ----------------------------------------------------------------------------
+def test_iterative_design_help_advertises_controller_coordinator():
+    """`--help` advertises the CF-2/CF-3 --controller_coordinator + --controller_ceiling
+    flags (and must exit 0 with PYTHONPATH unset — the coordinator imports stay inside
+    the opt-in branch, never at parse time)."""
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    proc = subprocess.run(
+        [sys.executable, "scripts/iterative_design.py", "--help"],
+        cwd=str(REPO), env=env, capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "--controller_coordinator" in proc.stdout
+    assert "--controller_ceiling" in proc.stdout
+
+
+def test_controller_ceiling_rejects_non_positive_clamp():
+    """--controller_ceiling must be an odds multiplier > 1.0 (T*ln(X) must be a
+    positive clamp); <=1 fails fast at validation (after parse_args, before any file
+    access) even with the coordinator off. The four required args are supplied with
+    nonexistent paths so the custom validation block is reached."""
+    proc = subprocess.run(
+        [sys.executable, "scripts/iterative_design.py",
+         "--seed_pdb", "/nonexistent.pdb", "--ligand_params", "/nonexistent.params",
+         "--plm_artifacts_dir", "/nonexistent", "--position_table", "/nonexistent.tsv",
+         "--controller_ceiling", "0.5"],
+        cwd=str(REPO), env={**os.environ, "PYTHONPATH": "src"},
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode != 0
+    assert "--controller_ceiling must be a finite odds multiplier > 1.0" in proc.stderr
+
+
+@pytest.mark.parametrize(
+    "value, expect_flag",
+    [
+        ("0", False), ("false", False), ("off", False), ("", False),
+        ("no", False),
+        ("1", True), ("true", True), ("YES", True), ("On", True),
+    ],
+)
+def test_shell_controller_coordinator_truthiness(value, expect_flag):
+    """The run_chisel_design.sh CONTROLLER_COORDINATOR snippet maps {1,true,yes,on} ->
+    --controller_coordinator and everything else -> disabled (pinned to the shipped
+    regex run in real bash)."""
+    script = (
+        'ADAPTIVE_BIAS_CLI=()\n'
+        f'[[ "${{CONTROLLER_COORDINATOR:-0}}" =~ {_SHELL_TRUTHY_RE} ]] '
+        '&& ADAPTIVE_BIAS_CLI+=( --controller_coordinator )\n'
+        'echo "${ADAPTIVE_BIAS_CLI[@]}"\n'
+    )
+    proc = subprocess.run(
+        ["bash", "-c", script],
+        env={**os.environ, "CONTROLLER_COORDINATOR": value},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert ("--controller_coordinator" in proc.stdout) is expect_flag
+
+
+def test_shell_controller_coordinator_wired_in_source():
+    """Pin the CONTROLLER_COORDINATOR -> --controller_coordinator wiring (and the
+    CONTROLLER_CEILING passthrough) to the committed run_chisel_design.sh."""
+    src = (REPO / "scripts" / "run_chisel_design.sh").read_text()
+    assert "--controller_coordinator" in src
+    assert 'CONTROLLER_COORDINATOR:-0' in src
+    assert "--controller_ceiling" in src
+
+
+def test_run_cycle_coordinator_off_is_byte_identical_clamp_default():
+    """At the driver layer, the CF-3 nested-ceiling block is GATED on
+    controller_coordinator=True. With it False (the default), _clamp_bias_total runs
+    exactly as before — a None clamp returns bias_k unchanged (the same object) — so
+    the default sampler bias is byte-identical."""
+    rng = np.random.default_rng(0)
+    bias_k = rng.normal(0, 1.0, (12, 20)).astype(np.float32)
+    # the legacy None-clamp contract: same object back (no copy, no perturbation)
+    out = idz._clamp_bias_total(bias_k, None, None)
+    assert out is bias_k
+
+
+def test_driver_nested_clamp_roundtrip_matches_pure_nested_total_clip():
+    """The driver reconstructs bias_for_sampling = nested(rest, controller) − merged_vec
+    so that (bias_for_sampling + merged_vec) == the nested total. Verify the round-trip
+    against the pure nested_total_clip for a representative cell (the exact algebra the
+    inline driver block uses)."""
+    from protein_chisel.sampling.bias_scale import nats_for_odds
+    from protein_chisel.sampling.coordinator import (
+        nested_total_clip, TOTAL_CEILING, CONTROLLER_CEILING,
+    )
+    T = 0.15
+    total_nats = nats_for_odds(TOTAL_CEILING, T)
+    reserve = nats_for_odds(CONTROLLER_CEILING, T)
+    # one (1,20) cell: a saturated PLM stack in "rest" + a controller global on D.
+    merged_vec = np.zeros(20, dtype=np.float32)
+    from protein_chisel.sampling.adaptive_bias import AA_TO_IDX
+    merged_vec[AA_TO_IDX["D"]] = reserve            # controller pushed D to its reserve
+    controller_bucket = np.zeros((1, 20), dtype=np.float32)
+    controller_bucket[0, AA_TO_IDX["D"]] = reserve
+    bias_k = np.full((1, 20), 5.0, dtype=np.float32)  # huge PLM bias_k (the "rest")
+    eff_total = bias_k + merged_vec[None, :]
+    rest = eff_total - controller_bucket
+    nested = nested_total_clip(rest, controller_bucket, total_nats=total_nats,
+                               reserve_nats=reserve)
+    bias_for_sampling = (nested - merged_vec[None, :]).astype(np.float32)
+    # the sampler sees bias_for_sampling + merged_vec == nested (the bounded total)
+    assert np.allclose(bias_for_sampling + merged_vec[None, :], nested, atol=1e-6)
+    # and the bounded total respects the whole-stack ceiling everywhere
+    assert np.all(np.abs(nested) <= total_nats + 1e-6)
+    # the D cell keeps its full controller reserve on top of the saturated rest
+    assert nested[0, AA_TO_IDX["D"]] == pytest.approx(total_nats, abs=1e-6)
+
+
+def test_driver_nested_clamp_bypasses_clash_veto():
+    """The CF-3 driver nesting must NOT dilute the graded-clash VETO. A large clash
+    discouragement (in bias_k) rides OUTSIDE the nested clips, so the whole-stack
+    ceiling never weakens it — this reproduces the exact bypass algebra the inline
+    run_cycle block uses (rest = eff_total − reserved − veto_bypass; final = nested +
+    veto_bypass)."""
+    from protein_chisel.sampling.bias_scale import nats_for_odds, odds_for_nats
+    from protein_chisel.sampling.coordinator import (
+        nested_total_clip, TOTAL_CEILING, CONTROLLER_CEILING,
+    )
+    from protein_chisel.sampling.adaptive_bias import AA_TO_IDX
+    T = 0.15
+    total_nats = nats_for_odds(TOTAL_CEILING, T)
+    reserve = nats_for_odds(CONTROLLER_CEILING, T)
+    # one (1,20) cell: a -4 nat clash veto on W (a bulky AA), no controller, no merge.
+    bias_k = np.zeros((1, 20), dtype=np.float32)
+    clash = np.zeros((1, 20), dtype=np.float32)
+    clash[0, AA_TO_IDX["W"]] = -4.0          # graded clash discouragement
+    bias_k = bias_k + clash                   # clash rides in bias_k (as in base_bias)
+    merged_vec = np.zeros(20, dtype=np.float32)
+    # controller bucket = 0 here; veto bypass = the clash.
+    ctrl_reserved = np.zeros((1, 20), dtype=np.float32)
+    ctrl_overflow = np.zeros((1, 20), dtype=np.float32)
+    veto_bypass = clash + ctrl_overflow
+    eff_total = bias_k + merged_vec[None, :]
+    rest = eff_total - ctrl_reserved - veto_bypass
+    nested = nested_total_clip(rest, ctrl_reserved, total_nats=total_nats,
+                               reserve_nats=reserve) + veto_bypass
+    bias_for_sampling = (nested - merged_vec[None, :]).astype(np.float32)
+    # the clash veto survives the whole-stack clamp UN-diluted (still -4, not -0.72).
+    assert bias_for_sampling[0, AA_TO_IDX["W"]] == pytest.approx(-4.0, abs=1e-6)
+    # and a HYPOTHETICAL huge PLM stack in the rest IS bounded to the whole-stack
+    # ceiling (the bypass is surgical, not a blanket exemption).
+    bias_k2 = np.full((1, 20), 5.0, dtype=np.float32)
+    bias_k2[0, AA_TO_IDX["W"]] = 5.0 - 4.0    # PLM +5 with the -4 clash on W
+    clash2 = np.zeros((1, 20), dtype=np.float32)
+    clash2[0, AA_TO_IDX["W"]] = -4.0
+    veto2 = clash2
+    eff2 = bias_k2 + merged_vec[None, :]
+    rest2 = eff2 - ctrl_reserved - veto2
+    nested2 = nested_total_clip(rest2, ctrl_reserved, total_nats=total_nats,
+                                reserve_nats=reserve) + veto2
+    # the +5 PLM on a NON-clash AA is bounded to total_nats; on W the clash still applies.
+    assert nested2[0, AA_TO_IDX["A"]] <= total_nats + 1e-6
+    # W: rest (5-(-4)? no) -> rest2[W] = (5-4) - 0 - (-4) = 5, clipped to total-reserve,
+    # then + (-4) clash. So W is (total-reserve) - 4 <= bounded but clash preserved.
+    assert nested2[0, AA_TO_IDX["W"]] == pytest.approx((total_nats - reserve) - 4.0,
+                                                       abs=1e-6)
+
+
+def test_driver_nested_clamp_controller_ceiling_above_total_is_bounded():
+    """codex BUG-B edge: a controller ceiling LARGER than the whole-stack ceiling must
+    not let nested_total_clip overrun the total (reserve is capped at total)."""
+    from protein_chisel.sampling.bias_scale import nats_for_odds
+    from protein_chisel.sampling.coordinator import nested_total_clip
+    T = 0.15
+    total_nats = nats_for_odds(50.0, T)        # small whole-stack ceiling
+    reserve = nats_for_odds(1e6, T)            # absurdly large controller reserve
+    rest = np.full((2, 20), 9.0)
+    controller = np.full((2, 20), 9.0)
+    out = nested_total_clip(rest, controller, total_nats=total_nats,
+                            reserve_nats=reserve)
+    assert np.all(np.abs(out) <= total_nats + 1e-9)

@@ -4694,6 +4694,9 @@ def run_cycle(
     throat_bias_decay: float = 0.5,
     adaptive_bias_global: Optional[dict] = None,
     adaptive_bias_delta: Optional[np.ndarray] = None,
+    controller_coordinator: bool = False,
+    controller_ceiling: float = 8.0,
+    clash_bias: Optional[np.ndarray] = None,
 ) -> tuple[Optional[pd.DataFrame], dict[str, Path], dict]:
     """Run ONE iteration cycle. Returns (ranked DataFrame, pdb_map, cycle_telemetry).
 
@@ -4974,6 +4977,10 @@ def run_cycle(
     # Carried (raw, unmerged) from the previous cycle's adaptive controller; merge
     # it with THIS cycle's fresh class-balance bias (class-balance wins conflicts).
     # None unless --adaptive_bias, so the default path is byte-identical.
+    # CF-3: capture the CLASS-BALANCE-ONLY bias_AA *before* the controller merge so the
+    # nested-ceiling split below can recover the controller's SURVIVING global
+    # contribution (merged − class_balance), respecting "class-balance wins".
+    _class_balance_bias_AA = bias_AA_str
     if adaptive_bias_global:
         from protein_chisel.sampling.adaptive_bias import merge_bias_AA_strings
         bias_AA_str, _ab_conflicts = merge_bias_AA_strings(bias_AA_str, adaptive_bias_global)
@@ -5075,6 +5082,75 @@ def run_cycle(
                 LOGGER.info("cycle %d: bias_total_clamp=%.2f adjusted %d (pos,AA) cells "
                             "(effective bias_k+bias_AA bounded)",
                             cycle_cfg.cycle_idx, _clamp_nats, n_clamped)
+    # ---- CF-3 §(c) nested ceilings (BUG-B): reserve the controller's odds headroom
+    # INSIDE the whole-stack ceiling so BOTH bind. Opt-in via --controller_coordinator
+    # (default OFF => this block is skipped entirely => byte-identical). The controller
+    # bucket = the adaptive surface delta + the controller's SURVIVING global term
+    # (merged − class-balance, so "class-balance wins" is respected); the rest = the
+    # PLM+consensus+throat stack. cell_total = clip(rest, ±(total−reserve)) +
+    # clip(controller, ±reserve), all in nats at THIS cycle's T (the application T).
+    if controller_coordinator:
+        from protein_chisel.sampling.bias_scale import nats_for_odds as _nfo
+        from protein_chisel.sampling.adaptive_bias import (
+            AA_TO_IDX as _AAI, parse_bias_AA as _pba)
+        from protein_chisel.sampling.coordinator import (
+            nested_total_clip as _nested, TOTAL_CEILING as _TOTAL_CEIL)
+        _T = cycle_cfg.sampling_temperature
+        if _T is not None and _T > 0:
+            _total_nats = _nfo(_TOTAL_CEIL, _T)
+            _reserve_nats = _nfo(controller_ceiling, _T)
+            # controller's surviving global = merged bias_AA − class-balance-only.
+            _merged_vec = np.zeros(20, dtype=bias_k.dtype)
+            for _aa, _v in _pba(bias_AA_str).items():
+                if _aa in _AAI:
+                    _merged_vec[_AAI[_aa]] = _v
+            _cb_vec = np.zeros(20, dtype=bias_k.dtype)
+            for _aa, _v in _pba(_class_balance_bias_AA).items():
+                if _aa in _AAI:
+                    _cb_vec[_AAI[_aa]] = _v
+            _ctrl_global_vec = (_merged_vec - _cb_vec)[None, :]
+            _ctrl_delta = (adaptive_bias_delta.astype(bias_k.dtype)
+                           if (adaptive_bias_delta is not None
+                               and adaptive_bias_delta.shape == bias_k.shape)
+                           else np.zeros_like(bias_k))
+            # The controller bucket is the coordinator's BUDGET-tier output, already
+            # bounded to ±reserve per cell by coordinate() (the global D/E/K/R and the
+            # surface hydrophobic actuators are DISJOINT in AA space, so they never sum
+            # past reserve at any one (pos,AA)). Clip to ±reserve as a belt-and-suspenders
+            # carve-out — NOT a heuristic "excess == veto" split: a budget term must never
+            # be reclassified as veto and allowed to bypass the total ceiling (codex). A
+            # true controller VETO-tier axis (none exist today — veto = omit masks / the
+            # clash floor, applied OUTSIDE the controller) would need its own separate
+            # threading here; the pure coordinate() still preserves veto bypass for direct
+            # callers (test_veto_tier_bypasses_budget).
+            _controller_bucket = np.clip(_ctrl_delta + _ctrl_global_vec,
+                                         -_reserve_nats, _reserve_nats)
+            # VETO bypass for the graded-clash term: it is a ban (clash/omit/fraction-cap
+            # tier) and "bypasses the budget entirely (never diluted)". It rides in bias_k
+            # (folded into base_bias), so subtract it from the stack BEFORE the nested clip
+            # and add it back un-clipped afterward, so the whole-stack ceiling never
+            # weakens a clash discouragement. None (not threaded) => zero => unchanged.
+            _veto_bias = (clash_bias.astype(bias_k.dtype)
+                          if (clash_bias is not None
+                              and clash_bias.shape == bias_k.shape)
+                          else np.zeros_like(bias_k))
+            _eff_total = bias_for_sampling + _merged_vec[None, :]
+            # rest = the BUDGETED whole-stack remainder = effective total − the reserved
+            # controller − the clash veto bypass (so the nested clip bounds only what
+            # should be bounded; the controller gets ±reserve; the clash veto untouched).
+            _rest = _eff_total - _controller_bucket - _veto_bias
+            _nested_total = (_nested(_rest, _controller_bucket,
+                                     total_nats=_total_nats, reserve_nats=_reserve_nats)
+                             + _veto_bias)
+            _new_bias = (_nested_total - _merged_vec[None, :]).astype(bias_k.dtype)
+            _n_nested = int((np.abs(_new_bias - bias_for_sampling) > 1e-9).sum())
+            bias_for_sampling = _new_bias
+            if _n_nested:
+                LOGGER.info("cycle %d: controller_coordinator nested ceilings "
+                            "(total %.0fx=%.3f nats, controller reserve %.0fx=%.3f nats "
+                            "@ T=%.3f) adjusted %d (pos,AA) cells",
+                            cycle_cfg.cycle_idx, _TOTAL_CEIL, _total_nats,
+                            controller_ceiling, _reserve_nats, _T, _n_nested)
     cand_tsv = stage_sample(
         cycle_cfg=cycle_cfg, seed_pdb=seed_pdb, bias=bias_for_sampling,
         protein_resnos=protein_resnos, fixed_resnos=fixed_resnos,
@@ -5673,6 +5749,25 @@ def main() -> None:
                         "CONTROLLER REPORT to the log, for step-by-step chronological "
                         "validation. Advisory only — a trace write error never stops "
                         "the run. No effect without --adaptive_bias.")
+    p.add_argument("--controller_coordinator", action="store_true", default=False,
+                   help="CF-2/CF-3 opt-in multi-objective controller COORDINATOR "
+                        "(default OFF => byte-identical). With --adaptive_bias, route "
+                        "the controller's GLOBAL per-AA bias AND the (L,20) surface "
+                        "delta through a weight-partitioned, work-conserving, signed-"
+                        "sum-bounded JOINT odds budget instead of the legacy sum-then-"
+                        "rescale. Axes that share an ACTUATOR (e.g. charge and pI both "
+                        "drive D/E/K/R) collapse by sign-selected MAX (same-sign, anti-"
+                        "double-count) or signed SUM (opposite-sign) — never a second "
+                        "lock. The controller share is bounded to "
+                        "--controller_ceiling odds and nested INSIDE a ~1e3x whole-"
+                        "stack ceiling at the sampler (both bind, reserved headroom), "
+                        "all at the application-cycle T. Enables the pI axis to share "
+                        "the charge actuator. No effect without --adaptive_bias.")
+    p.add_argument("--controller_ceiling", type=float, default=8.0, metavar="X",
+                   help="Joint CONTROLLER odds ceiling for --controller_coordinator "
+                        "(default 8 = ODDS_STRONG; moves a pool meaningfully without "
+                        "locking it). Must be > 1.0. No effect without "
+                        "--controller_coordinator.")
     # ---- WS-E sampling-core safety (opt-in; defaults => byte-identical) ----
     p.add_argument("--bias_total_clamp", type=_nonneg_finite_arg, default=None,
                    metavar="NATS",
@@ -5994,6 +6089,12 @@ def main() -> None:
         p.error("--bias_total_clamp and --bias_total_clamp_odds are mutually exclusive "
                 "(one bounds the total bias in raw nats, the other in odds space); "
                 "set only one.")
+    # CF-3 coordinator: the joint controller odds ceiling must be a positive clamp
+    # (T*ln(X) > 0 <=> X > 1.0). Validated even when the coordinator is off so a typo
+    # fails fast rather than silently degrading the controller.
+    if not (math.isfinite(args.controller_ceiling) and args.controller_ceiling > 1.0):
+        p.error("--controller_ceiling must be a finite odds multiplier > 1.0 "
+                f"(T*ln(X) must be positive), got {args.controller_ceiling}")
     debug_short_test_override_msg = None
     if args.debug_short_test:
         if args.target_k != 5 or args.cycles != 3:
@@ -6867,6 +6968,10 @@ def main() -> None:
             carry=args.adaptive_bias_carry, t_min=args.adaptive_bias_tmin,
             f_min=args.adaptive_bias_fmin, min_n=args.adaptive_bias_min_n,
             mode=args.adaptive_bias_mode, max_odds=args.adaptive_bias_max_odds,
+            # CF-3 coordinator (opt-in; both default to the byte-identical legacy path
+            # when --controller_coordinator is absent).
+            coordinator=args.controller_coordinator,
+            controller_ceiling=args.controller_ceiling,
             **_ab_damp,
         )
         try:
@@ -6925,6 +7030,11 @@ def main() -> None:
                         "slew_limit_frac=%.2f deadband_mode=%s)",
                         _ab_cfg.measurement_ewma_alpha, _ab_cfg.derivative_gain,
                         _ab_cfg.slew_limit_frac, _ab_cfg.deadband_mode)
+        if args.controller_coordinator:
+            LOGGER.info("controller COORDINATOR ENABLED (CF-2/CF-3): joint odds budget "
+                        "%.0fx (controller share), nested inside ~%.0fx whole-stack "
+                        "ceiling; shared actuators collapse by sign-selected max/sum.",
+                        args.controller_ceiling, 1.0e3)
         # Optional cycle-0 warm-start from the input scaffold's own properties.
         if args.adaptive_bias_seed_from_input and _seed_gravy is not None:
             from protein_chisel.sampling.adaptive_bias import seed_warmstart
@@ -6951,8 +7061,14 @@ def main() -> None:
     # debug output to the log itself but the TSV is always there.
     cycle_metric_rows: list[dict] = []
 
-    for cyc in cycles:
+    for _cyc_pos, cyc in enumerate(cycles):
         cycle_dir = run_dir / f"cycle_{cyc.cycle_idx:02d}"
+        # The adaptive controller measures THIS cycle's pool but its bias is APPLIED at
+        # the NEXT cycle (a possibly lower, annealed T). The CF-3 coordinator sizes its
+        # odds budget at the APPLICATION-cycle T (math review §2.4); on the last cycle
+        # there is no next application, so fall back to this cycle's T (harmless).
+        _next_apply_T = (cycles[_cyc_pos + 1].sampling_temperature
+                         if _cyc_pos + 1 < len(cycles) else cyc.sampling_temperature)
         ranked_df, pdb_map, cyc_telem = run_cycle(
             cycle_cfg=cyc, seed_pdb=args.seed_pdb,
             base_bias=base_bias,
@@ -7013,6 +7129,15 @@ def main() -> None:
             throat_bias_decay=args.throat_feedback_decay,
             adaptive_bias_global=adaptive_global,
             adaptive_bias_delta=adaptive_delta,
+            # The coordinator's nested-ceiling clamp at the sampler is meaningful only
+            # when the controller is actually running (--adaptive_bias); without it the
+            # controller buckets are empty and the nesting would just clamp the PLM
+            # stack. Gate on BOTH so --controller_coordinator alone is a true no-op.
+            controller_coordinator=(args.controller_coordinator and args.adaptive_bias),
+            controller_ceiling=args.controller_ceiling,
+            # The graded-clash bias (VETO tier) so the nested whole-stack clamp can
+            # bypass it (a ban must never be diluted by the total ceiling).
+            clash_bias=clash_bias,
         )
         # Carry throat-bias forward to next cycle (None if disabled or
         # this cycle didn't produce one).
@@ -7051,16 +7176,19 @@ def main() -> None:
                     seq_stage_df["sequence"].astype(str).tolist(),
                     reference=args.aa_reference)
                     if "sequence" in seq_stage_df.columns else None)
+                # CF-3 owns bias-application timing: under --controller_coordinator the
+                # joint odds budget is sized at the APPLICATION-cycle T (the bias is
+                # applied NEXT cycle). The legacy CF-1 odds clamp keeps using THIS
+                # cycle's T so existing --adaptive_bias_max_odds runs stay byte-identical
+                # (the budget is the only thing that should track the application T).
+                _ctrl_T = (_next_apply_T if args.controller_coordinator
+                           else cyc.sampling_temperature)
                 ab_res = compute_adaptive_bias(
                     pool_df=seq_stage_df, axes=ab_axes, cfg=_ab_cfg, state=adaptive_state,
                     L=base_bias.shape[0], position_classes=position_classes,
                     sasa_fraction=_ab_sasa, fixed_idx=_ab_fixed_idx,
                     over_rep_mask=_ab_overrep, surface_mask=_ab_surface_mask,
-                    # this cycle's T; the bias is APPLIED next cycle at a (possibly
-                    # annealed, lower) T, so the odds clamp runs slightly loose under
-                    # annealing. Acceptable for the opt-in clamp; the CF-3 coordinator
-                    # will own bias-application timing (codex CF-1 review).
-                    temperature=cyc.sampling_temperature,
+                    temperature=_ctrl_T,
                 )
                 adaptive_state = ab_res.new_state
                 adaptive_global = ab_res.controller_global or None

@@ -265,6 +265,24 @@ class ControlAxis:
     # (e.g. a struct-stage SAP axis, whose sap_corr_* only exists post-fold) sets
     # its own key and the driver passes that frame in the ``pools`` mapping.
     pool_key: str = "seq"
+    # ---- CF-2 Actuator (opt-in; byte-identical when unset) ----
+    # The KNOB this axis drives. ``None`` (default) ⇒ the axis is its own actuator
+    # (legacy: the coordinator groups on ``actuator or name``, so an unset actuator
+    # means every axis is its own group and the budget algorithm reduces EXACTLY to
+    # today's per-axis behaviour). Multiple axes may share one actuator (e.g. charge
+    # and pI both drive ``charge_DEKR``): the coordinator then takes the sign-selected
+    # MAX (same-sign, anti-double-count) or signed SUM (opposite-sign) of their drives,
+    # never both as a second lock. Only consulted when ``--controller_coordinator`` is on.
+    actuator: Optional[str] = None
+    # Coordinator tier: ``"veto"`` (bans — clash/omit/fraction-cap — bypass the budget,
+    # never diluted) | ``"budget"`` (preference controllers share the joint odds budget)
+    # | ``"nudge"`` (low-weight reinforcing axes). Default ``"budget"``.
+    tier: str = "budget"
+    # Share of the joint controller odds budget for this axis's actuator group.
+    weight: float = 1.0
+    # Deterministic re-lend / tie-break order in the work-conserving budget (lower =
+    # earlier). Default 100.
+    priority: int = 100
 
 
 @dataclass
@@ -311,6 +329,16 @@ class AdaptiveBiasConfig:
     #   deadband) | "ramp" (drive the FULL signed error through target, i.e. drop the
     #   deadband subtraction — a continuous, no-dead-zone response that kills the
     #   stick-slip of the hard band relaxing/re-engaging at the edge).
+    # ---- CF-3 coordinator (opt-in; default False ⇒ byte-identical) ----
+    # When True, compute_adaptive_bias routes the GLOBAL per-AA vector AND the (L,20)
+    # surface delta through the CF-3 coordinator (weight-partitioned, sign-selected
+    # shared-actuator, signed-sum-bounded joint odds budget at CONTROLLER_CEILING)
+    # instead of the legacy global_per_aa_bias sum-then-rescale + per-axis surface
+    # accumulation. False (default) ⇒ the legacy calls run unchanged ⇒ byte-identical.
+    coordinator: bool = False
+    # Joint controller odds ceiling for the coordinator budget (only consulted when
+    # ``coordinator`` is True). Default 8x (ODDS_STRONG / coordinator.CONTROLLER_CEILING).
+    controller_ceiling: float = 8.0
 
 
 @dataclass
@@ -771,11 +799,18 @@ def build_surface_delta(outcome: AxisOutcome, *, L: int, position_classes: list,
 def default_axes(*, gravy_target: float = -0.2, gravy_band: tuple = (-0.8, 0.3),
                  net_charge_target: float = -10.0,
                  net_charge_band: tuple = (-18.0, -4.0),
+                 pi_target: float = 5.5, pi_band: tuple = (5.0, 7.5),
                  deadband_frac: float = 0.25,
                  basic_downweight_scale: float = 0.35,
                  charge_band: Optional[tuple] = None,
                  axes: Optional[list] = None) -> list:
-    """Build the controller axis registry (global charge + surface hydrophobicity).
+    """Build the controller axis registry (charge + surface hydrophobicity + pI).
+
+    The registry holds three axes but ``default_axes()`` returns only the historical
+    two (``charge``, ``surface_hydrophobicity``); ``pi`` is opt-in via the ``axes``
+    selector (and is only effective with ``--controller_coordinator`` so it shares the
+    charge actuator under max-not-sum). ``pi_target`` defaults to 5.5 (acidic, to match
+    the TOPSIS ``pi`` target) and ``pi_band`` to the seq-filter pI band (5.0–7.5).
 
     Targets default to ``scoring.multi_objective.DEFAULT_METRIC_SPECS``; bands come
     from the cycle's filter configuration. The deadband (``deadband_frac`` of the
@@ -811,6 +846,15 @@ def default_axes(*, gravy_target: float = -0.2, gravy_band: tuple = (-0.8, 0.3),
     g_half = max(g_hi - gravy_target, gravy_target - g_lo)
     c_lo, c_hi = net_charge_band
     c_half = max(c_hi - net_charge_target, net_charge_target - c_lo)
+    # pI band/target. The pI axis (opt-in via the ``axes`` selector + the coordinator)
+    # SHARES the charge actuator (D/E/K/R), so it is never a second lock. Target =
+    # 5.5 (acidic) to match scoring.multi_objective's TOPSIS ``pi`` target — acidic
+    # ⇒ drive D/E up, K/R down, the SAME sign convention as ``charge_weights``. The
+    # band defaults to the seq-filter pI band (5.0–7.5). ``pi_gap`` is a two-sided
+    # interval gap (>0 below pi_min OR above pi_max), so one column captures both
+    # the too-basic and the over-corrected too-acidic directions (mirrors gravy).
+    pi_lo, pi_hi = pi_band
+    pi_half = max(pi_hi - pi_target, pi_target - pi_lo)
     registry = {
         "charge": ControlAxis(
             name="charge", metric_column="net_charge_full_HH",
@@ -820,6 +864,7 @@ def default_axes(*, gravy_target: float = -0.2, gravy_band: tuple = (-0.8, 0.3),
             fail_high_column=charge_fail_high,
             fail_low_column=charge_fail_low,
             estimate_gain=False,   # merged with class-balance -> secant unreliable
+            actuator="charge_DEKR",
         ),
         "surface_hydrophobicity": ControlAxis(
             name="surface_hydrophobicity", metric_column="gravy",
@@ -831,6 +876,22 @@ def default_axes(*, gravy_target: float = -0.2, gravy_band: tuple = (-0.8, 0.3),
             # over-corrected too-hydrophilic directions via this single column.
             fail_high_column="selection__seq_filter_gap_gravy",
             fail_low_column=None,
+            actuator="gravy_surface",
+        ),
+        "pi": ControlAxis(
+            name="pi", metric_column="pi",
+            target=pi_target, band_lo=pi_lo, band_hi=pi_hi,
+            deadband=deadband_frac * pi_half, error_scale=pi_half, scope="global",
+            # pI is acidic-target: low pI ≡ negative charge (same physics), so it
+            # drives the SHARED charge_DEKR actuator (D/E up, K/R down) under
+            # max-not-sum — a reinforcing read of the same residues, never a second
+            # lock. estimate_gain off (it rides the class-balance-merged charge
+            # actuator, so the applied u ≠ requested u — same reason as charge).
+            aa_weights=charge_weights(basic_downweight_scale),
+            fail_high_column="selection__seq_filter_gap_pi",
+            fail_low_column=None,
+            estimate_gain=False,
+            actuator="charge_DEKR",
         ),
     }
     selected = axes if axes is not None else ["charge", "surface_hydrophobicity"]
@@ -888,6 +949,13 @@ def compute_adaptive_bias(*, pool_df: Optional[pd.DataFrame] = None,
     from protein_chisel.sampling.bias_scale import effective_clamp_nats
     _eff_max_nats = effective_clamp_nats(cfg.max_nats, cfg.max_odds, temperature)
     eff_cfg = cfg if _eff_max_nats == cfg.max_nats else _dc.replace(cfg, max_nats=_eff_max_nats)
+    # CF-3: coordinate ONLY when opted in AND the application-cycle temperature is
+    # usable (the joint odds budget is nats_for_odds(ceiling, T) — needs T>0). The
+    # in-loop surface accumulation and the post-loop global computation both branch on
+    # this single flag so they can never disagree (a coordinator run with an unusable T
+    # degrades cleanly to the legacy path, not to a half-coordinated state).
+    coordinated = bool(eff_cfg.coordinator
+                       and temperature is not None and temperature > 0)
     delta = np.zeros((L, 20), dtype=np.float32)
     outcomes: list = []
     new_state: dict = {}
@@ -919,7 +987,10 @@ def compute_adaptive_bias(*, pool_df: Optional[pd.DataFrame] = None,
             new_state[axis.name] = AxisState(
                 last_u=st.last_u, history=st.history,
                 m_smooth_prev=st.m_smooth_prev).to_dict()
-            if axis.scope == "surface":
+            # Legacy: accumulate the per-axis surface delta in-loop. Under the CF-3
+            # coordinator the (L,20) delta is produced jointly AFTER the loop (the
+            # actuator-grouped, budget-bounded coordinate_surface), so skip here.
+            if axis.scope == "surface" and not coordinated:
                 delta = delta + build_surface_delta(
                     held, L=L, position_classes=position_classes,
                     sasa_fraction=sasa_fraction, fixed_idx=fixed_idx, cfg=eff_cfg,
@@ -928,16 +999,39 @@ def compute_adaptive_bias(*, pool_df: Optional[pd.DataFrame] = None,
         oc, st_new = step_axis(primary, axis, st, eff_cfg)
         outcomes.append(oc)
         new_state[axis.name] = st_new.to_dict()
-        if axis.scope == "surface":
+        if axis.scope == "surface" and not coordinated:
             delta = delta + build_surface_delta(
                 oc, L=L, position_classes=position_classes,
                 sasa_fraction=sasa_fraction, fixed_idx=fixed_idx, cfg=eff_cfg,
                 over_rep_mask=over_rep_mask, surface_mask=surface_mask)
 
     axes_by_name = {a.name: a for a in axes}
-    controller_global = global_per_aa_bias(outcomes, axes_by_name, eff_cfg)
+    # CF-3 coordinator (opt-in): route BOTH the global per-AA vector and the (L,20)
+    # surface delta through the weight-partitioned, sign-selected, signed-sum-bounded
+    # joint odds budget at the application-cycle temperature. Default (coordinator off)
+    # ⇒ the legacy global_per_aa_bias + the in-loop delta accumulation above ⇒
+    # byte-identical.
+    if coordinated:
+        from protein_chisel.sampling.coordinator import coordinate as _coordinate
+        controller_global, delta = _coordinate(
+            outcomes, axes_by_name, eff_cfg, temperature, L=L,
+            position_classes=position_classes, sasa_fraction=sasa_fraction,
+            fixed_idx=fixed_idx, over_rep_mask=over_rep_mask,
+            surface_mask=surface_mask,
+            controller_ceiling=eff_cfg.controller_ceiling)
+    else:
+        # Coordinator off (or no usable temperature) ⇒ legacy global vector. The
+        # surface ``delta`` was already accumulated per-axis in the loop above.
+        controller_global = global_per_aa_bias(outcomes, axes_by_name, eff_cfg)
     merged, conflicts = merge_bias_AA_strings(class_balance_bias_AA, controller_global)
 
+    # Config snapshot for telemetry. When the coordinator is OFF, strip the two
+    # CF-3-only fields so adaptive_bias_telemetry.json is byte-identical to the
+    # pre-feature artifact (the new fields appear ONLY when the coordinator is engaged).
+    _cfg_snapshot = vars(eff_cfg)
+    if not cfg.coordinator:
+        _cfg_snapshot = {k: v for k, v in _cfg_snapshot.items()
+                         if k not in ("coordinator", "controller_ceiling")}
     telemetry = {
         "axes": [vars(oc) | {"u": round(oc.u, 4)} for oc in outcomes],
         "controller_global_bias_AA": controller_global,
@@ -945,12 +1039,19 @@ def compute_adaptive_bias(*, pool_df: Optional[pd.DataFrame] = None,
         "class_balance_conflicts": conflicts,
         "n_surface_positions_touched": int((np.abs(delta) > 1e-6).any(axis=1).sum()),
         "max_surface_penalty_nats": float(delta.min()) if delta.size else 0.0,
-        "config": vars(eff_cfg),
+        "config": _cfg_snapshot,
     }
     if cfg.max_odds is not None:               # only emit when the odds clamp is engaged
         telemetry["odds_clamp"] = {
             "max_odds": cfg.max_odds, "temperature": temperature,
             "eff_max_nats": round(float(_eff_max_nats), 4)}
+    if cfg.coordinator:                        # only emit when the coordinator is on
+        from protein_chisel.sampling.bias_scale import nats_for_odds as _nfo
+        telemetry["coordinator"] = {
+            "active": coordinated, "controller_ceiling": cfg.controller_ceiling,
+            "temperature": temperature,
+            "budget_nats": (round(float(_nfo(cfg.controller_ceiling, temperature)), 4)
+                            if coordinated else None)}
     return AdaptiveBiasResult(
         bias_AA_string=merged, controller_global=controller_global,
         per_position_delta=delta, outcomes=outcomes, new_state=new_state,
@@ -1059,4 +1160,25 @@ __all__ = [
     "merge_bias_AA_strings", "global_per_aa_bias", "build_surface_delta",
     "default_axes", "compute_adaptive_bias", "seed_warmstart",
     "hydrophobic_over_rep_mask",
+    # CF-3 coordinator (re-exported from .coordinator; see below).
+    "coordinate", "coordinate_global", "coordinate_surface", "nested_total_clip",
+    "CONTROLLER_CEILING", "TOTAL_CEILING",
 ]
+
+# CF-3 coordinator re-export — LAZY (PEP 562 module __getattr__) so callers can keep
+# importing the controller surface from a single module (adaptive_bias.coordinate, ...)
+# WITHOUT an import cycle: coordinator.py imports AA_ORDER / build_surface_delta from
+# THIS module, so a plain top-level re-export here would dead-lock when coordinator is
+# imported first (partially-initialised module). Resolving the name on first access
+# instead means the cycle is already fully built by the time anyone touches it.
+_COORDINATOR_REEXPORTS = frozenset({
+    "CONTROLLER_CEILING", "TOTAL_CEILING", "coordinate", "coordinate_global",
+    "coordinate_surface", "nested_total_clip",
+})
+
+
+def __getattr__(name: str):
+    if name in _COORDINATOR_REEXPORTS:
+        from protein_chisel.sampling import coordinator as _coord
+        return getattr(_coord, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
