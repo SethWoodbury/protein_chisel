@@ -950,6 +950,17 @@ def test_build_tunnel_lining_omit_empty_is_noop():
     assert idz._build_tunnel_lining_omit([50], "A", "XZ-") == {}     # non-canonical
 
 
+def test_canonical_omit_aas_derives_full_global_omit():
+    """The z-gate / composition exclusion drops EVERY hard-omitted canonical AA (not just
+    cysteine), so an un-pickable AA is never up-weighted, capped, nor used as an over-rep
+    signal (codex: a 'C'-only special-case missed --omit_AA WX => W could falsely trip)."""
+    assert idz._canonical_omit_aas("X") == ""
+    assert idz._canonical_omit_aas("CX") == "C"
+    assert idz._canonical_omit_aas("WX") == "W"
+    assert idz._canonical_omit_aas("cwx") == "CW"          # case-insensitive, X dropped
+    assert idz._canonical_omit_aas("") == ""
+
+
 def test_build_tunnel_lining_omit_rejects_degenerate_set():
     """codex: a too-large omit set would forbid nearly every AA at a lining
     position -> fused-MPNN samples uniformly from the 'forbidden' set. Reject it."""

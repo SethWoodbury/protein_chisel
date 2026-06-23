@@ -1129,6 +1129,18 @@ def _read_seed_tunnel_lining(tsv_path) -> set:
         return set()
 
 
+def _canonical_omit_aas(omit_AA: str) -> str:
+    """The canonical AAs the sampler is forbidden to pick, derived from an omit string.
+
+    Strips the structural ``X`` placeholder and upper-cases; returns the remaining hard-
+    omitted canonical AAs (e.g. ``"CX"`` -> ``"C"``, ``"WX"`` -> ``"W"``). Shared by the
+    WS-C composition exclusion and the seed-triage z-gate exclusion so that an AA the
+    sampler CANNOT pick is never up-weighted, capped, nor used as an over-representation
+    signal (codex: a single-cysteine special-case missed ``--omit_AA WX`` etc.).
+    """
+    return "".join(c for c in str(omit_AA).upper() if c != "X")
+
+
 def _build_tunnel_lining_omit(lining_resnos, chain: str, omit_aas: str, *,
                               fixed_resnos=()) -> dict[str, str]:
     """WS-G ``--omit_tunnel_lining``: forbid bulky/hydrophobic AAs at tunnel-lining
@@ -5021,7 +5033,7 @@ def run_cycle(
         pool_seq = "".join(_comp_pool_df["sequence"].astype(str).tolist())
         # exclude_aas matches cycle_cfg.omit_AA (default "X" or "CX") so
         # we don't try to up-weight an AA the sampler can't pick anyway.
-        excl = "".join(c for c in cycle_cfg.omit_AA.upper() if c != "X")
+        excl = _canonical_omit_aas(cycle_cfg.omit_AA)
         # ---- WS-C per-AA fraction cap (opt-in) -------------------------
         # Any AA whose fraction in the survivor pool is at/over the cap is
         # hard-omitted at every NON-FIXED designable position next cycle,
@@ -6698,9 +6710,11 @@ def main() -> None:
             _triage_gravy = float(_triage_ppm(
                 _triage_seq, ph=args.design_ph,
                 n_term_pad=args.n_term_pad, c_term_pad=args.c_term_pad).gravy)
-            # exclude_aas: drop an already-hard-omitted cysteine from the z-gate (capping
-            # it is redundant) — derived from the global omit per the plan ("C" if in omit).
-            _triage_exclude = "C" if "C" in str(args.omit_AA).upper() else ""
+            # exclude_aas: drop EVERY hard-omitted canonical AA from the z-gate — flagging
+            # over-representation of an AA the sampler cannot pick is meaningless and would
+            # falsely amputate the PLM. Derived from the global omit the same way the WS-C
+            # composition path does (codex: not just cysteine — --omit_AA WX must drop W too).
+            _triage_exclude = _canonical_omit_aas(args.omit_AA)
             _seed_assessment = assess_seed(
                 _triage_seq, _triage_gravy,
                 gravy_max=args.plm_autoskip_gravy,
