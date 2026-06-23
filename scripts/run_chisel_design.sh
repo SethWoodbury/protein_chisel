@@ -623,6 +623,33 @@ if [[ "${PLM_AUTOSKIP_BAD_INPUT:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]
     [[ -n "${PLM_AUTOSKIP_HYDROPHOBIC_FRAC:-}" ]] && PLM_AUTOSKIP_CLI+=( --plm_autoskip_hydrophobic_frac "$PLM_AUTOSKIP_HYDROPHOBIC_FRAC" )
 fi
 
+# Design acceptance bands (opt-in; each unset => byte-identical default). Set the
+# FINAL (strictest) acceptance band; under --strategy annealing the earlier cycles
+# relax from it by the fixed legacy offsets, while charge/sap/pi stay constant. Each
+# var emits its flag ONLY when set (mirrors the AA_FRACTION_CAP value-passthrough),
+# so a Slurm driver cell can override any band without changing the default run.
+#   NET_CHARGE_MIN  --net_charge_min     drop net_charge_full_HH <= X (acidic floor; default -18.0)
+#   NET_CHARGE_MAX  --net_charge_max     drop net_charge_full_HH >= X (acidic ceil;  default  -4.0)
+#   SAP_MAX         --sap_max_threshold  drop SAP (freesasa-proxy) above X (default 100.0 = off)
+#   GRAVY_MIN       --gravy_min          Kyte-Doolittle GRAVY lower bound (default -0.8)
+#   GRAVY_MAX       --gravy_max          Kyte-Doolittle GRAVY upper bound (default  0.3)
+#   INSTABILITY_MAX --instability_max    Guruprasad instability ceiling (default 60.0)
+#   ALIPHATIC_MIN   --aliphatic_min      Ikai aliphatic-index floor (default 40.0)
+#   BOMAN_MAX       --boman_max          Boman-index ceiling (default 4.5)
+#   PI_MIN          --pi_min             theoretical pI floor (default 5.0)
+#   PI_MAX          --pi_max             theoretical pI ceiling (default 7.5)
+ACCEPTANCE_BANDS_CLI=()
+[[ -n "${NET_CHARGE_MIN:-}"  ]] && ACCEPTANCE_BANDS_CLI+=( --net_charge_min "$NET_CHARGE_MIN" )
+[[ -n "${NET_CHARGE_MAX:-}"  ]] && ACCEPTANCE_BANDS_CLI+=( --net_charge_max "$NET_CHARGE_MAX" )
+[[ -n "${SAP_MAX:-}"         ]] && ACCEPTANCE_BANDS_CLI+=( --sap_max_threshold "$SAP_MAX" )
+[[ -n "${GRAVY_MIN:-}"       ]] && ACCEPTANCE_BANDS_CLI+=( --gravy_min "$GRAVY_MIN" )
+[[ -n "${GRAVY_MAX:-}"       ]] && ACCEPTANCE_BANDS_CLI+=( --gravy_max "$GRAVY_MAX" )
+[[ -n "${INSTABILITY_MAX:-}" ]] && ACCEPTANCE_BANDS_CLI+=( --instability_max "$INSTABILITY_MAX" )
+[[ -n "${ALIPHATIC_MIN:-}"   ]] && ACCEPTANCE_BANDS_CLI+=( --aliphatic_min "$ALIPHATIC_MIN" )
+[[ -n "${BOMAN_MAX:-}"       ]] && ACCEPTANCE_BANDS_CLI+=( --boman_max "$BOMAN_MAX" )
+[[ -n "${PI_MIN:-}"          ]] && ACCEPTANCE_BANDS_CLI+=( --pi_min "$PI_MIN" )
+[[ -n "${PI_MAX:-}"          ]] && ACCEPTANCE_BANDS_CLI+=( --pi_max "$PI_MAX" )
+
 # Decode-time Product-of-Experts backend (Phase: PoE; opt-in). Default 'bias' = the
 # in-process LigandMPNN sampler with our calibrated fusion bias (byte-identical).
 # MPNN_BACKEND=poe runs a SEPARATE HOST stage (nested apptainer is blocked) that
@@ -922,6 +949,7 @@ run_stage3_driver() {
             "${AA_REFERENCE_CLI[@]}" \
             "${WS_E_CLI[@]}" \
             "${PLM_AUTOSKIP_CLI[@]}" \
+            "${ACCEPTANCE_BANDS_CLI[@]}" \
             "$@" \
             ${EXTRA_DRIVER_FLAGS:-}
 }

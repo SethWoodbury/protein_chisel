@@ -207,17 +207,21 @@ def test_help_works_without_pythonpath():
     assert "--catalytic_resnos" in proc.stdout
 
 
-def test_pi_min_help_no_longer_references_phantom_flag():
-    """The --pi_min help text used to reference a non-existent --net_charge_max
-    argparse flag (net-charge bands come from the per-cycle strategy schedule).
-    The corrected help must NOT mention --net_charge_max as a flag."""
+def test_pi_min_help_no_longer_claims_net_charge_has_no_flag():
+    """The --pi_min help text used to claim the net-charge band "comes from the
+    per-cycle strategy schedule, not a CLI flag". Net-charge bands are now first-
+    class CLI flags (--net_charge_min/--net_charge_max), so the help must NOT make
+    that stale "not a CLI flag" claim, and the real flag must be advertised."""
     proc = subprocess.run(
         [sys.executable, "scripts/iterative_design.py", "--help"],
         cwd=str(REPO), env={**os.environ, "PYTHONPATH": "src"},
         capture_output=True, text=True, timeout=120,
     )
     assert proc.returncode == 0, proc.stderr
-    assert "--net_charge_max" not in proc.stdout
+    assert "not a CLI flag" not in proc.stdout
+    # the net-charge band is now a genuine, advertised CLI flag
+    assert "--net_charge_max" in proc.stdout
+    assert "--net_charge_min" in proc.stdout
 
 
 # ----------------------------------------------------------------------
