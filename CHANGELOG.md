@@ -3,6 +3,60 @@
 All notable changes to **protein_chisel** are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions use semver.
 
+## [1.4.0] — smarter seed-triage + a default bias-sum safety cap (⚠️ default-path change)
+
+Four committee-debated refinements (architect + skeptic + codex math/stats), all **reusing existing
+machinery**. Features 1 & 2 are **opt-in and byte-identical by default**; **Feature 3 is a deliberate
+default-path change** (like the 1.2.0 damping flip) — a 3-nat bias-sum safety cap is now ON by default.
+The lead runs the cluster validation (soft-vs-cliff, clamp non-regression) before flipping any further
+default; this release ships the plan's defaults (cliff default, 3-nat clamp). Host suite: 1099 passed.
+
+### Added — F1: distribution-aware z-score over-representation gate in seed triage (opt-in)
+- New opt-in `--plm_autoskip_aa_zmax Z` (+ `--plm_autoskip_aa_log2_floor`, default 0.25) adds a
+  **per-AA, distribution-aware** over-representation signal to the seed triage, **redundant with (ORed
+  to)** the flat `--plm_autoskip_max_aa_frac` so naturally-abundant (Leu/Ala) and rare (Trp/Cys) AAs are
+  judged fairly. An AA trips iff **one-sided `z >= Z` AND `log2_enrichment >= floor`** — reusing
+  `aa_composition.aa_z_scores` / `aa_log2_enrichment` (the existing `|z|>3 AND |log2|>0.25` precedent).
+  The z is a **population distance, not a significance test** (it divides by the between-sequence SD), so
+  pass the design's own EC class via `--aa_reference` (the EC-3 default is wrong for non-hydrolases — see
+  `docs/cli_reference.md`). The fold-change floor stops a rare-AA-at-high-z-but-trivial-% false trip; the
+  one-sidedness ignores under-representation; `exclude_aas` drops an already-omitted Cys.
+- **Consequence (both, per the user):** flagged AAs both (a) contribute to `pathological` → drive the
+  triage PLM reduction, and (b) are logged prominently AND **armed into the cycle-0 composition
+  bootstrap** (the `expression_soft_bias` seed-map), so the composition cap targets them from cycle 0.
+- Default `None` ⇒ the z-gate is off ⇒ byte-identical. Double opt-in (the whole triage is already behind
+  `--plm_autoskip_bad_input`). Lazy-imported, so `--help` stays import-light.
+
+### Added — F2: soft/graded `plm_strength` reduction in seed triage (opt-in; CLIFF stays default)
+- New opt-in `--plm_autoskip_soft` (+ `--plm_autoskip_soft_zero`, default 2.0) reduces `plm_strength`
+  **gradually** on a pathological seed instead of the 0/1 cliff: full strength at the trip threshold
+  (severity 1) decaying linearly to 0 at `soft_zero`. New pure `seed_triage.graded_plm_strength` +
+  `severity` helpers. **The cliff is the DEFAULT** because soft does NOT rescue a pathological seed (at
+  T≈0.15 even `plm_strength=0.4` is ~602× odds ≫ the 8× controller authority; parity with "off" only near
+  ~0.13) — soft is for cluster A/B comparison. `--plm_autoskip_soft` off ⇒ byte-identical (the cliff path
+  + `should_skip_plm` are preserved). The realized strength is recorded in `fusion_config.json`.
+
+### Changed — ⚠️ F3: the bias-sum safety cap (`--bias_total_clamp`) is ON BY DEFAULT at 3.0 nats
+- `--bias_total_clamp` now **defaults to 3.0 nats** (named constant
+  `_DEFAULT_BIAS_TOTAL_CLAMP_NATS`) instead of `None`, bounding the effective per-(pos,AA)
+  `bias_per_residue + global bias_AA` so the pathological 1e17–1e20× double-count lock can't recur on any
+  run (incl. pure-PLM, no `--adaptive_bias` needed). **3 nats is the safety value** — it preserves a legit
+  ~3-nat single-source PLM peak while capping the 6–20-nat double-count lock (codex: a fixed-nats cap is
+  the right semantic; the odds form / coordinator 1e3× would clip a legit peak). Reuses the standalone
+  `_clamp_bias_total`. **Opt-out: `--no_bias_total_clamp`** (or `NO_BIAS_TOTAL_CLAMP=1`) restores the
+  **exact pre-1.4.0 unclamped path**; an explicit `--bias_total_clamp`/`--bias_total_clamp_odds` suppresses
+  the 3-nat default (precedence resolved by the pure `_resolve_bias_total_clamp_default`, run after the
+  nats/odds mutual-exclusion so the injected default never participates). This **breaks default-path
+  byte-identity** (deliberate); the un-locker (the opt-in coordinator) is unchanged.
+
+### Unchanged — F4: side-chain context stays OFF (`sc=0`)
+- Unanimous: clash is already prevented by `compute_clash_prone_first_shell_omits`; `sc=1` collapses
+  first-shell diversity and would revert the deliberate v2 1→0 decision. No code change. Docs recommend the
+  already-shipped opt-in `--use_side_chain_context_schedule '1,1,0'` only for a *measured* residual clash.
+
+### Fixed — version drift
+- Reconciled `pyproject.toml` (was stuck at `1.0.0`) to `1.4.0`, matching `src/protein_chisel/__init__.py`.
+
 ## [1.2.0] — controller effectiveness (damping ON by default, ⚠️ default-path change)
 
 After cluster validation + an independent math review (codex + subagent) of the controller/MPNN

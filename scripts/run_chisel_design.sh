@@ -601,9 +601,16 @@ AA_REFERENCE_CLI=()
 #                                    Mutually exclusive with BIAS_TOTAL_CLAMP.
 #   SAMPLING_TEMPERATURE_FLOOR=<T>   raise any cycle temp to >= T (suggest 0.3)
 #   PLM_CLASS_STRENGTH=<k=v,...>     absolute per-class PLM weight overrides
+# NOTE (v1.4.0): --bias_total_clamp is now ON BY DEFAULT at 3.0 nats. Set
+# BIAS_TOTAL_CLAMP=<nats> to OVERRIDE the default, or NO_BIAS_TOTAL_CLAMP=1 to DISABLE the
+# cap entirely (the pre-1.4.0 unclamped path). Setting an explicit BIAS_TOTAL_CLAMP and
+# NO_BIAS_TOTAL_CLAMP together is rejected at parse time.
 WS_E_CLI=()
 [[ -n "${BIAS_TOTAL_CLAMP:-}"          ]] && WS_E_CLI+=( --bias_total_clamp "$BIAS_TOTAL_CLAMP" )
 [[ -n "${BIAS_TOTAL_CLAMP_ODDS:-}"     ]] && WS_E_CLI+=( --bias_total_clamp_odds "$BIAS_TOTAL_CLAMP_ODDS" )
+if [[ "${NO_BIAS_TOTAL_CLAMP:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]]; then
+    WS_E_CLI+=( --no_bias_total_clamp )
+fi
 [[ -n "${SAMPLING_TEMPERATURE_FLOOR:-}" ]] && WS_E_CLI+=( --sampling_temperature_floor "$SAMPLING_TEMPERATURE_FLOOR" )
 [[ -n "${PLM_CLASS_STRENGTH:-}"        ]] && WS_E_CLI+=( --plm_class_strength "$PLM_CLASS_STRENGTH" )
 
@@ -622,12 +629,26 @@ fi
 #                              regenerates without the PLM bias amplifying the bad seed.
 #   PLM_AUTOSKIP_GRAVY / PLM_AUTOSKIP_MAX_AA_FRAC / PLM_AUTOSKIP_HYDROPHOBIC_FRAC
 #                              triage thresholds (driver defaults 0.4 / 0.16 / 0.50).
+#   PLM_AUTOSKIP_AA_ZMAX=<z>   F1: opt-in distribution-aware z-gate (redundant OR with the
+#                              flat max-AA cap). Pass the design's own EC class via
+#                              AA_REFERENCE — the EC-3 default is wrong for non-hydrolases.
+#   PLM_AUTOSKIP_AA_LOG2_FLOOR=<l>  z-gate fold-change floor (default 0.25).
+#   PLM_AUTOSKIP_SOFT=1        F2: graded plm_strength reduction instead of the 0/1 cliff
+#                              (CLIFF is the default — soft does not rescue a pathological
+#                              seed; for A/B comparison only).
+#   PLM_AUTOSKIP_SOFT_ZERO=<s> severity at which the soft curve hits 0 (default 2.0).
 PLM_AUTOSKIP_CLI=()
 if [[ "${PLM_AUTOSKIP_BAD_INPUT:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]]; then
     PLM_AUTOSKIP_CLI+=( --plm_autoskip_bad_input )
     [[ -n "${PLM_AUTOSKIP_GRAVY:-}" ]]            && PLM_AUTOSKIP_CLI+=( --plm_autoskip_gravy "$PLM_AUTOSKIP_GRAVY" )
     [[ -n "${PLM_AUTOSKIP_MAX_AA_FRAC:-}" ]]      && PLM_AUTOSKIP_CLI+=( --plm_autoskip_max_aa_frac "$PLM_AUTOSKIP_MAX_AA_FRAC" )
     [[ -n "${PLM_AUTOSKIP_HYDROPHOBIC_FRAC:-}" ]] && PLM_AUTOSKIP_CLI+=( --plm_autoskip_hydrophobic_frac "$PLM_AUTOSKIP_HYDROPHOBIC_FRAC" )
+    [[ -n "${PLM_AUTOSKIP_AA_ZMAX:-}" ]]          && PLM_AUTOSKIP_CLI+=( --plm_autoskip_aa_zmax "$PLM_AUTOSKIP_AA_ZMAX" )
+    [[ -n "${PLM_AUTOSKIP_AA_LOG2_FLOOR:-}" ]]    && PLM_AUTOSKIP_CLI+=( --plm_autoskip_aa_log2_floor "$PLM_AUTOSKIP_AA_LOG2_FLOOR" )
+    if [[ "${PLM_AUTOSKIP_SOFT:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]]; then
+        PLM_AUTOSKIP_CLI+=( --plm_autoskip_soft )
+        [[ -n "${PLM_AUTOSKIP_SOFT_ZERO:-}" ]]    && PLM_AUTOSKIP_CLI+=( --plm_autoskip_soft_zero "$PLM_AUTOSKIP_SOFT_ZERO" )
+    fi
 fi
 
 # Design acceptance bands (opt-in; each unset => byte-identical default). Set the

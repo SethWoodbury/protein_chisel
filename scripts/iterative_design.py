@@ -1196,6 +1196,74 @@ def _clamp_bias_total(
     return np.where(clipped != total, clipped - g, bias_k).astype(bias_k.dtype)
 
 
+# F3 (v1.4.0): the bias-sum safety cap is ON BY DEFAULT at this many nats. 3 nats
+# preserves a legit ~3-nat single-source PLM peak (so a clean PLM-on run is essentially
+# unaffected) while capping the pathological 6-20-nat double-count lock (codex: a fixed-
+# nats cap is the right semantic — it allows <=3 nats at EVERY temperature, unlike the
+# odds form or the coordinator's 1e3x, both of which would clip a legit peak). This is a
+# deliberate default-path change (like the 1.2.0 damping flip); --no_bias_total_clamp
+# (or NO_BIAS_TOTAL_CLAMP=1) restores the exact pre-1.4.0 (unclamped) path.
+_DEFAULT_BIAS_TOTAL_CLAMP_NATS = 3.0
+
+
+def _resolve_bias_total_clamp_default(
+    *,
+    bias_total_clamp: Optional[float],
+    bias_total_clamp_odds: Optional[float],
+    no_clamp: bool,
+) -> Optional[float]:
+    """Decide the effective ``--bias_total_clamp`` (nats) after applying the F3 default.
+
+    Pure precedence resolver (keeps the driver glue a one-liner + makes the rule unit-
+    testable without argparse):
+
+    * ``no_clamp`` (``--no_bias_total_clamp``) -> ``None`` — the EXACT legacy path
+      (``_clamp_bias_total`` is then the identity no-op => byte-identical to pre-1.4.0).
+    * an explicit ``--bias_total_clamp`` (not ``None``, INCLUDING ``0.0``) -> kept verbatim
+      (the user's value wins; never silently bumped to the default).
+    * an explicit ``--bias_total_clamp_odds`` -> leave the nats clamp ``None`` so the odds
+      path owns the clamp that cycle AND the two never collide / falsely trip the existing
+      nats-vs-odds mutual-exclusion guard.
+    * otherwise (a bare run) -> inject :data:`_DEFAULT_BIAS_TOTAL_CLAMP_NATS` (3.0).
+
+    NOTE: callers must run this AFTER the existing nats-vs-odds mutual-exclusion check so
+    the injected default never participates in that check.
+    """
+    if no_clamp:
+        return None
+    if bias_total_clamp is not None:
+        return bias_total_clamp
+    if bias_total_clamp_odds is not None:
+        return None
+    return _DEFAULT_BIAS_TOTAL_CLAMP_NATS
+
+
+def _merge_seed_overrep_into_soft_bias(
+    soft_bias: dict[int, str],
+    *,
+    over_rep_aas: list[str],
+    n_positions: int,
+) -> dict[int, str]:
+    """Fold the seed-triage whole-protein ``over_rep_aas`` into the cycle-0
+    ``expression_soft_bias`` seed-map (0-indexed body position -> AAs to down-weight).
+
+    The z-gate over-rep is a WHOLE-PROTEIN signal, so each flagged AA is appended to EVERY
+    designable body position ``[0, n_positions)`` — that is exactly what arms the cycle-0
+    composition bootstrap (the existing ``soft_bias_to_bias_array`` path) to push those AAs
+    down from the very first cycle, before any survivors exist. Pre-existing local entries
+    are preserved and the per-position AA set is de-duplicated (str of sorted unique AAs).
+    Mutates a COPY-friendly dict in place and returns it; empty ``over_rep_aas`` /
+    ``n_positions==0`` is a no-op (returns the map unchanged).
+    """
+    if not over_rep_aas or n_positions <= 0:
+        return soft_bias
+    add = set("".join(over_rep_aas).upper())
+    for pos in range(n_positions):
+        existing = set(soft_bias.get(pos, ""))
+        soft_bias[pos] = "".join(sorted(existing | add))
+    return soft_bias
+
+
 # WS-C fraction cap never leaves a designable position with fewer than this many
 # sampleable AAs (guards the all-AAs-omitted → uniform-from-forbidden MPNN failure).
 _MIN_SAMPLEABLE_AAS_AFTER_CAP = 3
@@ -5817,12 +5885,20 @@ def main() -> None:
     # ---- WS-E sampling-core safety (opt-in; defaults => byte-identical) ----
     p.add_argument("--bias_total_clamp", type=_nonneg_finite_arg, default=None,
                    metavar="NATS",
-                   help="Opt-in (default None => byte-identical). Bound the EFFECTIVE "
-                        "per-(position,AA) sampling bias (bias_per_residue + global "
-                        "bias_AA) to ±NATS. The consensus(+2.0) + PLM-peak stack is "
-                        "otherwise uncapped; at T≈0.15 that locks a cell near-"
-                        "deterministically (~10^13x odds). Suggested production value "
-                        "~3.0 (an overflow/stacking guard, not a gentle regularizer).")
+                   help="Bound the EFFECTIVE per-(position,AA) sampling bias "
+                        "(bias_per_residue + global bias_AA) to ±NATS. As of v1.4.0 this "
+                        "is ON BY DEFAULT at 3.0 nats (a safety cap on the otherwise-"
+                        "uncapped consensus(+2.0)+PLM-peak stack, which at T≈0.15 locks a "
+                        "cell ~10^13x; 3 nats preserves a legit ~3-nat single-source PLM "
+                        "peak while capping the 6-20-nat double-count lock). Pass an "
+                        "explicit value to override the 3-nat default, or "
+                        "--no_bias_total_clamp to disable entirely (the pre-1.4.0 path). "
+                        "An overflow/stacking guard, not a gentle regularizer.")
+    p.add_argument("--no_bias_total_clamp", action="store_true", default=False,
+                   help="Opt OUT of the default 3-nat bias-sum safety cap (restores the "
+                        "exact pre-1.4.0 unclamped sampling bias). Mirrors the "
+                        "--no_controller_damping idiom. Mutually exclusive with an "
+                        "explicit --bias_total_clamp / --bias_total_clamp_odds.")
     p.add_argument("--bias_total_clamp_odds", type=float, default=None, metavar="X",
                    help="CF-3a opt-in (default None => byte-identical). Like "
                         "--bias_total_clamp but the ceiling is expressed in ODDS space "
@@ -6125,6 +6201,36 @@ def main() -> None:
                    help="Seed-triage single-AA fraction ceiling (default 0.16).")
     p.add_argument("--plm_autoskip_hydrophobic_frac", type=float, default=0.50, metavar="F",
                    help="Seed-triage hydrophobic-fraction ceiling (default 0.50).")
+    # ---- F1: opt-in distribution-aware z-score over-representation gate -----------
+    p.add_argument("--plm_autoskip_aa_zmax", type=float, default=None, metavar="Z",
+                   help="Opt-in (default None => z-gate OFF => byte-identical). Add a "
+                        "distribution-aware single-AA over-representation signal to the "
+                        "seed triage: an AA trips iff its one-sided z (vs --aa_reference's "
+                        "per-sequence mean+SD) >= Z AND its log2 enrichment >= "
+                        "--plm_autoskip_aa_log2_floor. REDUNDANT with (ORed to) the flat "
+                        "--plm_autoskip_max_aa_frac so naturally-abundant (Leu/Ala) and "
+                        "rare (Trp/Cys) AAs are judged fairly. The z is a population "
+                        "DISTANCE not a significance test; pass the design's own EC class "
+                        "via --aa_reference (the EC-3 default is wrong for non-hydrolases). "
+                        "Only active with --plm_autoskip_bad_input.")
+    p.add_argument("--plm_autoskip_aa_log2_floor", type=float, default=0.25, metavar="L",
+                   help="Fold-change floor for the z-gate (default 0.25): an AA must ALSO "
+                        "have log2(design%%/ref-global%%) >= L to trip, so a naturally-rare "
+                        "AA at high z but a trivial %% does not falsely trip. Matches the "
+                        "existing aa_quality_check |log2|>0.25 precedent.")
+    # ---- F2: opt-in soft/graded plm_strength reduction (CLIFF stays default) ------
+    p.add_argument("--plm_autoskip_soft", action="store_true", default=False,
+                   help="Opt-in (default OFF => the CLIFF: a pathological seed forces "
+                        "--plm_strength to 0). When set, REDUCE plm_strength gradually "
+                        "instead: full strength at the trip threshold (severity 1) decaying "
+                        "linearly to 0 at --plm_autoskip_soft_zero. NOTE: soft does NOT "
+                        "rescue a pathological seed (at T~0.15 even strength 0.4 is ~602x "
+                        "odds >> the 8x controller), so the cliff is the validated default; "
+                        "soft is for cluster A/B comparison.")
+    p.add_argument("--plm_autoskip_soft_zero", type=float, default=2.0, metavar="S",
+                   help="Severity at which the soft curve reaches plm_strength 0 (default "
+                        "2.0 = twice over the trip threshold). Only used with "
+                        "--plm_autoskip_soft; S<=1 degrades to the cliff.")
     args = p.parse_args()
     if not math.isfinite(args.plm_strength):
         p.error("--plm_strength must be finite")
@@ -6144,6 +6250,19 @@ def main() -> None:
                           ("--plm_autoskip_hydrophobic_frac", args.plm_autoskip_hydrophobic_frac)):
         if not (math.isfinite(_tval) and 0.0 < _tval <= 1.0):
             p.error(f"{_tname} must be a fraction in (0, 1], got {_tval}")
+    # F1 z-gate / F2 soft validation (only meaningful with --plm_autoskip_bad_input, but
+    # validate unconditionally so a typo fails fast). zmax must be a finite POSITIVE
+    # threshold (one-sided over-rep; <=0 is meaningless and would let the z=0 no-signal
+    # sentinel trip — codex); log2_floor finite; soft_zero finite (S<=1 is allowed —
+    # graded_plm_strength degrades it to the cliff).
+    if args.plm_autoskip_aa_zmax is not None and not (
+            math.isfinite(args.plm_autoskip_aa_zmax) and args.plm_autoskip_aa_zmax > 0.0):
+        p.error("--plm_autoskip_aa_zmax must be a finite positive z-threshold "
+                f"(one-sided over-representation), got {args.plm_autoskip_aa_zmax}")
+    if not math.isfinite(args.plm_autoskip_aa_log2_floor):
+        p.error("--plm_autoskip_aa_log2_floor must be finite")
+    if not math.isfinite(args.plm_autoskip_soft_zero):
+        p.error("--plm_autoskip_soft_zero must be finite")
     if args.adaptive_bias_max_odds is not None and not (
             math.isfinite(args.adaptive_bias_max_odds) and args.adaptive_bias_max_odds > 1.0):
         p.error("--adaptive_bias_max_odds must be a finite odds multiplier > 1.0 "
@@ -6159,6 +6278,22 @@ def main() -> None:
         p.error("--bias_total_clamp and --bias_total_clamp_odds are mutually exclusive "
                 "(one bounds the total bias in raw nats, the other in odds space); "
                 "set only one.")
+    # F3 (v1.4.0): --no_bias_total_clamp is the opt-OUT; pairing it with an explicit
+    # clamp value is contradictory (disable vs set). Check on the USER's explicit values
+    # BEFORE injecting the default below.
+    if args.no_bias_total_clamp and (
+            args.bias_total_clamp is not None or args.bias_total_clamp_odds is not None):
+        p.error("--no_bias_total_clamp (opt out of the default 3-nat cap) is mutually "
+                "exclusive with an explicit --bias_total_clamp / --bias_total_clamp_odds; "
+                "pass the value alone to set a custom cap, or --no_bias_total_clamp alone "
+                "to disable it.")
+    # F3: apply the default 3-nat safety cap (deliberate default-path change). Runs AFTER
+    # the mutual-exclusion checks so the injected default never participates in them.
+    args.bias_total_clamp = _resolve_bias_total_clamp_default(
+        bias_total_clamp=args.bias_total_clamp,
+        bias_total_clamp_odds=args.bias_total_clamp_odds,
+        no_clamp=args.no_bias_total_clamp,
+    )
     # CF-3 coordinator: the joint controller odds ceiling must be a positive clamp
     # (T*ln(X) > 0 <=> X > 1.0). Validated even when the coordinator is off so a typo
     # fails fast rather than silently degrading the controller.
@@ -6546,37 +6681,65 @@ def main() -> None:
     # the seed trips the triage, force plm_strength -> 0 BEFORE building the fusion so
     # LigandMPNN regenerates from structure + fixed residues. Default OFF => the fusion
     # below is byte-identical (imports + work happen only inside the opt-in branch).
+    # Whole-protein over-rep AAs the z-gate flags (always defined; only populated when the
+    # opt-in z-gate fires) — fed to the cycle-0 composition bootstrap below.
+    _triage_over_rep_aas: list[str] = []
     if args.plm_autoskip_bad_input:
         # ALL imports + work inside the try so a missing dep (e.g. Biopython for
         # protparam) degrades to "no skip" rather than crashing the run (codex).
-        _triage_skip = False
-        _triage_reasons = ""
+        _triage_new_strength = args.plm_strength
         try:
-            from protein_chisel.sampling.seed_triage import assess_seed, should_skip_plm
+            from protein_chisel.sampling.seed_triage import (
+                assess_seed, graded_plm_strength, severity as _seed_severity,
+            )
             from protein_chisel.io.pdb import extract_sequence as _triage_extract_seq
             from protein_chisel.filters.protparam import protparam_metrics as _triage_ppm
             _triage_seq = _triage_extract_seq(args.seed_pdb, chain=CHAIN)
             _triage_gravy = float(_triage_ppm(
                 _triage_seq, ph=args.design_ph,
                 n_term_pad=args.n_term_pad, c_term_pad=args.c_term_pad).gravy)
+            # exclude_aas: drop an already-hard-omitted cysteine from the z-gate (capping
+            # it is redundant) — derived from the global omit per the plan ("C" if in omit).
+            _triage_exclude = "C" if "C" in str(args.omit_AA).upper() else ""
             _seed_assessment = assess_seed(
                 _triage_seq, _triage_gravy,
                 gravy_max=args.plm_autoskip_gravy,
                 max_aa_frac=args.plm_autoskip_max_aa_frac,
-                hydrophobic_frac_max=args.plm_autoskip_hydrophobic_frac)
-            if should_skip_plm(_seed_assessment, enabled=True,
-                               current_plm_strength=args.plm_strength):
-                _triage_skip = True
-                _triage_reasons = "; ".join(_seed_assessment.reasons)
+                hydrophobic_frac_max=args.plm_autoskip_hydrophobic_frac,
+                aa_zmax=args.plm_autoskip_aa_zmax,
+                aa_reference=args.aa_reference,
+                aa_z_log2_floor=args.plm_autoskip_aa_log2_floor,
+                exclude_aas=_triage_exclude)
+            # Log the LOGIC of every z-gate trip: each tripped AA's z, log2, and reference
+            # (the reasons list already carries all three — emit them prominently).
+            if _seed_assessment.over_rep_aas:
+                _triage_over_rep_aas = list(_seed_assessment.over_rep_aas)
+                for _r in _seed_assessment.reasons:
+                    if "z=" in _r and "log2=" in _r:
+                        LOGGER.warning("SEED TRIAGE z-gate: %s", _r)
+                LOGGER.warning(
+                    "SEED TRIAGE z-gate flagged over-represented AAs %s (vs %s); these "
+                    "are armed into the cycle-0 composition bootstrap.",
+                    "".join(_triage_over_rep_aas), args.aa_reference)
+            # F2 policy: cliff (default) or soft/graded reduction of plm_strength.
+            _triage_new_strength = graded_plm_strength(
+                _seed_assessment, enabled=True,
+                current_plm_strength=args.plm_strength,
+                soft=args.plm_autoskip_soft,
+                soft_zero=args.plm_autoskip_soft_zero)
+            if _triage_new_strength != args.plm_strength:
+                _sev = _seed_severity(_seed_assessment)
+                _mode = ("soft (soft_zero=%.2f)" % args.plm_autoskip_soft_zero
+                         ) if args.plm_autoskip_soft else "cliff"
+                LOGGER.warning(
+                    "SEED TRIAGE [%s]: input scaffold is pathological (%s) -> "
+                    "severity %.3f -> --plm_strength %.2f -> %.3f (PLM bias would "
+                    "amplify the seed; LigandMPNN leans on structure + fixed residues).",
+                    _mode, "; ".join(_seed_assessment.reasons), _sev,
+                    args.plm_strength, _triage_new_strength)
         except Exception as _triage_exc:               # advisory; never crash the run
             LOGGER.warning("seed triage skipped (%s)", _triage_exc)
-        if _triage_skip:
-            LOGGER.warning(
-                "SEED TRIAGE: input scaffold is pathological (%s) -> forcing "
-                "--plm_strength %.2f -> 0.0 (PLM bias would amplify the seed; "
-                "LigandMPNN regenerates from structure + fixed residues).",
-                _triage_reasons, args.plm_strength)
-            args.plm_strength = 0.0
+        args.plm_strength = _triage_new_strength
     fusion_cfg = FusionConfig(global_strength=args.plm_strength)
     if _plm_class_overrides:
         fusion_cfg.class_weights.update(_plm_class_overrides)
@@ -6812,6 +6975,19 @@ def main() -> None:
     expression_soft_bias = wt_eng.soft_bias_per_residue(
         max_span_frac=_SOFT_BIAS_MAX_SPAN_FRAC,
     )
+    # F1 consequence (b): the z-gate's whole-protein over_rep_aas are folded into the
+    # cycle-0 soft-bias seed-map so the composition cap targets them from the first cycle
+    # (cycles 1+ rebuild the map from the survivor pool, so this is a cycle-0 bootstrap).
+    # Only when --composition_soft_bias consumes the map AND the z-gate flagged something.
+    if args.composition_soft_bias and _triage_over_rep_aas:
+        _n_before = len(expression_soft_bias)
+        expression_soft_bias = _merge_seed_overrep_into_soft_bias(
+            expression_soft_bias, over_rep_aas=_triage_over_rep_aas,
+            n_positions=len(protein_resnos))
+        LOGGER.warning(
+            "SEED TRIAGE z-gate -> cycle-0 composition bootstrap: armed over-rep AAs %s "
+            "at all %d designable body positions (was %d local soft-bias positions).",
+            "".join(_triage_over_rep_aas), len(protein_resnos), _n_before)
     if args.composition_soft_bias:
         LOGGER.info(
             "expression-engine SOFT_BIAS seed-bootstrap map: %d local positions "

@@ -1331,6 +1331,240 @@ def test_bias_total_clamp_and_clamp_odds_are_mutually_exclusive():
     assert "--bias_total_clamp" in proc.stderr
 
 
+# ----------------------------------------------------------------------------
+# F3 (v1.4.0): the 3-nat bias-sum safety cap is ON BY DEFAULT (deliberate
+# default-path change). The pure resolver decides the precedence; --no_bias_total_clamp
+# restores the exact legacy (None) path; an explicit --bias_total_clamp[_odds] suppresses
+# the injected default. The CLI smokes exercise the real argparse wiring end-to-end.
+# ----------------------------------------------------------------------------
+
+
+def test_default_bias_total_clamp_constant_is_three_nats():
+    """The default cap is the named constant (no magic number), set to 3.0 nats — the
+    value that preserves a legit ~3-nat single-source PLM peak while capping the 6-20-nat
+    double-count lock (codex)."""
+    assert idz._DEFAULT_BIAS_TOTAL_CLAMP_NATS == 3.0
+
+
+def test_resolve_clamp_default_injects_three_nats_when_nothing_passed():
+    """F3 default-path change: neither clamp flag passed AND not opted out => the resolver
+    injects the 3-nat default (this is what breaks legacy byte-identity, deliberately)."""
+    assert idz._resolve_bias_total_clamp_default(
+        bias_total_clamp=None, bias_total_clamp_odds=None, no_clamp=False
+    ) == idz._DEFAULT_BIAS_TOTAL_CLAMP_NATS
+
+
+def test_resolve_clamp_default_no_clamp_restores_legacy_none():
+    """--no_bias_total_clamp restores the EXACT legacy path: clamp resolves to None
+    (=> _clamp_bias_total is the identity no-op => byte-identical to pre-1.4.0)."""
+    assert idz._resolve_bias_total_clamp_default(
+        bias_total_clamp=None, bias_total_clamp_odds=None, no_clamp=True
+    ) is None
+
+
+def test_resolve_clamp_default_explicit_nats_suppresses_default():
+    """An explicit --bias_total_clamp X (incl. 0.0) suppresses the 3-nat default — the
+    user's value wins, never silently bumped to 3."""
+    assert idz._resolve_bias_total_clamp_default(
+        bias_total_clamp=5.0, bias_total_clamp_odds=None, no_clamp=False) == 5.0
+    assert idz._resolve_bias_total_clamp_default(
+        bias_total_clamp=0.0, bias_total_clamp_odds=None, no_clamp=False) == 0.0
+
+
+def test_resolve_clamp_default_explicit_odds_suppresses_default():
+    """An explicit --bias_total_clamp_odds X also suppresses the nats default (the odds
+    path owns the clamp that cycle); the nats default must stay None so the two don't
+    collide / falsely trip the mutual-exclusion guard."""
+    assert idz._resolve_bias_total_clamp_default(
+        bias_total_clamp=None, bias_total_clamp_odds=8.0, no_clamp=False) is None
+
+
+def test_default_run_clamp_is_on_via_real_module():
+    """End-to-end through the SHIPPED module: importing iterative_design and calling the
+    resolver with a bare-run signature yields 3.0 (the v1.4.0 default-path change)."""
+    code = (
+        "import iterative_design as idz;"
+        "print(idz._resolve_bias_total_clamp_default("
+        "bias_total_clamp=None,bias_total_clamp_odds=None,no_clamp=False))"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=str(REPO),
+        env={**os.environ, "PYTHONPATH": f"src{os.pathsep}scripts"},
+        capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "3.0"
+
+
+def test_iterative_design_help_advertises_no_bias_total_clamp():
+    """`--help` (host) advertises the new opt-out --no_bias_total_clamp and documents
+    the 3-nat default. Must exit 0 even with PYTHONPATH unset (no parse-time import)."""
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    proc = subprocess.run(
+        [sys.executable, "scripts/iterative_design.py", "--help"],
+        cwd=str(REPO), env=env, capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "--no_bias_total_clamp" in proc.stdout
+
+
+def test_no_bias_total_clamp_conflicts_with_explicit_clamp():
+    """Passing BOTH --no_bias_total_clamp AND --bias_total_clamp X is contradictory
+    (opt out vs set a value) => parse-time error. Supplies the 4 required paths so the
+    post-parse conflict block (not the missing-required error) is what fires."""
+    proc = subprocess.run(
+        [sys.executable, "scripts/iterative_design.py",
+         "--seed_pdb", "/nonexistent.pdb", "--ligand_params", "/nonexistent.params",
+         "--plm_artifacts_dir", "/nonexistent", "--position_table", "/nonexistent.tsv",
+         "--no_bias_total_clamp", "--bias_total_clamp", "3.0"],
+        cwd=str(REPO), env={**os.environ, "PYTHONPATH": "src"},
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode != 0, proc.stdout
+    assert "--no_bias_total_clamp" in proc.stderr and "mutually exclusive" in proc.stderr
+
+
+def test_explicit_odds_still_mutually_exclusive_with_explicit_nats_under_default():
+    """The default-injection must NOT break the existing nats/odds mutual-exclusion:
+    passing both explicit flags still errors (the injected default never participates).
+    Supplies the 4 required paths so the post-parse mutual-exclusion block is reached."""
+    proc = subprocess.run(
+        [sys.executable, "scripts/iterative_design.py",
+         "--seed_pdb", "/nonexistent.pdb", "--ligand_params", "/nonexistent.params",
+         "--plm_artifacts_dir", "/nonexistent", "--position_table", "/nonexistent.tsv",
+         "--bias_total_clamp", "3.0", "--bias_total_clamp_odds", "8.0"],
+        cwd=str(REPO), env={**os.environ, "PYTHONPATH": "src"},
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode != 0
+    assert "mutually exclusive" in proc.stderr
+
+
+def test_shell_no_bias_total_clamp_passthrough():
+    """NO_BIAS_TOTAL_CLAMP=1 emits --no_bias_total_clamp; unset emits nothing. Pins to
+    the shipped run_chisel_design.sh."""
+    sh = (REPO / "scripts" / "run_chisel_design.sh").read_text()
+    assert "NO_BIAS_TOTAL_CLAMP" in sh
+    snippet = (
+        'WS_E_CLI=()\n'
+        'if [[ "${NO_BIAS_TOTAL_CLAMP:-0}" =~ '
+        '^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]]; then\n'
+        '  WS_E_CLI+=( --no_bias_total_clamp )\n'
+        'fi\n'
+        'echo "${WS_E_CLI[@]}"\n'
+    )
+    on = subprocess.run(["bash", "-c", snippet],
+                        env={**os.environ, "NO_BIAS_TOTAL_CLAMP": "1"},
+                        capture_output=True, text=True, timeout=30)
+    assert on.stdout.strip() == "--no_bias_total_clamp"
+    off_env = {k: v for k, v in os.environ.items() if k != "NO_BIAS_TOTAL_CLAMP"}
+    off = subprocess.run(["bash", "-c", snippet], env=off_env,
+                         capture_output=True, text=True, timeout=30)
+    assert off.stdout.strip() == ""
+
+
+# ----------------------------------------------------------------------------
+# F1 (v1.4.0): the z-gate driver wiring — new flags advertised, env passthrough,
+# and the over_rep_aas -> cycle-0 composition-bootstrap helper.
+# ----------------------------------------------------------------------------
+
+
+def test_iterative_design_help_advertises_z_gate_flags():
+    """`--help` advertises the opt-in z-gate flags + soft flags; exits 0 PYTHONPATH-unset
+    (the z machinery is lazy-imported, never at parse time)."""
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    proc = subprocess.run(
+        [sys.executable, "scripts/iterative_design.py", "--help"],
+        cwd=str(REPO), env=env, capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    for flag in ("--plm_autoskip_aa_zmax", "--plm_autoskip_aa_log2_floor",
+                 "--plm_autoskip_soft", "--plm_autoskip_soft_zero"):
+        assert flag in proc.stdout, flag
+
+
+def test_cli_rejects_non_positive_aa_zmax():
+    """codex fix: --plm_autoskip_aa_zmax must be a finite POSITIVE z-threshold; <=0 (which
+    would let the z=0 no-signal sentinel trip) fails fast at parse time."""
+    for bad in ("0", "-1", "nan", "inf"):
+        proc = subprocess.run(
+            [sys.executable, "scripts/iterative_design.py",
+             "--seed_pdb", "/nonexistent.pdb", "--ligand_params", "/nonexistent.params",
+             "--plm_artifacts_dir", "/nonexistent", "--position_table", "/nonexistent.tsv",
+             "--plm_autoskip_aa_zmax", bad],
+            cwd=str(REPO), env={**os.environ, "PYTHONPATH": "src"},
+            capture_output=True, text=True, timeout=120,
+        )
+        assert proc.returncode != 0, (bad, proc.stdout)
+        assert "--plm_autoskip_aa_zmax" in proc.stderr
+
+
+def test_seed_overrep_bootstrap_map_adds_aas_at_every_designable_position():
+    """The pure helper that folds triage's whole-protein over_rep_aas into the cycle-0
+    expression_soft_bias seed-map: each over-rep AA is appended to EVERY designable body
+    position (0-indexed) so the composition cap targets them from cycle 0. Existing
+    entries are preserved + de-duplicated; empty over_rep_aas is a no-op."""
+    base = {0: "M", 2: "F"}                              # pre-existing local soft-bias
+    # 4 body positions; over-rep AAs A and V applied globally.
+    out = idz._merge_seed_overrep_into_soft_bias(
+        dict(base), over_rep_aas=["A", "V"], n_positions=4)
+    for pos in range(4):
+        assert "A" in out[pos] and "V" in out[pos]
+    assert "M" in out[0] and "F" in out[2]               # locals preserved
+    # de-dup: applying again doesn't double a letter.
+    out2 = idz._merge_seed_overrep_into_soft_bias(
+        out, over_rep_aas=["A"], n_positions=4)
+    assert out2[0].count("A") == 1
+    # empty over_rep_aas => unchanged map.
+    same = idz._merge_seed_overrep_into_soft_bias(dict(base), over_rep_aas=[], n_positions=4)
+    assert same == base
+
+
+def test_seed_overrep_bootstrap_empty_positions_is_safe():
+    """n_positions=0 (degenerate) yields an unchanged map (no crash)."""
+    assert idz._merge_seed_overrep_into_soft_bias({}, over_rep_aas=["A"], n_positions=0) == {}
+
+
+def test_shell_z_gate_value_passthrough():
+    """PLM_AUTOSKIP_AA_ZMAX / _AA_LOG2_FLOOR / PLM_AUTOSKIP_SOFT[_ZERO] emit their flags
+    only when --plm_autoskip_bad_input is on AND they're set. Pins to the shipped sh."""
+    sh = (REPO / "scripts" / "run_chisel_design.sh").read_text()
+    for tok in ("PLM_AUTOSKIP_AA_ZMAX", "PLM_AUTOSKIP_AA_LOG2_FLOOR",
+                "PLM_AUTOSKIP_SOFT", "PLM_AUTOSKIP_SOFT_ZERO"):
+        assert tok in sh, tok
+    snippet = (
+        'PLM_AUTOSKIP_CLI=()\n'
+        'if [[ "${PLM_AUTOSKIP_BAD_INPUT:-0}" =~ '
+        '^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]]; then\n'
+        '  PLM_AUTOSKIP_CLI+=( --plm_autoskip_bad_input )\n'
+        '  [[ -n "${PLM_AUTOSKIP_AA_ZMAX:-}" ]] && PLM_AUTOSKIP_CLI+=( --plm_autoskip_aa_zmax "$PLM_AUTOSKIP_AA_ZMAX" )\n'
+        '  [[ -n "${PLM_AUTOSKIP_AA_LOG2_FLOOR:-}" ]] && PLM_AUTOSKIP_CLI+=( --plm_autoskip_aa_log2_floor "$PLM_AUTOSKIP_AA_LOG2_FLOOR" )\n'
+        '  if [[ "${PLM_AUTOSKIP_SOFT:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]]; then\n'
+        '    PLM_AUTOSKIP_CLI+=( --plm_autoskip_soft )\n'
+        '    [[ -n "${PLM_AUTOSKIP_SOFT_ZERO:-}" ]] && PLM_AUTOSKIP_CLI+=( --plm_autoskip_soft_zero "$PLM_AUTOSKIP_SOFT_ZERO" )\n'
+        '  fi\n'
+        'fi\n'
+        'echo "${PLM_AUTOSKIP_CLI[@]}"\n'
+    )
+    set_env = {**os.environ, "PLM_AUTOSKIP_BAD_INPUT": "1",
+               "PLM_AUTOSKIP_AA_ZMAX": "3.0", "PLM_AUTOSKIP_AA_LOG2_FLOOR": "0.25",
+               "PLM_AUTOSKIP_SOFT": "1", "PLM_AUTOSKIP_SOFT_ZERO": "2.0"}
+    got = subprocess.run(["bash", "-c", snippet], env=set_env,
+                         capture_output=True, text=True, timeout=30)
+    assert got.stdout.strip() == (
+        "--plm_autoskip_bad_input --plm_autoskip_aa_zmax 3.0 "
+        "--plm_autoskip_aa_log2_floor 0.25 --plm_autoskip_soft "
+        "--plm_autoskip_soft_zero 2.0")
+    # autoskip off => nothing emitted even if the z-gate vars are set.
+    off_env = {k: v for k, v in os.environ.items()
+               if k not in ("PLM_AUTOSKIP_BAD_INPUT", "PLM_AUTOSKIP_SOFT")}
+    off_env["PLM_AUTOSKIP_AA_ZMAX"] = "3.0"
+    off = subprocess.run(["bash", "-c", snippet], env=off_env,
+                         capture_output=True, text=True, timeout=30)
+    assert off.stdout.strip() == ""
+
+
 def test_shell_bias_total_clamp_odds_value_passthrough():
     """BIAS_TOTAL_CLAMP_ODDS=<X> emits `--bias_total_clamp_odds <X>`; unset emits
     nothing (byte-identical default). Pins to the shipped run_chisel_design.sh."""

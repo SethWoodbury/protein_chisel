@@ -94,6 +94,7 @@ PYTHONPATH=src:scripts python scripts/iterative_design.py \
 - **Description:** LigandMPNN context flag. `0` = backbone + ligand only (better first-shell diversity; clash-prone bulky AAs auto-omitted). `1` = catalytic sidechain rotamers visible (more WT-conservative).
 - **Change when:** designs collapse near WT (use `0`); aggressive samples clash with catalytic packing (use `1`).
 - **Example:** `--use_side_chain_context 1`
+- **Recommendation (1.4.0 review, F4):** **keep `sc=0`.** Clash is already prevented by the auto-omit of bulky AAs at clash-prone first-shell positions (`compute_clash_prone_first_shell_omits`), and a uniform `sc=1` **collapses first-shell diversity** (it would revert the deliberate v2 `1→0` decision). If — and only if — a specific scaffold shows a **measured** residual clash, prefer the opt-in **`--use_side_chain_context_schedule '1,1,0'`** (sc on early, off late) so the final cycle still samples with full first-shell diversity; never run `sc=1` in the final cycle.
 
 ### `--enhance` (str | None)
 - **Default:** `None` (base ligand_mpnn)
@@ -287,11 +288,13 @@ PYTHONPATH=src:scripts python scripts/iterative_design.py \
 ## 13. Opt-in solubility steering, adaptive controller & generalizability
 
 Almost every flag in this section is **opt-in and OFF/None by default → byte-identical
-to the legacy pipeline when unset**, with two **byte-identical-at-default but non-`None`**
-exceptions (1.2.0): the adaptive controller's **damping is ON by default** (opt-OUT via
-`--no_controller_damping`), and the generalizability flags `--chain` (default `"A"`) and
+to the legacy pipeline when unset**, with a few **default-on / non-`None`-default**
+exceptions: the adaptive controller's **damping is ON by default** (1.2.0; opt-OUT via
+`--no_controller_damping`); the generalizability flags `--chain` (default `"A"`) and
 `--aa_reference` (default EC-3 hydrolases) carry a non-trivial default value that
-reproduces the prior hard-coded behavior. Each flag has an environment-variable
+reproduces the prior hard-coded behavior; and — **new in 1.4.0, a deliberate
+default-path change** — the bias-sum safety cap **`--bias_total_clamp` is ON by default at
+3.0 nats** (opt-OUT via `--no_bias_total_clamp`). Each flag has an environment-variable
 equivalent honored by `scripts/run_chisel_design.sh` (booleans truthy on
 `1/true/yes/on`, case-insensitive; value knobs forwarded only when set). The
 **generalizability** flags (`--catalytic_resnos`, `--chain`, `--no_require_cat_his_hbond`,
@@ -396,6 +399,31 @@ depth), and the design synthesis in `docs/plans/controller_framework.md`.
 - **Change when:** tuning the overall-hydrophobicity trigger.
 - **Example:** `--plm_autoskip_hydrophobic_frac 0.55` / `PLM_AUTOSKIP_HYDROPHOBIC_FRAC=0.55`
 
+### `--plm_autoskip_aa_zmax` (float `Z`) — env `PLM_AUTOSKIP_AA_ZMAX` (seed triage; F1, 1.4.0)
+- **Default:** `None` → the z-gate is **off** → byte-identical (the flat `--plm_autoskip_max_aa_frac` is the only single-AA signal).
+- **Description:** Adds a **distribution-aware**, per-AA single-AA over-representation signal to the seed triage, **redundant with (ORed to)** the flat `--plm_autoskip_max_aa_frac` so a naturally-abundant AA (Leu ~9.7%, Ala ~8.7%) and a naturally-rare one (Trp ~1.1%, Cys ~1.3%) are judged **fairly** against their own per-AA mean±SD instead of one flat 16% line. An AA trips iff **one-sided `z ≥ Z` (default 3.0) AND `log2_enrichment ≥ --plm_autoskip_aa_log2_floor`** — reusing `aa_composition.aa_z_scores` / `aa_log2_enrichment` (the existing `|z|>3 AND |log2|>0.25` precedent). Flagged AAs both contribute to the pathological verdict (driving the PLM cliff/soft reduction) **and** are armed into the **cycle-0 composition bootstrap** (the `--composition_soft_bias` seed-map), so the composition cap targets them from cycle 0. No effect unless `--plm_autoskip_bad_input`.
+- **⚠️ Caveat (read before using):** the z is a **population distance, not a significance test** — it divides by the reference's **between-sequence SD**, so a high `z` means "far from the typical member of this family", **not** "statistically significant". And the **default `--aa_reference` (EC-3 hydrolases) is WRONG for a non-hydrolase seed** — always pass the design's **own** EC class (e.g. `--aa_reference swissprot_ec2_transferases_2026_01`) so the comparison distribution is right. The **log2 floor + one-sidedness + `exclude_aas`** (an already-omitted Cys is dropped) are what keep a legit Trp/Cys/Pro-rich family from being falsely triaged.
+- **Change when:** you want a fair, per-AA over-representation trigger (and have set the correct `--aa_reference`).
+- **Example:** `--plm_autoskip_bad_input --plm_autoskip_aa_zmax 3.0 --aa_reference swissprot_ec2_transferases_2026_01` / `PLM_AUTOSKIP_BAD_INPUT=1 PLM_AUTOSKIP_AA_ZMAX=3.0 AA_REFERENCE=swissprot_ec2_transferases_2026_01`
+
+### `--plm_autoskip_aa_log2_floor` (float `L`) — env `PLM_AUTOSKIP_AA_LOG2_FLOOR` (seed triage; F1, 1.4.0)
+- **Default:** `0.25` (matches the existing `aa_quality_check` `|log2| > 0.25` precedent).
+- **Description:** Fold-change **floor** for the z-gate: a flagged AA must ALSO have `log2(design% / ref-global%) ≥ L`, so a naturally-rare AA at high `z` but a trivial absolute % does **not** falsely trip. Only used with `--plm_autoskip_aa_zmax`.
+- **Change when:** tuning how large a fold-change is required alongside the z-threshold (raise to require a bigger enrichment).
+- **Example:** `--plm_autoskip_aa_log2_floor 0.5` / `PLM_AUTOSKIP_AA_LOG2_FLOOR=0.5`
+
+### `--plm_autoskip_soft` (flag) — env `PLM_AUTOSKIP_SOFT` (seed triage; F2, 1.4.0)
+- **Default:** off → the **cliff** (a pathological seed forces `--plm_strength` to 0), the validated default.
+- **Description:** Reduce `--plm_strength` **gradually** on a pathological seed instead of the 0/1 cliff: full strength at the trip threshold (severity 1) decaying linearly to 0 at `--plm_autoskip_soft_zero`. **The cliff stays the default** because a soft reduction does **not** rescue a pathological seed — at `T ≈ 0.15` even `plm_strength = 0.4` is ~602× odds, far past the ~8× controller authority (parity with "off" only near `plm_strength ≈ 0.13`). Soft is provided for **cluster A/B comparison**; the realized strength is recorded in `fusion_config.json`. No effect unless `--plm_autoskip_bad_input`.
+- **Change when:** running the soft-vs-cliff validation, or you have measured that a gentle PLM reduction outperforms the cliff on borderline seeds.
+- **Example:** `--plm_autoskip_bad_input --plm_autoskip_soft` / `PLM_AUTOSKIP_BAD_INPUT=1 PLM_AUTOSKIP_SOFT=1`
+
+### `--plm_autoskip_soft_zero` (float `S`) — env `PLM_AUTOSKIP_SOFT_ZERO` (seed triage; F2, 1.4.0)
+- **Default:** `2.0` (twice over the trip threshold).
+- **Description:** Severity at which the soft curve reaches `plm_strength = 0`. Only used with `--plm_autoskip_soft`; `S ≤ 1` degrades to the cliff (full strength at the threshold and zero just above it).
+- **Change when:** tuning how fast the soft reduction reaches zero (lower = steeper, closer to the cliff).
+- **Example:** `--plm_autoskip_soft_zero 1.5` / `PLM_AUTOSKIP_SOFT_ZERO=1.5`
+
 ### `--adaptive_bias` (flag) — env `ADAPTIVE_BIAS=1`
 - **Default:** off → byte-identical to the legacy pipeline.
 - **Description:** Master switch for the closed-loop solubility controller. After each cycle it measures the candidate pool's **net charge** and **surface hydrophobicity** and steers the next cycle's MPNN biases toward target solubility (global D/E up-weight; per-position hydrophobic down-weight at solvent-exposed surface positions). It fires **only when the pool is statistically out of target**, holds the bias once in-band, and reverses on overshoot. All the `--adaptive_bias_*`, `--adaptive_*`, `--controller_*`, and `--no_controller_damping` knobs below have effect **only** when this is set. Full design: `docs/adaptive_bias.md`. The two default axes are `charge` + `surface_hydrophobicity`.
@@ -446,11 +474,17 @@ WS-D scope / band overrides (default `None` → the legacy `distal_surface` scop
 - **Change when:** validating or debugging the adaptive controller cycle-by-cycle.
 - **Example:** `--adaptive_bias --controller_verbose` / `ADAPTIVE_BIAS=1 CONTROLLER_VERBOSE=1`
 
-### `--bias_total_clamp` (float `NATS ≥ 0`) — env `BIAS_TOTAL_CLAMP` (WS-E)
-- **Default:** `None` → byte-identical.
-- **Description:** Bound the **effective** per-`(position, AA)` sampling bias (`bias_per_residue` + the separately-applied global `bias_AA`) to `±NATS`. The consensus (`+2.0`, uncapped) + PLM-peak (~2.5) stack is otherwise uncapped; at `T ≈ 0.15` that locks a cell near-deterministically (~10¹³× odds), defeating the diversity injection. Applied to the bias the sampler sees (the `bias.npy` diagnostic stays the un-clamped per-position fusion bias). Suggested production `~3.0` — an overflow/stacking guard, not a gentle regularizer. **Independent of `--adaptive_bias`** (it guards the whole bias stack).
-- **Change when:** the consensus + PLM stack is over-locking cells (low sampling diversity at low `T`).
-- **Example:** `--bias_total_clamp 3.0` / `BIAS_TOTAL_CLAMP=3.0`
+### `--bias_total_clamp` (float `NATS ≥ 0`) — env `BIAS_TOTAL_CLAMP` (WS-E; ⚠️ default-on in 1.4.0)
+- **Default:** **`3.0` nats — ON by default as of 1.4.0** (was `None`). This is a **deliberate default-path change** (like the 1.2.0 damping flip): a bare run now caps the bias stack at 3 nats. Pass an explicit value to override the default, or `--no_bias_total_clamp` to disable it (the exact pre-1.4.0 unclamped path).
+- **Description:** Bound the **effective** per-`(position, AA)` sampling bias (`bias_per_residue` + the separately-applied global `bias_AA`) to `±NATS`. The consensus (`+2.0`, uncapped) + PLM-peak (~2.5) stack is otherwise uncapped; at `T ≈ 0.15` that locks a cell near-deterministically (~10¹³× odds), and the pathological double-count stacks to **1e17–1e20×**. Applied to the bias the sampler sees (the `bias.npy` diagnostic stays the un-clamped per-position fusion bias). **Why 3 nats:** it preserves a legit ~3-nat **single-source** PLM peak (so a clean PLM-on run is essentially unaffected) while capping the 6–20-nat double-count lock — a fixed-nats cap is the right semantic here (it allows ≤3 nats at **every** temperature), unlike the odds form or the coordinator's 1e3× whole-stack ceiling, both of which would clip a legit peak. It is a **safety cap, not the un-locker** — the opt-in coordinator (`--controller_coordinator`) remains the budgeted un-locker. **Independent of `--adaptive_bias`** (it guards the whole bias stack on every run, incl. pure-PLM). When the firing telemetry shows it adjusted N `(pos,AA)` cells, that count is the number bound.
+- **Change when:** you want a different cap than 3 nats (raise for a stronger legit peak; lower to clamp harder).
+- **Example:** `--bias_total_clamp 4.0` / `BIAS_TOTAL_CLAMP=4.0`
+
+### `--no_bias_total_clamp` (flag, opt-OUT) — env `NO_BIAS_TOTAL_CLAMP=1` (1.4.0)
+- **Default:** off → the 3-nat cap stays **ON** (the 1.4.0 default).
+- **Description:** Opt **out** of the default 3-nat bias-sum safety cap, restoring the **exact pre-1.4.0 unclamped** sampling bias. Mirrors the `--no_controller_damping` idiom. **Mutually exclusive** with an explicit `--bias_total_clamp` / `--bias_total_clamp_odds` (passing both errors at parse time — opt-out vs set-a-value is contradictory).
+- **Change when:** you specifically want to reproduce the pre-1.4.0 (unclamped) bias stack.
+- **Example:** `--no_bias_total_clamp` / `NO_BIAS_TOTAL_CLAMP=1`
 
 ### `--bias_total_clamp_odds` (float `X > 1.0`) — env `BIAS_TOTAL_CLAMP_ODDS` (CF-3a)
 - **Default:** `None` → byte-identical. **Mutually exclusive** with `--bias_total_clamp`.
