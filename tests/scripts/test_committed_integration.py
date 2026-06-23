@@ -1534,3 +1534,19 @@ def test_driver_nested_clamp_controller_ceiling_above_total_is_bounded():
     out = nested_total_clip(rest, controller, total_nats=total_nats,
                             reserve_nats=reserve)
     assert np.all(np.abs(out) <= total_nats + 1e-9)
+
+
+def test_shared_actuator_axes_without_coordinator_errors():
+    """--adaptive_bias_axes selecting axes that SHARE an actuator (pi+charge) WITHOUT
+    --controller_coordinator is a startup error (exit 2): the legacy additive sum would
+    double-count on D/E/K/R. The coordinator's max-not-sum is required to make it safe."""
+    req = ["--seed_pdb", "/dev/null", "--ligand_params", "/dev/null",
+           "--plm_artifacts_dir", "/tmp", "--position_table", "/dev/null"]
+    proc = subprocess.run(
+        [sys.executable, "scripts/iterative_design.py", *req,
+         "--adaptive_bias", "--adaptive_bias_axes", "charge,pi"],
+        cwd=str(REPO), env={**os.environ, "PYTHONPATH": "src"},
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 2, (proc.stdout + proc.stderr)[-2000:]
+    assert "SHARE an actuator" in proc.stderr

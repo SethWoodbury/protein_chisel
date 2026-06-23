@@ -6095,6 +6095,27 @@ def main() -> None:
     if not (math.isfinite(args.controller_ceiling) and args.controller_ceiling > 1.0):
         p.error("--controller_ceiling must be a finite odds multiplier > 1.0 "
                 f"(T*ln(X) must be positive), got {args.controller_ceiling}")
+    # Shared-actuator guard (codex): axes that share an actuator (e.g. 'pi' shares the
+    # charge D/E/K/R actuator with 'charge') DOUBLE-COUNT in the legacy additive sum and
+    # re-create the multiplicative lock. The coordinator's max-not-sum is what makes a
+    # shared actuator safe, so reject the footgun at startup unless it is on. (--help
+    # exits in parse_args before this, so the import stays off the no-PYTHONPATH path.)
+    if args.adaptive_bias_axes and not args.controller_coordinator:
+        _gsel = [a.strip() for a in args.adaptive_bias_axes.split(",") if a.strip()]
+        try:
+            from protein_chisel.sampling.adaptive_bias import default_axes as _da_guard
+            _gacts = [ax.actuator for ax in _da_guard(axes=_gsel)
+                      if getattr(ax, "actuator", None)]
+            _gdup = sorted({a for a in _gacts if _gacts.count(a) > 1})
+        except ValueError:
+            _gdup = []   # an unknown/duplicate name surfaces with the full message later
+        if _gdup:
+            p.error(
+                "--adaptive_bias_axes selects axes that SHARE an actuator (%s) — they "
+                "double-count in the legacy additive sum and re-create the "
+                "multiplicative lock. Add --controller_coordinator (its max-not-sum "
+                "makes shared actuators safe) or drop the redundant axis (e.g. 'pi' "
+                "shares the charge D/E/K/R actuator with 'charge')." % ", ".join(_gdup))
     debug_short_test_override_msg = None
     if args.debug_short_test:
         if args.target_k != 5 or args.cycles != 3:
@@ -6950,6 +6971,10 @@ def main() -> None:
     _ab_surface_mask = None        # WS-D non_tunnel_surface mask (None => legacy)
     _ab_charge_band = None         # WS-D --adaptive_charge_band override (None => cycle)
     _ab_axes_sel = None            # WS-D --adaptive_bias_axes selector (None => default)
+    # pI controller band/target (default_axes' own defaults until set from --pi_min/max
+    # below) — defined at function scope so every default_axes() call site is safe.
+    _pi_band = (float(args.pi_min), float(args.pi_max))
+    _pi_target = min(args.pi_min + 0.5, (args.pi_min + args.pi_max) / 2.0)
     if args.adaptive_bias:
         from protein_chisel.sampling.adaptive_bias import (
             AdaptiveBiasConfig, compute_adaptive_bias, default_axes,
@@ -6995,7 +7020,8 @@ def main() -> None:
         # is defensively wrapped, so without this an invalid band (lo>=hi) or unknown
         # axis name would silently degrade the run to unbiased every cycle.
         try:
-            default_axes(charge_band=_ab_charge_band, axes=_ab_axes_sel)
+            default_axes(charge_band=_ab_charge_band, axes=_ab_axes_sel,
+                         pi_band=_pi_band, pi_target=_pi_target)
         except ValueError as _exc:
             raise SystemExit(f"adaptive-bias config error: {_exc}")
         # ---- WS-D: non_tunnel_surface scope mask (structure-invariant; built once).
@@ -7043,6 +7069,7 @@ def main() -> None:
                 net_charge_band=(cycles[0].net_charge_min, cycles[0].net_charge_max),
                 deadband_frac=args.adaptive_bias_deadband,
                 charge_band=_ab_charge_band, axes=_ab_axes_sel,
+                pi_band=_pi_band, pi_target=_pi_target,
             )
             adaptive_global, adaptive_delta, adaptive_state, _ab_seed_tele = seed_warmstart(
                 seed_metrics={"gravy": _seed_gravy, "net_charge_full_HH": _seed_charge},
@@ -7174,6 +7201,7 @@ def main() -> None:
                     net_charge_band=(cyc.net_charge_min, cyc.net_charge_max),
                     deadband_frac=args.adaptive_bias_deadband,
                     charge_band=_ab_charge_band, axes=_ab_axes_sel,
+                    pi_band=_pi_band, pi_target=_pi_target,
                 )
                 from protein_chisel.sampling.adaptive_bias import hydrophobic_over_rep_mask
                 _ab_overrep = (hydrophobic_over_rep_mask(

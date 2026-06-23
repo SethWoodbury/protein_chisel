@@ -519,3 +519,27 @@ def test_compute_adaptive_bias_coordinator_total_odds_bounded():
     # surface delta cells are also controller-budget bounded
     assert np.all(odds_for_nats_vec(np.abs(r.per_position_delta), 0.15)
                   <= CONTROLLER_CEILING + 1e-6)
+
+
+# ---------------------------------------------------------------------------
+# pI-band wiring + shared-actuator guard basis (codex review follow-ups).
+# ---------------------------------------------------------------------------
+def test_pi_axis_band_and_target_follow_pi_min_max():
+    """The pI controller axis takes its band/target from the (pi_min, pi_max) the
+    driver threads from --pi_min/--pi_max, so the controller deadbands/gates against
+    the SAME band the pI filter enforces (codex)."""
+    axes = ab.default_axes(axes=["charge", "surface_hydrophobicity", "pi"],
+                           pi_band=(5.5, 7.0), pi_target=6.0)
+    pi = next(a for a in axes if a.name == "pi")
+    assert pi.band_lo == 5.5 and pi.band_hi == 7.0
+    assert pi.target == 6.0
+    assert pi.metric_column == "pi"
+
+
+def test_pi_and_charge_share_charge_dekr_actuator():
+    """pI shares the charge D/E/K/R actuator (the basis for the driver's
+    shared-actuator guard); charge + surface do NOT share an actuator."""
+    cp = ab.default_axes(axes=["charge", "pi"])
+    assert all(a.actuator == "charge_DEKR" for a in cp)
+    cs = ab.default_axes(axes=["charge", "surface_hydrophobicity"])
+    assert {a.actuator for a in cs} == {"charge_DEKR", "gravy_surface"}
