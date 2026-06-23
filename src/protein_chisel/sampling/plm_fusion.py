@@ -421,10 +421,40 @@ def fuse_experts(
     )
 
 
+def decoupled_fitness_weights(
+    expert_logprobs: Sequence[np.ndarray],
+    position_classes: Sequence[str],
+    config: Optional[FusionConfig] = None,
+    expert_names: Optional[Sequence[str]] = None,
+) -> np.ndarray:
+    """Per-position fitness weights DECOUPLED from ``--plm_strength``.
+
+    The seed-marginal fitness ranking (``fitness_score.fitness_from_seed_marginals``)
+    weights each position by the fusion ``(β, γ)``. Because ``global_strength``
+    (= ``--plm_strength``) scales ``β = γ`` *uniformly*, the fused-mean ranking is
+    INVARIANT to any ``strength > 0`` (the scale cancels in the ``(βx+γy)/(β+γ)``
+    ratio) but COLLAPSES to a constant — every design ties at 0 — at ``strength = 0``,
+    silently zeroing the weight-2.0 fitness objective. Computing the weights at
+    ``global_strength = 1.0`` keeps the ranking meaningful regardless of the sampling
+    strength: byte-identical for ``strength > 0``, a real rank (instead of ties) at 0.
+    The sampling *bias* still honors the user's ``--plm_strength`` separately.
+
+    Returns the ``(L, 2)`` ``weights_per_position`` (the 2-expert legacy fitness
+    shape); for >2 experts it returns the generic ``(L, N)`` ``weights_per_expert``.
+    """
+    import dataclasses
+    cfg = config or FusionConfig()
+    cfg_unit = dataclasses.replace(cfg, global_strength=1.0)
+    res = fuse_experts(expert_logprobs, position_classes, cfg_unit, expert_names)
+    return (res.weights_per_position if res.weights_per_position is not None
+            else res.weights_per_expert)
+
+
 __all__ = [
     "AA_ORDER",
     "AA_BG_VEC",
     "FusionConfig",
+    "decoupled_fitness_weights",
     "FusionResult",
     "UNIPROT_AA_BG",
     "calibrate_log_odds",

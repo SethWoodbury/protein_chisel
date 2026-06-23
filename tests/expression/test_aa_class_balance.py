@@ -116,3 +116,61 @@ def test_class_definitions_consistent():
 def test_unknown_reference_raises():
     with pytest.raises(ValueError):
         compute_class_balanced_bias_AA("AAAAAAAAAA", reference="not_a_reference")
+
+
+# ---------------------------------------------------------------------------
+# WS-C: suppress-all-overrep — every over-rep class member, not just the max
+# ---------------------------------------------------------------------------
+
+
+# A is the class max (z~5.5); L is also over-rep (z~4.4) but NOT the max, so the
+# legacy single-swap path leaves it untouched ("Leucine escapes"). V/I/M=0 give
+# the under-rep swap partners. Counts sum to exactly 200 so _build_seq does not
+# pad with extra A.
+_OVERREP_COUNTS = {"A": 52, "L": 40, "G": 40, "S": 24, "T": 16, "E": 14, "D": 14}
+
+
+def test_default_path_leaves_non_max_overrep_member_untouched():
+    """Baseline (the bug): only the class-max AA (A) is down-weighted; the
+    second over-rep member of the SAME class (L) escapes entirely."""
+    seq = _build_seq(_OVERREP_COUNTS)
+    z = aa_z_scores(seq, reference="swissprot_ec3_hydrolases_2026_01")
+    assert z["A"] > z["L"] > 2.0, f"setup: A z={z['A']:.2f} L z={z['L']:.2f}"
+
+    t = compute_class_balanced_bias_AA(seq, exclude_aas="C")
+    assert t.per_aa_bias.get("A", 0.0) < 0.0          # class max down-weighted
+    assert t.per_aa_bias.get("L", 0.0) == 0.0         # non-max over-rep ESCAPES
+
+
+def test_suppress_all_overrep_downweights_every_overrep_member():
+    """suppress_all_overrep=True down-weights BOTH A and L (every member with
+    z > balance_z_threshold), while still up-weighting the under-rep partner."""
+    seq = _build_seq(_OVERREP_COUNTS)
+    t = compute_class_balanced_bias_AA(
+        seq, exclude_aas="C", suppress_all_overrep=True,
+    )
+    assert t.per_aa_bias.get("A", 0.0) < 0.0          # class max still down
+    assert t.per_aa_bias.get("L", 0.0) < 0.0          # non-max ALSO down now
+    # The within-class swap up-weight is preserved on the SPECIFIC under-rep
+    # hydrophobic partner (V is z~-3.5 in this pool), not just "some" positive AA
+    # (an unrelated polar-class upweight must not be able to satisfy this).
+    assert t.per_aa_bias.get("V", 0.0) > 0.0
+    hydro_swaps = [s for s in t.swaps
+                   if s["class"] == "hydrophobic_aliphatic" and s["kind"] == "swap"]
+    assert len(hydro_swaps) == 1
+    assert hydro_swaps[0]["down_aa"] == "A" and hydro_swaps[0]["up_aa"] == "V"
+    # Magnitudes obey the clamp.
+    for aa, val in t.per_aa_bias.items():
+        assert -2.5 - 1e-9 <= val <= 2.5 + 1e-9
+
+
+def test_suppress_all_overrep_default_is_byte_identical():
+    """The flag defaults False and the off-path is the legacy path verbatim:
+    for the same input, default == suppress_all_overrep=False, bit for bit."""
+    seq = _build_seq(_OVERREP_COUNTS)
+    t_implicit = compute_class_balanced_bias_AA(seq, exclude_aas="C")
+    t_explicit = compute_class_balanced_bias_AA(
+        seq, exclude_aas="C", suppress_all_overrep=False,
+    )
+    assert t_implicit.bias_AA_string == t_explicit.bias_AA_string
+    assert t_implicit.per_aa_bias == t_explicit.per_aa_bias

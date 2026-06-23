@@ -19,9 +19,84 @@ CPU). Enable only deliberately.
 from __future__ import annotations
 
 import logging
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
+
+import numpy as np
+import pandas as pd
 
 LOGGER = logging.getLogger("protein_chisel.sampling.mpnn_with_refresh")
+
+
+def choose_inband_representative(
+    survivors: Optional[pd.DataFrame],
+    *,
+    gravy_min: float,
+    gravy_max: float,
+    net_charge_min: float,
+    net_charge_max: float,
+    fitness_col: str = "fitness__logp_fused_mean",
+    seq_col: str = "sequence",
+    require_passed_seq_filter: bool = True,
+) -> Optional[str]:
+    """Median-fitness sequence among IN-BAND survivors (the rep to re-ground on).
+
+    'In-band' = the shared solubility band (``scoring.solubility.within_solubility_band``
+    — GRAVY inclusive, net-charge exclusive, fail-closed). A representative must also
+    have passed the seq filter (when that column is present and
+    ``require_passed_seq_filter``). Among the qualified, pick the row NEAREST the
+    median fitness (a *typical* soluble drift, not an outlier), deterministically
+    tie-broken by higher fitness then original order; if no usable fitness, the first
+    in-band row. Returns the sequence string the ESM-C recompute consumes, or ``None``
+    when nothing qualifies (the caller then skips the refresh round).
+    """
+    if survivors is None or len(survivors) == 0 or seq_col not in survivors.columns:
+        return None
+    from protein_chisel.scoring.solubility import within_solubility_band
+    inband = within_solubility_band(
+        survivors, gravy_min=gravy_min, gravy_max=gravy_max,
+        net_charge_min=net_charge_min, net_charge_max=net_charge_max)
+    if require_passed_seq_filter and "passed_seq_filter" in survivors.columns:
+        # Robust truthiness: a string "False"/"0" or NaN must read as FAILED (a naive
+        # .astype(bool) reads any non-empty string — incl. "False" — as True).
+        inband = inband & survivors["passed_seq_filter"].map(
+            lambda v: str(v).strip().lower() in ("true", "1", "yes", "t"))
+    cand = survivors[inband]
+    # Drop null / empty sequences (a pd.NA would stringify to "<NA>").
+    cand = cand[cand[seq_col].notna() & (cand[seq_col].astype(str).str.len() > 0)]
+    if len(cand) == 0:
+        return None
+    if fitness_col in cand.columns:
+        cfit = pd.to_numeric(cand[fitness_col], errors="coerce")
+        finite = cand[np.isfinite(cfit)]
+        if len(finite) > 0:
+            ffit = pd.to_numeric(finite[fitness_col], errors="coerce")
+            med = float(ffit.median())
+            order = finite.assign(_d=(ffit - med).abs(), _f=ffit).sort_values(
+                ["_d", "_f"], ascending=[True, False], kind="stable")
+            return str(order.iloc[0][seq_col])
+    return str(cand.iloc[0][seq_col])               # no usable fitness -> first in-band
+
+
+def refuse_esmc_only(
+    *,
+    new_esmc_lp: np.ndarray,
+    seed_saprot_lp: np.ndarray,
+    position_classes: Sequence[str],
+    fusion_cfg,
+) -> np.ndarray:
+    """Re-fuse the ESM-C-only refresh: fresh ESM-C marginals + the UNCHANGED seed
+    SaProt marginals → ``(L, 20)`` bias.
+
+    SaProt is structure-aware (it consumes the 3Di token); a masked-LM marginal on
+    the *drifted sequence* would erase that structural signal, so SaProt must stay at
+    its seed marginals (refresh ESM-C ONLY). The same ``fusion_cfg`` flows
+    ``--plm_strength`` / ``--plm_class_strength`` through, and ``fuse_experts``
+    recomputes entropy-match + disagreement-shrink on the new pair.
+    """
+    from protein_chisel.sampling.plm_fusion import fuse_experts
+    return fuse_experts(
+        [new_esmc_lp, seed_saprot_lp], list(position_classes),
+        config=fusion_cfg, expert_names=["esmc", "saprot"]).bias
 
 
 def run_with_refresh(

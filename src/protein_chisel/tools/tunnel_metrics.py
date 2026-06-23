@@ -99,6 +99,37 @@ _BLOCKER_WEIGHT: dict[str, float] = {
 }
 
 
+# Canonical 3-letter -> 1-letter map (one copy; build_throat_bias_delta used to
+# redefine this dict inline, twice, per call).
+_AA3_TO_1: dict[str, str] = {
+    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
+    "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
+    "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
+    "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
+}
+
+
+def bulky_blocker_aas(threshold: float = 0.70) -> str:
+    """1-letter codes of residues classified as 'bulky' at the throat.
+
+    A residue is bulky when its ``_BLOCKER_WEIGHT`` (channel-constriction mass-
+    weight) is ``>= threshold``. The default 0.70 is exactly
+    ``build_throat_bias_delta``'s ``bulky_threshold``, so this returns the *same*
+    classification the throat-feedback controller applies — surfaced as a sorted,
+    deterministic string for consumers that need the explicit set (e.g. the WS-G
+    tunnel-lining omit). Deriving from ``_BLOCKER_WEIGHT`` keeps the two
+    consistent by construction, with no hand-maintained parallel list.
+
+    At the default 0.70 this is ``"FHKRWY"`` — aromatics W/F/Y/H plus the long
+    charged R/K (Lys Cb->NZ ~5.5 A, Arg ~6 A, both long enough to line and
+    constrict the channel). Lower to 0.55 to also include the medium
+    hydrophobics M/L/I/V.
+    """
+    return "".join(sorted(
+        _AA3_TO_1[a3] for a3, w in _BLOCKER_WEIGHT.items()
+        if w >= threshold and a3 in _AA3_TO_1))
+
+
 @dataclasses.dataclass
 class TunnelConfig:
     """Tunable knobs for tunnel scoring. Defaults validated on PTE_i1."""
@@ -1144,13 +1175,7 @@ def build_throat_bias_delta(
             mw = _BLOCKER_WEIGHT[aa_3]
             if mw < bulky_threshold:
                 continue
-            # Convert 3-letter to 1-letter via an inline map
-            aa_1 = {
-                "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
-                "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
-                "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
-                "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
-            }.get(aa_3)
+            aa_1 = _AA3_TO_1.get(aa_3)
             if aa_1 is None or aa_1 not in aa_to_idx:
                 continue
             ai = aa_to_idx[aa_1]
@@ -1158,12 +1183,7 @@ def build_throat_bias_delta(
 
         # Extra penalty on the OBSERVED top blocker AA
         top_aa_3 = stats["top_aa"]
-        top_aa_1 = {
-            "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
-            "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
-            "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
-            "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
-        }.get(top_aa_3)
+        top_aa_1 = _AA3_TO_1.get(top_aa_3)
         if top_aa_1 and top_aa_1 in aa_to_idx:
             delta[idx, aa_to_idx[top_aa_1]] -= observed_extra
             n_aas_biased += 1

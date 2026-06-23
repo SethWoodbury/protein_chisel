@@ -31,7 +31,6 @@ from pathlib import Path
 LOGGER = logging.getLogger("protein_chisel.tools.finalize_names")
 
 _TSV_NAME = "chiseled_design_metrics.tsv"
-_CHISEL_RE = re.compile(r"^(?P<stem>.+)_chisel_\d+.*$")  # strip trailing _chisel_<idx>[suffix]
 _TRUE = {"true", "1", "yes"}
 
 
@@ -56,12 +55,31 @@ def finalize_design_names(
     *,
     keep_intermediate: bool = False,
     tsv_name: str = _TSV_NAME,
+    design_token: str = "chisel",
 ) -> dict:
     """Rename + DESIGN_PATH-collapse the published designs under ``final_root``.
 
     Returns a summary dict. No-op (exit-friendly) when the TSV is absent/empty or
     there are no design rows.
+
+    ``design_token`` is the name component used in the shipped filename
+    ``<stem>_<design_token>_<NNN>.pdb`` (default ``"chisel"`` → byte-identical to
+    the legacy naming). It must be a non-empty alphanumeric string (no ``_``/``.``)
+    so the trailing-index strip stays unambiguous. The strip also recognises the
+    legacy ``chisel`` token, so a run minting ``_chisel_<idx>`` ids is renamed to a
+    custom token, and a re-run with the same custom token is idempotent.
     """
+    if not re.fullmatch(r"[A-Za-z0-9]+", design_token or ""):
+        raise ValueError(
+            f"design_token must be non-empty alphanumeric (no '_' or '.'); "
+            f"got {design_token!r}")
+    # Strip a trailing ``_<design_token>_<idx>`` OR the legacy ``_chisel_<idx>``.
+    # Greedy ``.+`` keeps any earlier same-token occurrence that is part of the
+    # input stem (e.g. an input named ``..._chisel_62_..._chisel_5`` strips only
+    # the final ``_chisel_5``). When design_token == "chisel" this is identical to
+    # the legacy chisel-only strip (``^(.+)_chisel_\d+.*$``).
+    strip_re = re.compile(
+        rf"^(?P<stem>.+)_(?:{re.escape(design_token)}|chisel)_\d+.*$")
     final_root = Path(final_root)
     tsv = final_root / tsv_name
     if not tsv.is_file() or tsv.stat().st_size == 0:
@@ -136,9 +154,9 @@ def finalize_design_names(
             raise ValueError(
                 f"finalize: id={rid!r} pdb {old_path} is outside the designs dir "
                 f"{designs_dir}; refusing to rename")
-        m = _CHISEL_RE.match(old_path.stem)
+        m = strip_re.match(old_path.stem)
         stem = m.group("stem") if m else old_path.stem
-        new_id = f"{stem}_chisel_{rank:0{width}d}"
+        new_id = f"{stem}_{design_token}_{rank:0{width}d}"
         plan.append((di, old_path, f"{new_id}.pdb", new_id))
 
     new_names = [nm for (_, _, nm, _) in plan]

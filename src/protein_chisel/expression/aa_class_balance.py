@@ -84,6 +84,7 @@ def compute_class_balanced_bias_AA(
     over_z_threshold: float = 3.0,
     max_bias_nats: float = 2.5,
     bias_per_z: float = 0.4,
+    suppress_all_overrep: bool = False,
 ) -> AaBalanceTelemetry:
     """Build a ``bias_AA`` string by class-balanced compensatory weights.
 
@@ -96,6 +97,17 @@ def compute_class_balanced_bias_AA(
         each by ``bias_per_z * z`` (capped at +-max_bias_nats).
       - Singleton classes (P, G) are handled separately: only downweight
         if z > over_z_threshold (no swap partner available).
+
+    ``suppress_all_overrep`` (default False → byte-identical): when True,
+    down-weight EVERY member of a multi-member class whose z exceeds
+    ``balance_z_threshold`` — not only the single class maximum. The
+    legacy path touches just the most over-represented member, so a
+    second over-rep member of the same class escapes (e.g. when Alanine
+    is the class max, an also-over-represented Leucine is left alone).
+    The within-class swap up-weight of the most under-represented partner
+    is preserved (attached to the class-max down-weight). Singleton
+    classes (P, G) are unaffected — their only member already *is* the
+    class max, so there is nothing to escape.
 
     Final per-AA bias is the SUM of contributions from all classes the
     AA belongs to (an AA in multiple classes can be biased multiple
@@ -132,6 +144,41 @@ def compute_class_balanced_bias_AA(
         zs.sort(key=lambda t: t[1])
         low_aa, low_z = zs[0]
         high_aa, high_z = zs[-1]
+        if suppress_all_overrep:
+            # Down-weight EVERY over-rep member (z > balance_z_threshold),
+            # not just the class max, so a non-max over-rep AA (e.g. Leucine
+            # when Alanine is the class max) can't escape. The most over-rep
+            # member additionally carries the within-class swap up-weight of
+            # the most under-rep partner when one exists, preserving the
+            # property-conserving swap. High-to-low z order so the class max
+            # is the swap's down side.
+            overrep = sorted(
+                ((m, mz) for m, mz in zs if mz > balance_z_threshold),
+                key=lambda t: -t[1],
+            )
+            has_swap = bool(overrep) and low_z < -balance_z_threshold
+            for idx, (m, mz) in enumerate(overrep):
+                down_mag = min(max_bias_nats, bias_per_z * mz)
+                _add(m, -down_mag)
+                if idx == 0 and has_swap:
+                    up_mag = min(max_bias_nats, bias_per_z * abs(low_z))
+                    _add(low_aa, +up_mag)
+                    swaps.append({
+                        "class": class_name, "kind": "swap",
+                        "down_aa": m, "down_z": round(mz, 2),
+                        "up_aa": low_aa, "up_z": round(low_z, 2),
+                        "down_bias": round(-down_mag, 3),
+                        "up_bias": round(up_mag, 3),
+                    })
+                else:
+                    swaps.append({
+                        "class": class_name, "kind": "suppress_overrep",
+                        "down_aa": m, "down_z": round(mz, 2),
+                        "up_aa": None, "up_z": None,
+                        "down_bias": round(-down_mag, 3),
+                        "up_bias": 0.0,
+                    })
+            continue
         if high_z > balance_z_threshold and low_z < -balance_z_threshold:
             # Symmetric swap: both ends extreme.
             down_mag = min(max_bias_nats, bias_per_z * high_z)

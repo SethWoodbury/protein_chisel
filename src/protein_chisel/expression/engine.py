@@ -11,6 +11,7 @@ from typing import Iterable, Optional
 
 import numpy as np
 
+from protein_chisel.expression.aa_composition import AA_ORDER_REF
 from protein_chisel.expression.profiles import ExpressionProfile
 from protein_chisel.expression.rules import (
     REGISTRY, Rule, RuleRegistry, StructureContext,
@@ -19,6 +20,44 @@ from protein_chisel.expression.severity import RuleHit, Severity
 
 
 LOGGER = logging.getLogger("protein_chisel.expression.engine")
+
+
+def soft_bias_to_bias_array(
+    soft_bias_per_residue: dict[int, str],
+    L: int,
+    *,
+    magnitude: float,
+    aa_order: str = AA_ORDER_REF,
+) -> np.ndarray:
+    """Translate per-residue soft-bias AA downweights into an ``(L, 20)`` bias.
+
+    ``soft_bias_per_residue`` maps a 0-indexed body position to the AAs to
+    discourage there (the shape returned by
+    :meth:`EngineResult.soft_bias_per_residue`). Every named ``(position, AA)``
+    cell receives ``-|magnitude|`` nats in the returned additive matrix, with
+    AA columns ordered by ``aa_order`` (default the canonical PLM/LigandMPNN
+    order). Out-of-range positions and AAs outside ``aa_order`` are skipped.
+
+    The result is always ``<= 0`` (a pure downweight) so it composes additively
+    with the PLM-fusion / consensus / throat / adaptive biases without ever
+    *encouraging* an AA. Source-agnostic: the input map need not come from the
+    seed — the per-cycle pool-derived map from :func:`aggregate_pool_soft_bias`
+    plugs in unchanged.
+    """
+    mag = abs(float(magnitude))
+    if not np.isfinite(mag):
+        raise ValueError(f"magnitude must be finite, got {magnitude!r}")
+    arr = np.zeros((int(L), len(aa_order)), dtype=np.float64)
+    aa_to_idx = {a: i for i, a in enumerate(aa_order)}
+    for pos, aas in soft_bias_per_residue.items():
+        p = int(pos)
+        if not (0 <= p < int(L)):
+            continue
+        for aa in set(str(aas).upper()):     # de-dup: a repeated letter applies once
+            j = aa_to_idx.get(aa)
+            if j is not None:
+                arr[p, j] -= mag
+    return arr
 
 
 @dataclass
@@ -57,10 +96,31 @@ class EngineResult:
                     out[pos] = "".join(sorted(cur))
         return out
 
-    def soft_bias_per_residue(self) -> dict[int, str]:
-        """0-indexed body position -> AAs to downweight."""
+    def soft_bias_per_residue(
+        self, max_span_frac: Optional[float] = None,
+    ) -> dict[int, str]:
+        """0-indexed body position -> AAs to downweight.
+
+        ``max_span_frac`` (default None → every hit, legacy behavior): when given,
+        switch to LOCAL-ONLY mode and exclude two kinds of non-positional hit:
+        (1) any hit a rule marked ``metadata["aggregate"]`` — a whole-sequence
+        property (too many dibasic motifs / an over-represented AA / Met excess)
+        whose span is a region envelope, NOT a per-position liability; and
+        (2) any hit whose span (``end - start``) exceeds ``max_span_frac *
+        len(sequence)``. Both classes are already handled globally by the
+        suppress-all / fraction-cap levers; what remains are the LOCAL structural
+        hits (polyproline, repeats, hydrophobic stretch, KR-near-catalytic) for
+        which a per-residue bias is the right tool.
+        """
+        L = len(self.sequence)
+        local_only = max_span_frac is not None
+        span_cap = (max_span_frac * L) if (local_only and L > 0) else None
         out: dict[int, str] = {}
         for h in self.soft_bias_hits:
+            if local_only and h.metadata.get("aggregate"):
+                continue                          # aggregate signal, not per-residue
+            if span_cap is not None and (h.end - h.start) > span_cap:
+                continue                          # whole-protein / region envelope
             for pos in h.positions():
                 if h.suggested_omit_AAs:
                     cur = set(out.get(pos, ""))
@@ -191,4 +251,69 @@ class ExpressionRuleEngine:
         )
 
 
-__all__ = ["EngineResult", "ExpressionRuleEngine"]
+def aggregate_pool_soft_bias(
+    engine: "ExpressionRuleEngine",
+    sequences: Iterable[str],
+    *,
+    ss_reduced: Optional[str] = None,
+    sasa: Optional[np.ndarray] = None,
+    position_class: Optional[list[str]] = None,
+    catalytic_resnos: Iterable[int] = (),
+    fixed_resnos: Iterable[int] = (),
+    protein_resnos: Optional[list[int]] = None,
+    min_support: float = 0.5,
+    max_span_frac: Optional[float] = 0.5,
+) -> dict[int, str]:
+    """Per-cycle, pool-derived per-residue soft-bias map.
+
+    Evaluate ``engine`` on each survivor sequence (all sharing the fixed-backbone
+    structure context), collect the LOCAL per-residue SOFT_BIAS hits (whole-protein
+    composition hits filtered out via ``max_span_frac``), and return
+    ``{position -> AAs}`` for every ``(position, AA)`` flagged in at least
+    ``min_support`` fraction of the sequences.
+
+    Unlike a seed-only map, this tracks the liabilities the DESIGNS actually
+    introduce as the pool drifts (polyproline, homopolymer repeats, hydrophobic
+    stretches) — which is where the over-representation / hydrophobic-surface
+    failure mode emerges. The support gate keeps a one-off outlier survivor from
+    polluting the bias. Empty input → ``{}``.
+    """
+    seqs = [s for s in sequences if s]
+    if not seqs:
+        return {}
+    from collections import Counter
+    counts: Counter = Counter()
+    n_ok = 0                                  # denominator = survivors evaluated OK
+    for seq in seqs:
+        try:
+            res = engine.evaluate(
+                seq, ss_reduced=ss_reduced, sasa=sasa,
+                position_class=position_class, catalytic_resnos=catalytic_resnos,
+                fixed_resnos=fixed_resnos, protein_resnos=protein_resnos,
+            )
+        except Exception:                     # one bad survivor must not abort the cycle
+            LOGGER.exception(
+                "aggregate_pool_soft_bias: engine.evaluate failed on a survivor; "
+                "skipping it",
+            )
+            continue
+        n_ok += 1
+        for pos, aas in res.soft_bias_per_residue(max_span_frac=max_span_frac).items():
+            for aa in set(aas):
+                counts[(int(pos), aa)] += 1
+    if n_ok == 0:
+        return {}
+    threshold = min_support * n_ok
+    agg: dict[int, set] = {}
+    for (pos, aa), c in counts.items():
+        if c >= threshold:
+            agg.setdefault(pos, set()).add(aa)
+    return {pos: "".join(sorted(aas)) for pos, aas in agg.items()}
+
+
+__all__ = [
+    "EngineResult",
+    "ExpressionRuleEngine",
+    "aggregate_pool_soft_bias",
+    "soft_bias_to_bias_array",
+]

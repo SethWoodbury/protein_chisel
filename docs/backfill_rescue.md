@@ -46,6 +46,25 @@ Default is **on** (`--final_filter_backfill true`). Disable with `--final_filter
 
 A run that ships `target_k` purely from primary survivors will show all rescue columns as False / NaN. A run that backfilled will show some rows with `selection__bucket=rescue` and the deferred-rescue flags populated.
 
+## Solubility veto (opt-in — `--ship_solubility_veto` / `SHIP_SOLUBILITY_VETO=1`)
+
+Backfill exists to recover **fpocket-druggability** near-misses (and to top up to
+`target_k`). It was **never** meant to override the **solubility** band. But the rescue
+re-scoring replays struct/tunnel/fpocket only and does **not** re-apply the GRAVY/charge
+seq filter, so a `passed_seq_filter=False` design (e.g. GRAVY=1.05) could be bucketed
+`rescued_final_filters` and shipped as rank-0. **Caveat on the columns above:**
+`selection__hard_final_filter_passed` means *"passed the strict fpocket-druggability
+cutoff"* — **not** solubility; it can read `True` for a GRAVY-failing design.
+
+Set `--ship_solubility_veto` (default OFF → byte-identical) to make the final top-K writer
+**drop any design outside the final-cycle GRAVY + net-charge band before shipping** — the
+single hard chokepoint both selection branches pass through, covering rescued rows *and*
+annealed primary rows that pass an early-cycle GRAVY band but fail the final one. It adds a
+truthful `selection__solubility_passed` column. With the veto on, **fewer than `target_k`
+designs may ship** (intended: better to ship 35 soluble than 40 with garbage). The band
+comes from the final `CycleConfig` (`gravy_min/gravy_max`, `net_charge_min/net_charge_max`);
+charge bounds are exclusive and GRAVY bounds inclusive, mirroring `stage_seq_filter`.
+
 ## Limits
 
 The rescue path is **intra-process only**. It looks at `cycle_NN/02_seq_filter/` artifacts that the same `iterative_design.py` process wrote earlier in its own execution — not at any prior partial run dir. It is robustness against *late-stage filter wipeouts*, not a `--resume` mechanism. (See "Resume from a partial run dir" below for the separate question.)

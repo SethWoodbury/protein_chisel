@@ -135,11 +135,14 @@ if manifest_path.is_file():
 PY
 }
 
-# Final rank-order rename (<stem>_chisel_NNN by rank) + DESIGN_PATH collapse on the
-# published dir. Runs LAST (after _rewrite_published_paths), in plain python3.
+# Final rank-order rename (<stem>_<CHISEL_SUFFIX>_NNN by rank) + DESIGN_PATH collapse
+# on the published dir. Runs LAST (after _rewrite_published_paths), in plain python3.
 # Non-fatal: a failure leaves designs as-is (copy-then-swap keeps originals safe).
+# CHISEL_SUFFIX (default 'chisel', alphanumeric) sets the filename token, e.g.
+# CHISEL_SUFFIX=chiseli2 -> <stem>_chiseli2_NNN.pdb. Default is byte-identical.
 FINALIZE_DESIGN_NAMES="${FINALIZE_DESIGN_NAMES:-1}"          # default ON
 KEEP_INTERMEDIATE_DESIGN_PATHS="${KEEP_INTERMEDIATE_DESIGN_PATHS:-0}"  # default OFF
+CHISEL_SUFFIX="${CHISEL_SUFFIX:-chisel}"                     # default 'chisel'
 _finalize_design_names() {
     local root="$1"
     [[ "$FINALIZE_DESIGN_NAMES" == "1" ]] || return 0
@@ -147,6 +150,7 @@ _finalize_design_names() {
     local keep=""
     [[ "$KEEP_INTERMEDIATE_DESIGN_PATHS" == "1" ]] && keep="--keep_intermediate"
     python3 "$REPO/scripts/finalize_design_names.py" --final_root "$root" $keep \
+        --design_token "$CHISEL_SUFFIX" \
         || echo "WARN: finalize_design_names failed on $root (designs left as-is)"
 }
 
@@ -314,6 +318,22 @@ if [[ -z "$SEED_PDB" ]]; then
     exit 1
 fi
 LIG_PARAMS="${LIG_PARAMS:?Set LIG_PARAMS to your ligand .params file}"
+# CATALYTIC_RESNOS: comma-separated 1-indexed catalytic resnos (chain A) to
+#   fix/protect, e.g. CATALYTIC_RESNOS='41,64,187'. Default empty = let the
+#   driver resolve them: REMARK 666 in SEED_PDB if present, else the hard-coded
+#   PTE_i1 builtin (with a loud warning). Set this for ANY non-PTE scaffold
+#   whose seed lacks REMARK 666 so the wrong (PTE) residues aren't pinned.
+#   Forwarded to iterative_design.py's --catalytic_resnos.
+CATALYTIC_RESNOS="${CATALYTIC_RESNOS:-}"
+# CHAIN: single-character chain id of the catalytic/design chain in SEED_PDB.
+#   Default 'A' (byte-identical). Set (e.g. CHAIN=B) for any scaffold whose
+#   design chain is not A. Forwarded to iterative_design.py's --chain.
+CHAIN="${CHAIN:-A}"
+# REQUIRE_CAT_HIS: require >=1 side-chain H-bond to a catalytic HIS in the
+#   struct filter. Default 1 (ON, byte-identical). Set REQUIRE_CAT_HIS=0 for an
+#   enzyme with NO catalytic His (else that criterion rejects every design);
+#   forwarded as iterative_design.py's --no_require_cat_his_hbond.
+REQUIRE_CAT_HIS="${REQUIRE_CAT_HIS:-1}"
 TARGET_K="${TARGET_K:-50}"
 MIN_HAMMING="${MIN_HAMMING:-3}"
 N_CYCLES="${N_CYCLES:-3}"
@@ -327,6 +347,13 @@ OMIT_AA="${OMIT_AA:-X}"
 # first-shell positions) is now prevented at sample time by auto-
 # detected per-residue omits.
 USE_SIDE_CHAIN_CONTEXT="${USE_SIDE_CHAIN_CONTEXT:-0}"
+
+# Opt-in per-cycle side-chain-context SCHEDULE (default unset => byte-identical;
+# the uniform USE_SIDE_CHAIN_CONTEXT applies to every cycle). A comma-separated
+# list of 0/1, e.g. USE_SIDE_CHAIN_CONTEXT_SCHEDULE='1,1,0' = ON early (clash
+# avoidance) then OFF late (first-shell diversity). Broadcast/truncated to the
+# run's cycle count by the driver. Overrides USE_SIDE_CHAIN_CONTEXT per cycle.
+USE_SIDE_CHAIN_CONTEXT_SCHEDULE="${USE_SIDE_CHAIN_CONTEXT_SCHEDULE:-}"
 
 # Post-translational modifications declared for catalytic residues.
 # Records the modification in the output PDB's REMARK 668 block so
@@ -371,6 +398,21 @@ CONSERVE_GROW_NETWORK="${CONSERVE_GROW_NETWORK:-0}"
 # Canonical REMARK transfer + DESIGN_PATH provenance (Feature 2). On by default;
 # carries REMARK 665/666/667/668/QCB from the seed onto restored + final PDBs.
 TRANSFER_REMARKS="${TRANSFER_REMARKS:-1}"
+
+# Catalytic-residue override passthrough. Empty (default) => omit the flag so the
+# driver auto-resolves from REMARK 666 / PTE builtin (byte-identical default).
+CATALYTIC_RESNOS_CLI=()
+[[ -n "$CATALYTIC_RESNOS" ]] && CATALYTIC_RESNOS_CLI+=( --catalytic_resnos "$CATALYTIC_RESNOS" )
+
+# Chain passthrough. Default 'A' => omit the flag (the driver default is 'A', so
+# the invocation stays byte-identical). Any other id is forwarded.
+CHAIN_CLI=()
+[[ -n "$CHAIN" && "$CHAIN" != "A" ]] && CHAIN_CLI+=( --chain "$CHAIN" )
+
+# Catalytic-HIS-H-bond requirement passthrough. Default 1 (ON) => omit the flag
+# (byte-identical). REQUIRE_CAT_HIS=0 forwards --no_require_cat_his_hbond.
+REQUIRE_CAT_HIS_CLI=()
+[[ "$REQUIRE_CAT_HIS" == 0 ]] && REQUIRE_CAT_HIS_CLI+=( --no_require_cat_his_hbond )
 
 # Assemble the driver CLI fragment for the two features once (avoids fragile
 # inline quoting in the apptainer invocation below).
@@ -446,6 +488,195 @@ FILTERS="${FILTERS:-all}"
 METRICS_CLI=()
 [[ "$METRICS" != "all" ]] && METRICS_CLI+=( --metrics "$METRICS" )
 [[ "$FILTERS" != "all" ]] && METRICS_CLI+=( --filters "$FILTERS" )
+
+# Adaptive solubility-bias controller (opt-in, default OFF => byte-identical).
+# ADAPTIVE_BIAS=1 turns on the closed-loop controller that steers net charge +
+# surface hydrophobicity toward target across cycles (only when statistically out
+# of target; holds once in-band; reverses on overshoot). Sub-knobs are emitted only
+# when set, so the default driver command is unchanged.
+#   CONTROLLER_DAMPING=0   DISABLE the (default-ON as of 1.2.0) control-law damping
+#                          (EWMA + derivative + slew + soft deadband); reverts to the
+#                          legacy under-damped law. Damping is on by default.
+ADAPTIVE_BIAS="${ADAPTIVE_BIAS:-0}"
+ADAPTIVE_BIAS_CLI=()
+if [[ "$ADAPTIVE_BIAS" != "0" ]]; then
+    ADAPTIVE_BIAS_CLI+=( --adaptive_bias )
+    # ${VAR:-} so an unset sub-knob does not trip `set -u` when ADAPTIVE_BIAS=1.
+    [[ -n "${ADAPTIVE_BIAS_GAIN:-}"      ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_gain "$ADAPTIVE_BIAS_GAIN" )
+    [[ -n "${ADAPTIVE_BIAS_MAX_NATS:-}"  ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_max_nats "$ADAPTIVE_BIAS_MAX_NATS" )
+    [[ -n "${ADAPTIVE_BIAS_MAX_ODDS:-}"  ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_max_odds "$ADAPTIVE_BIAS_MAX_ODDS" )
+    [[ -n "${ADAPTIVE_BIAS_CARRY:-}"     ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_carry "$ADAPTIVE_BIAS_CARRY" )
+    [[ -n "${ADAPTIVE_BIAS_DEADBAND:-}"  ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_deadband "$ADAPTIVE_BIAS_DEADBAND" )
+    [[ -n "${ADAPTIVE_BIAS_TMIN:-}"      ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_tmin "$ADAPTIVE_BIAS_TMIN" )
+    [[ -n "${ADAPTIVE_BIAS_FMIN:-}"      ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_fmin "$ADAPTIVE_BIAS_FMIN" )
+    [[ -n "${ADAPTIVE_BIAS_MIN_N:-}"     ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_min_n "$ADAPTIVE_BIAS_MIN_N" )
+    [[ -n "${ADAPTIVE_BIAS_MODE:-}"      ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_mode "$ADAPTIVE_BIAS_MODE" )
+    [[ "${ADAPTIVE_BIAS_SEED_FROM_INPUT:-0}" == "1" ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_seed_from_input )
+    # WS-D controller expansion (opt-in; unset => today's controller behavior):
+    #   ADAPTIVE_SURFACE_SASA_GATE=<frac>  non_tunnel_surface scope (e.g. 0.20)
+    #   ADAPTIVE_CHARGE_BAND=<lo,hi>       controller net-charge band (e.g. -15,-5)
+    #   ADAPTIVE_BIAS_AXES=<list>          axis subset (e.g. charge,surface_hydrophobicity)
+    [[ -n "${ADAPTIVE_SURFACE_SASA_GATE:-}" ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_surface_sasa_gate "$ADAPTIVE_SURFACE_SASA_GATE" )
+    [[ -n "${ADAPTIVE_CHARGE_BAND:-}"       ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_charge_band "$ADAPTIVE_CHARGE_BAND" )
+    [[ -n "${ADAPTIVE_BIAS_AXES:-}"         ]] && ADAPTIVE_BIAS_CLI+=( --adaptive_bias_axes "$ADAPTIVE_BIAS_AXES" )
+    # CF-5 opt-in verbose controller trace (default OFF => byte-identical). Truthy on
+    # 1/true/yes/on; writes <run_dir>/controller_trace.tsv + per-cycle CONTROLLER REPORT.
+    [[ "${CONTROLLER_VERBOSE:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]] && ADAPTIVE_BIAS_CLI+=( --controller_verbose )
+    # Control-law damping is ON by default (1.2.0; validated to hold setpoint vs a
+    # drifting plant — measurement-EWMA 0.5, derivative-on-measurement 0.5*gain, slew
+    # 0.15*max_nats, soft 'ramp' deadband). Set CONTROLLER_DAMPING=0 (or false/no/off)
+    # to revert to the legacy under-damped law.
+    [[ "${CONTROLLER_DAMPING:-1}" =~ ^(0|[Ff][Aa][Ll][Ss][Ee]|[Nn][Oo]|[Oo][Ff][Ff])$ ]] && ADAPTIVE_BIAS_CLI+=( --no_controller_damping )
+    # CF-2/CF-3 opt-in multi-objective controller COORDINATOR (default OFF =>
+    # byte-identical). Truthy on 1/true/yes/on; routes the controller bias through a
+    # weight-partitioned signed-sum-bounded joint odds budget (shared actuators collapse
+    # by sign-selected max/sum) and enables the pI axis to share the charge actuator.
+    # CONTROLLER_CEILING=<X> overrides the joint controller odds ceiling (default 8).
+    [[ "${CONTROLLER_COORDINATOR:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]] && ADAPTIVE_BIAS_CLI+=( --controller_coordinator )
+    [[ -n "${CONTROLLER_CEILING:-}"   ]] && ADAPTIVE_BIAS_CLI+=( --controller_ceiling "$CONTROLLER_CEILING" )
+fi
+
+# Hard solubility veto (opt-in; default OFF => byte-identical). SHIP_SOLUBILITY_VETO=1
+# makes the final top-K writer drop any design outside the final-cycle GRAVY +
+# net-charge band, so deferred-rescue / backfill can never ship a seq-filter-failing
+# design (e.g. GRAVY=1.05) as rank-0. May ship fewer than TARGET_K (intended).
+SHIP_SOLUBILITY_VETO_CLI=()
+# Truthy only on 1/true/yes/on (case-insensitive) so SHIP_SOLUBILITY_VETO=false|off|0
+# all correctly DISABLE the veto (don't enable on any non-"0" string).
+[[ "${SHIP_SOLUBILITY_VETO:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]] \
+    && SHIP_SOLUBILITY_VETO_CLI+=( --ship_solubility_veto )
+
+# Corrected SAP columns (opt-in; default OFF => byte-identical). SAP_CORRECTED=1 emits
+# sap_corr_* (centered, polar-cancellation-free) alongside the legacy sap_*.
+SAP_CORRECTED_CLI=()
+[[ "${SAP_CORRECTED:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]] \
+    && SAP_CORRECTED_CLI+=( --sap_corrected )
+
+# WS-C composition control (opt-in; default OFF/unset => byte-identical).
+#   COMPOSITION_SUPPRESS_ALL_OVERREP=1  down-weight every over-rep class member
+#                                        (not just the class max) in bias_AA.
+#   AA_FRACTION_CAP=<frac>              hard-omit any AA at/over <frac> of a
+#                                        cycle's survivor pool next cycle.
+#   COMPOSITION_SOFT_BIAS=1             activate the expression SOFT_BIAS tier
+#                                        (per-residue AA down-weights at sampling).
+#   COMPOSITION_SOFT_BIAS_NATS=<nats>   magnitude per SOFT_BIAS cell (default 0.5).
+#   COMPOSITION_POOL_FALLBACK=1        when a cycle's survivor pool is empty (e.g. a
+#                                        hydrophobic seed where ~100% fail the GRAVY
+#                                        band), derive the cap/class-balance/soft-bias
+#                                        from the previous cycle's full SAMPLED pool
+#                                        instead — bounds the 26%-Ala backfill mode.
+COMPOSITION_CLI=()
+[[ "${COMPOSITION_SUPPRESS_ALL_OVERREP:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]] \
+    && COMPOSITION_CLI+=( --composition_suppress_all_overrep )
+[[ -n "${AA_FRACTION_CAP:-}" ]] \
+    && COMPOSITION_CLI+=( --aa_fraction_cap "$AA_FRACTION_CAP" )
+if [[ "${COMPOSITION_SOFT_BIAS:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]]; then
+    COMPOSITION_CLI+=( --composition_soft_bias )
+    [[ -n "${COMPOSITION_SOFT_BIAS_NATS:-}" ]] \
+        && COMPOSITION_CLI+=( --composition_soft_bias_nats "$COMPOSITION_SOFT_BIAS_NATS" )
+fi
+[[ "${COMPOSITION_POOL_FALLBACK:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]] \
+    && COMPOSITION_CLI+=( --composition_pool_fallback )
+
+# Per-cycle side-chain-context schedule (opt-in; unset => byte-identical). Passed
+# through verbatim; the driver validates each entry is 0/1 at parse time.
+USE_SIDE_CHAIN_CONTEXT_SCHEDULE_CLI=()
+[[ -n "${USE_SIDE_CHAIN_CONTEXT_SCHEDULE:-}" ]] \
+    && USE_SIDE_CHAIN_CONTEXT_SCHEDULE_CLI+=( --use_side_chain_context_schedule "$USE_SIDE_CHAIN_CONTEXT_SCHEDULE" )
+
+# AA-composition baseline reference (opt-in; unset => byte-identical default of
+# the EC-3 hydrolase distribution). AA_REFERENCE=<key> selects which Swiss-Prot
+# distribution the over-representation checks (class-balanced bias_AA + the
+# adaptive hydrophobic over-rep mask) score against — set it to the design's own
+# EC class for a non-hydrolase enzyme (e.g. swissprot_ec2_transferases_2026_01).
+# Validated at parse time by iterative_design.py against REFERENCE_DISTRIBUTIONS.
+AA_REFERENCE_CLI=()
+[[ -n "${AA_REFERENCE:-}" ]] \
+    && AA_REFERENCE_CLI+=( --aa_reference "$AA_REFERENCE" )
+
+# WS-E sampling-core safety (opt-in; unset => byte-identical):
+#   BIAS_TOTAL_CLAMP=<nats>          bound the effective bias_k+bias_AA (suggest 3.0)
+#   BIAS_TOTAL_CLAMP_ODDS=<X>        CF-3a: same bound in ODDS space (T-invariant,
+#                                    clamp := T*ln(X) each cycle; suggest 8-100).
+#                                    Mutually exclusive with BIAS_TOTAL_CLAMP.
+#   SAMPLING_TEMPERATURE_FLOOR=<T>   raise any cycle temp to >= T (suggest 0.3)
+#   PLM_CLASS_STRENGTH=<k=v,...>     absolute per-class PLM weight overrides
+# NOTE (v1.4.0): --bias_total_clamp is now ON BY DEFAULT at 3.0 nats. Set
+# BIAS_TOTAL_CLAMP=<nats> to OVERRIDE the default, or NO_BIAS_TOTAL_CLAMP=1 to DISABLE the
+# cap entirely (the pre-1.4.0 unclamped path). Setting an explicit BIAS_TOTAL_CLAMP and
+# NO_BIAS_TOTAL_CLAMP together is rejected at parse time.
+WS_E_CLI=()
+[[ -n "${BIAS_TOTAL_CLAMP:-}"          ]] && WS_E_CLI+=( --bias_total_clamp "$BIAS_TOTAL_CLAMP" )
+[[ -n "${BIAS_TOTAL_CLAMP_ODDS:-}"     ]] && WS_E_CLI+=( --bias_total_clamp_odds "$BIAS_TOTAL_CLAMP_ODDS" )
+if [[ "${NO_BIAS_TOTAL_CLAMP:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]]; then
+    WS_E_CLI+=( --no_bias_total_clamp )
+fi
+[[ -n "${SAMPLING_TEMPERATURE_FLOOR:-}" ]] && WS_E_CLI+=( --sampling_temperature_floor "$SAMPLING_TEMPERATURE_FLOOR" )
+[[ -n "${PLM_CLASS_STRENGTH:-}"        ]] && WS_E_CLI+=( --plm_class_strength "$PLM_CLASS_STRENGTH" )
+
+# WS-G omit tunnel-lining (opt-in/experimental; unset => byte-identical):
+#   OMIT_TUNNEL_LINING=1            hard-omit bulky AAs at seed tunnel-lining positions
+#   OMIT_TUNNEL_LINING_AAS=<AAs>    the set to omit (default FHKRWY = the
+#                                   throat's bulky set: W/F/Y/H + R/K)
+if [[ "${OMIT_TUNNEL_LINING:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]]; then
+    WS_E_CLI+=( --omit_tunnel_lining )
+    [[ -n "${OMIT_TUNNEL_LINING_AAS:-}" ]] && WS_E_CLI+=( --omit_tunnel_lining_aas "$OMIT_TUNNEL_LINING_AAS" )
+fi
+
+# Seed triage (opt-in; unset => byte-identical):
+#   PLM_AUTOSKIP_BAD_INPUT=1   force --plm_strength 0 when the INPUT scaffold is
+#                              pathologically hydrophobic / over-represented, so MPNN
+#                              regenerates without the PLM bias amplifying the bad seed.
+#   PLM_AUTOSKIP_GRAVY / PLM_AUTOSKIP_MAX_AA_FRAC / PLM_AUTOSKIP_HYDROPHOBIC_FRAC
+#                              triage thresholds (driver defaults 0.4 / 0.16 / 0.50).
+#   PLM_AUTOSKIP_AA_ZMAX=<z>   F1: opt-in distribution-aware z-gate (redundant OR with the
+#                              flat max-AA cap). Pass the design's own EC class via
+#                              AA_REFERENCE — the EC-3 default is wrong for non-hydrolases.
+#   PLM_AUTOSKIP_AA_LOG2_FLOOR=<l>  z-gate fold-change floor (default 0.25).
+#   PLM_AUTOSKIP_SOFT=1        F2: graded plm_strength reduction instead of the 0/1 cliff
+#                              (CLIFF is the default — soft does not rescue a pathological
+#                              seed; for A/B comparison only).
+#   PLM_AUTOSKIP_SOFT_ZERO=<s> severity at which the soft curve hits 0 (default 2.0).
+PLM_AUTOSKIP_CLI=()
+if [[ "${PLM_AUTOSKIP_BAD_INPUT:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]]; then
+    PLM_AUTOSKIP_CLI+=( --plm_autoskip_bad_input )
+    [[ -n "${PLM_AUTOSKIP_GRAVY:-}" ]]            && PLM_AUTOSKIP_CLI+=( --plm_autoskip_gravy "$PLM_AUTOSKIP_GRAVY" )
+    [[ -n "${PLM_AUTOSKIP_MAX_AA_FRAC:-}" ]]      && PLM_AUTOSKIP_CLI+=( --plm_autoskip_max_aa_frac "$PLM_AUTOSKIP_MAX_AA_FRAC" )
+    [[ -n "${PLM_AUTOSKIP_HYDROPHOBIC_FRAC:-}" ]] && PLM_AUTOSKIP_CLI+=( --plm_autoskip_hydrophobic_frac "$PLM_AUTOSKIP_HYDROPHOBIC_FRAC" )
+    [[ -n "${PLM_AUTOSKIP_AA_ZMAX:-}" ]]          && PLM_AUTOSKIP_CLI+=( --plm_autoskip_aa_zmax "$PLM_AUTOSKIP_AA_ZMAX" )
+    [[ -n "${PLM_AUTOSKIP_AA_LOG2_FLOOR:-}" ]]    && PLM_AUTOSKIP_CLI+=( --plm_autoskip_aa_log2_floor "$PLM_AUTOSKIP_AA_LOG2_FLOOR" )
+    if [[ "${PLM_AUTOSKIP_SOFT:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]]; then
+        PLM_AUTOSKIP_CLI+=( --plm_autoskip_soft )
+        [[ -n "${PLM_AUTOSKIP_SOFT_ZERO:-}" ]]    && PLM_AUTOSKIP_CLI+=( --plm_autoskip_soft_zero "$PLM_AUTOSKIP_SOFT_ZERO" )
+    fi
+fi
+
+# Design acceptance bands (opt-in; each unset => byte-identical default). Set the
+# FINAL (strictest) acceptance band; under --strategy annealing the earlier cycles
+# relax from it by the fixed legacy offsets, while charge/sap/pi stay constant. Each
+# var emits its flag ONLY when set (mirrors the AA_FRACTION_CAP value-passthrough),
+# so a Slurm driver cell can override any band without changing the default run.
+#   NET_CHARGE_MIN  --net_charge_min     drop net_charge_full_HH <= X (acidic floor; default -18.0)
+#   NET_CHARGE_MAX  --net_charge_max     drop net_charge_full_HH >= X (acidic ceil;  default  -4.0)
+#   SAP_MAX         --sap_max_threshold  drop SAP (freesasa-proxy) above X (default 100.0 = off)
+#   GRAVY_MIN       --gravy_min          Kyte-Doolittle GRAVY lower bound (default -0.8)
+#   GRAVY_MAX       --gravy_max          Kyte-Doolittle GRAVY upper bound (default  0.3)
+#   INSTABILITY_MAX --instability_max    Guruprasad instability ceiling (default 60.0)
+#   ALIPHATIC_MIN   --aliphatic_min      Ikai aliphatic-index floor (default 40.0)
+#   BOMAN_MAX       --boman_max          Boman-index ceiling (default 4.5)
+#   PI_MIN          --pi_min             theoretical pI floor (default 5.0)
+#   PI_MAX          --pi_max             theoretical pI ceiling (default 7.5)
+ACCEPTANCE_BANDS_CLI=()
+[[ -n "${NET_CHARGE_MIN:-}"  ]] && ACCEPTANCE_BANDS_CLI+=( --net_charge_min "$NET_CHARGE_MIN" )
+[[ -n "${NET_CHARGE_MAX:-}"  ]] && ACCEPTANCE_BANDS_CLI+=( --net_charge_max "$NET_CHARGE_MAX" )
+[[ -n "${SAP_MAX:-}"         ]] && ACCEPTANCE_BANDS_CLI+=( --sap_max_threshold "$SAP_MAX" )
+[[ -n "${GRAVY_MIN:-}"       ]] && ACCEPTANCE_BANDS_CLI+=( --gravy_min "$GRAVY_MIN" )
+[[ -n "${GRAVY_MAX:-}"       ]] && ACCEPTANCE_BANDS_CLI+=( --gravy_max "$GRAVY_MAX" )
+[[ -n "${INSTABILITY_MAX:-}" ]] && ACCEPTANCE_BANDS_CLI+=( --instability_max "$INSTABILITY_MAX" )
+[[ -n "${ALIPHATIC_MIN:-}"   ]] && ACCEPTANCE_BANDS_CLI+=( --aliphatic_min "$ALIPHATIC_MIN" )
+[[ -n "${BOMAN_MAX:-}"       ]] && ACCEPTANCE_BANDS_CLI+=( --boman_max "$BOMAN_MAX" )
+[[ -n "${PI_MIN:-}"          ]] && ACCEPTANCE_BANDS_CLI+=( --pi_min "$PI_MIN" )
+[[ -n "${PI_MAX:-}"          ]] && ACCEPTANCE_BANDS_CLI+=( --pi_max "$PI_MAX" )
 
 # Decode-time Product-of-Experts backend (Phase: PoE; opt-in). Default 'bias' = the
 # in-process LigandMPNN sampler with our calibrated fusion bias (byte-identical).
@@ -731,10 +962,22 @@ run_stage3_driver() {
             "${DRIVER_CLI_ARGS[@]}" \
             ${PTM:+--ptm "$PTM"} \
             ${ENHANCE:+--enhance "$ENHANCE"} \
+            "${CATALYTIC_RESNOS_CLI[@]}" \
+            "${CHAIN_CLI[@]}" \
+            "${REQUIRE_CAT_HIS_CLI[@]}" \
             "${CONSERVE_CLI[@]}" \
             "${EXPERTS_CLI[@]}" \
             "${PLM_DTYPE_CLI[@]}" \
             "${METRICS_CLI[@]}" \
+            "${ADAPTIVE_BIAS_CLI[@]}" \
+            "${SHIP_SOLUBILITY_VETO_CLI[@]}" \
+            "${SAP_CORRECTED_CLI[@]}" \
+            "${COMPOSITION_CLI[@]}" \
+            "${USE_SIDE_CHAIN_CONTEXT_SCHEDULE_CLI[@]}" \
+            "${AA_REFERENCE_CLI[@]}" \
+            "${WS_E_CLI[@]}" \
+            "${PLM_AUTOSKIP_CLI[@]}" \
+            "${ACCEPTANCE_BANDS_CLI[@]}" \
             "$@" \
             ${EXTRA_DRIVER_FLAGS:-}
 }

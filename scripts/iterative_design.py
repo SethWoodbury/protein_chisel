@@ -41,6 +41,7 @@ import argparse
 import datetime as _dt
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -81,6 +82,13 @@ DEFAULT_CATRES = (60, 64, 128, 131, 132, 157)
 CATALYTIC_HIS_RESNOS = (60, 64, 128, 132)
 CHAIN = "A"
 
+# Bulky AAs for the always-on graded-clash bias (compute_graded_clash_bias).
+# Long/aromatic side chains that can collide with a fixed catalytic atom: aromatics
+# Y/F/W/H, long aliphatic M, and the long charged R AND K. K and R are the same
+# length tier (Cb->NZ ~5.5 A / Cb->CZ ~6 A), so they must be treated symmetrically —
+# shared here so the function default and its call site cannot drift apart.
+_CLASH_BULKY_AAS = "YFWHMRK"
+
 # --metrics objective-gating filter (add-on #7). Set once in main() from the
 # resolved metric selection: a frozenset of multi_objective labels to keep in the
 # TOPSIS basket, or None for "no gating" (the default --metrics all => byte-identical
@@ -103,6 +111,16 @@ def _filter_active(name: str) -> bool:
     default --filters all (``_ACTIVE_FILTERS is None``) every filter is active, so
     gating is a no-op and survivor sets are byte-identical."""
     return _ACTIVE_FILTERS is None or name in _ACTIVE_FILTERS
+
+
+# Catalytic-HIS H-bond structural requirement (any-enzyme generalization). The
+# default struct filter rejects a design with 0 side-chain H-bonds to a catalytic
+# HIS. That is correct for a His-containing active site but rejects EVERY design
+# for an enzyme whose mechanism has no catalytic His. Set in main() from
+# ``not args.no_require_cat_his_hbond`` (kept as a module global like
+# DEFAULT_CATRES so the threaded struct-filter worker reads it without threading
+# through its positional-tuple). Default True => byte-identical (criterion ON).
+REQUIRE_CAT_HIS_HBOND = True
 
 
 # ---- Decode-time PoE backend (add-on, opt-in --mpnn_backend poe) ----------
@@ -161,24 +179,291 @@ def _parse_bool_arg(value: str | bool) -> bool:
     )
 
 
-def _derive_catres_from_remark_666(seed_pdb: Path | str) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    """Read REMARK 666 from ``seed_pdb`` and return:
+def _fraction_arg(value: str) -> float:
+    """Parse a CLI fraction, requiring a finite value in (0, 1].
 
-        (all_catalytic_resnos, his_only_catalytic_resnos)
-
-    sorted ascending. Falls back to the module defaults
-    (PTE_i1 SEED1) if no REMARK 666 entries are found.
+    Used for ``--aa_fraction_cap``: a cap of 0/negative/NaN or an absurdly low
+    value would omit every (or nearly every) amino acid, which fused MPNN encodes
+    as equal ``-1e8`` logits → it then samples *uniformly from the "forbidden"
+    set* rather than respecting the omit. Reject those at the CLI boundary.
     """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"expected a number, got {value!r}")
+    if not math.isfinite(v) or not (0.0 < v <= 1.0):
+        raise argparse.ArgumentTypeError(
+            f"expected a finite fraction in (0, 1], got {value!r}",
+        )
+    return v
+
+
+def _nonneg_finite_arg(value: str, *, max_value: Optional[float] = None) -> float:
+    """Parse a CLI magnitude, requiring a finite value in ``[0, max_value]``.
+
+    Used for nats magnitudes (e.g. ``--composition_soft_bias_nats``): a NaN/inf
+    bias would propagate into the sampling softmax and poison every probability,
+    and an absurd-but-finite value (e.g. ``1e100``) casts to ``-inf`` in the
+    float32 sampler bias — ``max_value`` rejects those at the CLI boundary.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"expected a number, got {value!r}")
+    if not math.isfinite(v) or v < 0.0:
+        raise argparse.ArgumentTypeError(
+            f"expected a finite value >= 0, got {value!r}",
+        )
+    if max_value is not None and v > max_value:
+        raise argparse.ArgumentTypeError(
+            f"expected a value <= {max_value}, got {value!r}",
+        )
+    return v
+
+
+def _scc_schedule_arg(value: str) -> list[int]:
+    """Parse ``--use_side_chain_context_schedule '1,1,0'`` -> ``[1, 1, 0]``.
+
+    A comma-separated per-cycle 0/1 schedule for LigandMPNN's side-chain-context
+    flag (ON early for clash avoidance, OFF late for first-shell diversity).
+    Every entry must be EXACTLY 0 or 1, and at least one entry is required — a
+    typo (``2``, ``0.5``, an empty field) would otherwise silently mis-set the
+    sampler's context flag for a whole cycle. The list is broadcast/truncated to
+    the run's cycle count by :func:`_apply_scc_schedule`.
+
+    The parse is pure (no ``protein_chisel`` import), so ``--help`` builds even
+    without the package on ``PYTHONPATH``.
+    """
+    parts = [p.strip() for p in str(value).split(",")]
+    if not parts or any(p == "" for p in parts):
+        raise argparse.ArgumentTypeError(
+            f"--use_side_chain_context_schedule must be a non-empty comma-"
+            f"separated list of 0/1 (e.g. '1,1,0'), got {value!r}",
+        )
+    out: list[int] = []
+    for p in parts:
+        if p not in ("0", "1"):
+            raise argparse.ArgumentTypeError(
+                f"--use_side_chain_context_schedule entries must each be 0 or 1, "
+                f"got {p!r} in {value!r}",
+            )
+        out.append(int(p))
+    return out
+
+
+def _apply_scc_schedule(cycles: list, schedule: list[int]) -> None:
+    """Override each cycle's ``use_side_chain_context`` from ``schedule`` IN PLACE.
+
+    Broadcast/truncate rule (clear + documented): the schedule is matched to the
+    cycle count position-by-position; if it is SHORTER than the cycle count, its
+    LAST entry is repeated to fill the remaining (later) cycles (so ``'1,0'`` over
+    3 cycles becomes ``[1, 0, 0]`` — ON early, OFF late carries through); if it is
+    LONGER, the extra trailing entries are ignored (truncate to the cycle count).
+    A length-1 schedule broadcasts that single value to every cycle.
+
+    Called ONLY when ``--use_side_chain_context_schedule`` is given, so when the
+    flag is absent each cycle keeps the uniform ``--use_side_chain_context``
+    value => byte-identical.
+    """
+    if not cycles or not schedule:
+        return
+    last = schedule[-1]
+    for i, cyc in enumerate(cycles):
+        cyc.use_side_chain_context = schedule[i] if i < len(schedule) else last
+
+
+def _resolve_composition_pool(
+    *,
+    survivors_prev,
+    fallback_pool,
+    composition_pool_fallback: bool,
+):
+    """Choose the pool the WS-C cap / class-balance / soft-bias should derive from.
+
+    The WS-C levers normally read the previous cycle's *survivor* pool. On a
+    hydrophobic seed where ~100% of samples fail the GRAVY band, that survivor
+    pool is empty, so the levers never fire and the run ships a runaway single-AA
+    composition (the ~26%-Ala backfill mode). With ``--composition_pool_fallback``
+    set, when survivors are empty we instead derive them from the PREVIOUS cycle's
+    full SAMPLED (pre-band-filter) pool — the SAME source the adaptive controller
+    reads (``_load_cycle_seq_stage_pool``) — so the cap/class-balance/soft-bias
+    still engage.
+
+    Returns the fallback DataFrame ONLY when: the flag is set AND survivors are
+    empty/None AND a non-empty fallback pool exists. Otherwise returns ``None``
+    (the gated block then runs unchanged on survivors => byte-identical when the
+    flag is off, survivors exist, or there is no previous pool, e.g. cycle 0).
+    """
+    if not composition_pool_fallback:
+        return None
+    if survivors_prev is not None and len(survivors_prev) > 0:
+        return None
+    if fallback_pool is None or len(fallback_pool) == 0:
+        return None
+    return fallback_pool
+
+
+def _aa_reference_arg(value: str) -> str:
+    """Validate ``--aa_reference NAME`` against the bundled baseline keys.
+
+    NAME selects which Swiss-Prot AA-composition distribution the over-
+    representation baseline is scored against (z-scores / class-balance / the
+    hydrophobic over-rep mask). The default is the EC-3 hydrolase baseline; a
+    non-hydrolase enzyme should select its own EC class (e.g.
+    ``swissprot_ec2_transferases_2026_01``) so designs are compared to the
+    right distribution rather than the wrong one.
+
+    Fail-fast at parse time on an unknown key, listing the valid keys, so a
+    typo can never silently fall through to the wrong reference. The import is
+    deliberately LAZY (inside the function body): ``type=`` callables are only
+    invoked when a value is actually supplied, never for ``--help``, so this
+    keeps ``--help`` working even without ``protein_chisel`` on the path.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from protein_chisel.expression.aa_composition import REFERENCE_DISTRIBUTIONS
+    if value not in REFERENCE_DISTRIBUTIONS:
+        raise argparse.ArgumentTypeError(
+            f"unknown --aa_reference {value!r}; choose from "
+            f"{sorted(REFERENCE_DISTRIBUTIONS)}",
+        )
+    return value
+
+
+def _parse_charge_band_arg(s: str) -> tuple:
+    """Parse ``--adaptive_charge_band 'LO,HI'`` -> ``(lo, hi)`` floats.
+
+    Requires EXACTLY two finite values (a 3-field value was previously truncated
+    silently). ``default_axes`` additionally validates ``lo < hi`` at controller
+    setup, so a bad band fails fast at startup.
+    """
+    parts = str(s).split(",")
+    if len(parts) != 2:
+        raise ValueError(
+            f"--adaptive_charge_band must be 'LO,HI' (exactly two values), got {s!r}")
+    try:
+        lo, hi = float(parts[0]), float(parts[1])
+    except ValueError:
+        raise ValueError(
+            f"--adaptive_charge_band values must be numbers, got {s!r}")
+    if not (math.isfinite(lo) and math.isfinite(hi)):
+        raise ValueError(f"--adaptive_charge_band values must be finite, got {s!r}")
+    return (lo, hi)
+
+
+def _parse_catalytic_resnos_arg(s: str) -> tuple[int, ...]:
+    """Parse ``--catalytic_resnos '10,20,30'`` -> ``(10, 20, 30)``, sorted
+    ascending and de-duplicated.
+
+    These are 1-indexed PDB resseq numbers on the catalytic chain (CHAIN). An
+    explicit override exists for scaffolds whose seed PDB lacks a REMARK 666
+    block: without it the driver falls back to the PTE_i1 builtin positions,
+    which are wrong for any other enzyme. Requires at least one value and
+    every value a positive int (resseq is 1-indexed) — a typo'd/empty value
+    would otherwise silently pin the wrong residues.
+    """
+    parts = [tok.strip() for tok in str(s).split(",") if tok.strip()]
+    if not parts:
+        raise argparse.ArgumentTypeError(
+            f"--catalytic_resnos must list >=1 residue number, got {s!r}")
+    out: set[int] = set()
+    for tok in parts:
+        try:
+            v = int(tok)
+        except (TypeError, ValueError):
+            raise argparse.ArgumentTypeError(
+                f"--catalytic_resnos values must be integers, got {tok!r}")
+        if v < 1:
+            raise argparse.ArgumentTypeError(
+                f"--catalytic_resnos values must be positive (1-indexed "
+                f"resseq), got {v}")
+        out.add(v)
+    return tuple(sorted(out))
+
+
+def _parse_plm_class_strength(s: str) -> dict:
+    """Parse ``--plm_class_strength 'class=val,...'`` -> ``{class: weight}``.
+
+    ABSOLUTE per-class overrides of ``FusionConfig.class_weights`` (not multipliers):
+    e.g. ``distal_surface=0.3`` sets that class's PLM weight to 0.3 (then scaled by
+    the global ``--plm_strength``). Validates each key is a known position class and
+    each value is finite and ``>= 0`` — a typo'd class would otherwise be a silent
+    no-op (``_lookup`` just wouldn't read it). Empty string -> ``{}`` (byte-identical
+    default).
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from protein_chisel.scoring.multi_objective import parse_kv_string
+    from protein_chisel.tools.classify_positions import NEW_CLASSES
+    overrides = parse_kv_string(s)            # raises on a missing '=' / non-float
+    # Only the CURRENT (directional 6-class) taxonomy: legacy tables are re-classified
+    # to these names before fusion, so a legacy key (surface/buried/…) would be a
+    # silent no-op — reject it (the "no silent no-op" guarantee, per review).
+    known = set(NEW_CLASSES)
+    for cls, val in overrides.items():
+        if cls not in known:
+            raise ValueError(
+                f"--plm_class_strength: unknown position class {cls!r}; "
+                f"choose from {sorted(known)}")
+        if not math.isfinite(val) or val < 0.0:
+            raise ValueError(
+                f"--plm_class_strength: {cls}={val} must be a finite weight >= 0")
+    return overrides
+
+
+def _resolve_catalytic_resnos(
+    override: Optional[Iterable[int]],
+    seed_pdb: Path | str,
+) -> tuple[tuple[int, ...], tuple[int, ...], str]:
+    """Resolve the catalytic residue set for ANY scaffold, by priority:
+
+        1. ``override`` (``--catalytic_resnos``) — explicit user intent.
+        2. The seed PDB's ``REMARK 666`` motif block — auto-derived.
+        3. The hard-coded PTE_i1 builtin (``DEFAULT_CATRES`` /
+           ``CATALYTIC_HIS_RESNOS``) — correct ONLY for that scaffold.
+
+    Returns ``(all_catalytic_resnos, his_only_catalytic_resnos, source)`` with
+    ``source`` in ``{"override", "remark_666", "builtin"}``, all resno tuples
+    sorted ascending.
+
+    When (and only when) it falls through to case 3 — no override AND no
+    REMARK 666 — it emits a LOUD ``LOGGER.warning`` naming the PTE-specific
+    residues, flagging them as almost certainly wrong for a non-PTE scaffold,
+    and pointing at ``--catalytic_resnos``. The VALUES are unchanged from the
+    historic silent fallback (byte-identical: same residues, just warned).
+
+    For the override case the HIS subset is taken to be the SAME set as the
+    overridden resnos: every downstream consumer of the HIS subset (e.g.
+    ``_detect_hbond_to_his_sidechain``) is resname-guarded, so a non-HIS resno
+    in that set simply never matches a HIS atom — a safe superset.
+    """
+    if override is not None:
+        ov = tuple(sorted({int(r) for r in override}))
+        if ov:
+            return ov, ov, "override"
+
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
     from protein_chisel.tools.protonate_final import parse_remark_666 as _parse666
     entries = _parse666(seed_pdb)
-    if not entries:
-        return DEFAULT_CATRES, CATALYTIC_HIS_RESNOS
-    all_resnos = tuple(sorted({e.motif_resno for e in entries}))
-    his_resnos = tuple(sorted({
-        e.motif_resno for e in entries if e.motif_resname.upper() == "HIS"
-    }))
-    return all_resnos, his_resnos
+    if entries:
+        all_resnos = tuple(sorted({e.motif_resno for e in entries}))
+        his_resnos = tuple(sorted({
+            e.motif_resno for e in entries if e.motif_resname.upper() == "HIS"
+        }))
+        return all_resnos, his_resnos, "remark_666"
+
+    # No override and no REMARK 666 -> the PTE_i1 builtin. Correct ONLY for the
+    # PTE scaffold; loudly warn so a non-PTE run can't silently pin the wrong
+    # residues (the historic failure mode this resolver exists to fix).
+    LOGGER.warning(
+        "No --catalytic_resnos override and NO REMARK 666 block in seed_pdb "
+        "(%s): falling back to the hard-coded PTE_i1 catalytic residues "
+        "all=%s his=%s. These are almost certainly WRONG for a non-PTE "
+        "scaffold and will pin/fix the wrong positions. Pass "
+        "--catalytic_resnos 'r1,r2,...' (1-indexed resseq on chain %s) or add "
+        "a REMARK 666 motif block to the seed PDB.",
+        seed_pdb, DEFAULT_CATRES, CATALYTIC_HIS_RESNOS, CHAIN,
+    )
+    return DEFAULT_CATRES, CATALYTIC_HIS_RESNOS, "builtin"
+
 
 # Apptainer / cluster paths
 UNIVERSAL_SIF = Path("/net/software/containers/universal.sif")
@@ -297,6 +582,18 @@ def default_cycles(
     consensus_threshold: float = 0.85,
     consensus_strength: float = 2.0,
     consensus_max_fraction: float = 0.30,
+    # Acceptance bands. Each default is the CURRENT hardcoded FINAL
+    # (cycle-2, strictest) value, so an unparameterised call reproduces
+    # the legacy per-cycle schedule byte-for-byte. CLI flags / env vars
+    # override these (see main()'s --net_charge_* / --gravy_* / etc.).
+    net_charge_min: float = -18.0,
+    net_charge_max: float = -4.0,
+    sap_max_threshold: float = 100.0,
+    instability_max: float = 60.0,
+    gravy_min: float = -0.8,
+    gravy_max: float = 0.3,
+    aliphatic_min: float = 40.0,
+    boman_max: float = 4.5,
 ) -> list[CycleConfig]:
     """Three-cycle exploration → exploitation schedule.
 
@@ -311,6 +608,16 @@ def default_cycles(
         filters (charge band, pi band) stay constant throughout per
         the user's preference; only the LIGHT filters (instability,
         GRAVY, aliphatic, boman) and TOPSIS weights anneal.
+
+    Acceptance bands (``net_charge_min/max``, ``sap_max_threshold``,
+    ``instability_max``, ``gravy_min/max``, ``aliphatic_min``,
+    ``boman_max``, ``pi_min/max``) are the FINAL (strictest) band:
+      - ``constant`` strategy applies each one to EVERY cycle directly.
+      - ``annealing`` strategy applies the value to cycle 2 (final) and
+        relaxes cycles 1 and 0 from it by the fixed legacy offsets; the
+        charge / pi / sap bands stay CONSTANT across cycles ("only the
+        light filters anneal"). With all bands at their defaults the
+        annealing schedule is byte-identical to the legacy hardcoded one.
     """
     if strategy not in ("constant", "annealing"):
         raise ValueError(f"strategy must be 'constant' or 'annealing', got {strategy!r}")
@@ -325,70 +632,78 @@ def default_cycles(
         consensus_strength=consensus_strength,
         consensus_max_fraction=consensus_max_fraction,
     )
-    # Charge band and pi band stay constant (user pref: "the current
-    # range should be the final one"). Annealing only relaxes the
-    # *light* filters (instability/GRAVY/aliphatic/boman) early and
-    # uses TOPSIS for survivor selection late.
+    # Charge / sap / pi bands stay CONSTANT across cycles (user pref:
+    # "the current range should be the final one") in BOTH strategies.
+    charge_sap = dict(
+        net_charge_max=net_charge_max, net_charge_min=net_charge_min,
+        sap_max_threshold=sap_max_threshold,
+    )
     if strategy == "constant":
         return [
             CycleConfig(
                 cycle_idx=0, n_samples=500, sampling_temperature=0.20,
-                net_charge_max=-4.0, net_charge_min=-18.0,
-                sap_max_threshold=100.0, **common,
+                instability_max=instability_max,
+                gravy_min=gravy_min, gravy_max=gravy_max,
+                aliphatic_min=aliphatic_min, boman_max=boman_max,
+                **charge_sap, **common,
             ),
             CycleConfig(
                 cycle_idx=1, n_samples=400, sampling_temperature=0.18,
-                net_charge_max=-4.0, net_charge_min=-18.0,
-                sap_max_threshold=100.0, **common,
+                instability_max=instability_max,
+                gravy_min=gravy_min, gravy_max=gravy_max,
+                aliphatic_min=aliphatic_min, boman_max=boman_max,
+                **charge_sap, **common,
             ),
             CycleConfig(
                 cycle_idx=2, n_samples=300, sampling_temperature=0.15,
-                net_charge_max=-4.0, net_charge_min=-18.0,
-                sap_max_threshold=100.0, **common,
+                instability_max=instability_max,
+                gravy_min=gravy_min, gravy_max=gravy_max,
+                aliphatic_min=aliphatic_min, boman_max=boman_max,
+                **charge_sap, **common,
             ),
         ]
-    # Annealing — gentle relaxation, never tighten beyond defaults.
+    # Annealing — gentle relaxation, never tighten beyond the passed FINAL
+    # value. The passed value is the cycle-2 (strictest) band; cycles 1 and
+    # 0 relax from it by the FIXED legacy offsets (with all bands at their
+    # defaults this reproduces the legacy hardcoded schedule byte-for-byte).
     # Cycle 0 (explore): light filters loose; TOPSIS heavy on fitness;
     #                    survivors picked by fitness (legacy).
     # Cycle 1 (transition): light filters slightly loose; balanced
     #                    TOPSIS weights (defaults).
-    # Cycle 2 (exploit): light filters at default; default TOPSIS
-    #                    weights; survivors picked by TOPSIS so the
-    #                    final pool reinforces multi-objective good.
+    # Cycle 2 (exploit): light filters at the final band; default TOPSIS
+    #                    weights; survivors picked by TOPSIS so the final
+    #                    pool reinforces multi-objective good.
     return [
         CycleConfig(
             cycle_idx=0, n_samples=500, sampling_temperature=0.20,
-            net_charge_max=-4.0, net_charge_min=-18.0,
-            sap_max_threshold=100.0,
-            instability_max=80.0, gravy_min=-1.0, gravy_max=0.4,
-            aliphatic_min=30.0, boman_max=5.5,
+            instability_max=instability_max + 20.0,
+            gravy_min=gravy_min - 0.20, gravy_max=gravy_max + 0.10,
+            aliphatic_min=aliphatic_min - 10.0, boman_max=boman_max + 1.0,
             topsis_weight_overrides={
                 "fitness": 3.0,            # explore aggressively on fitness
                 "instability": 0.1, "gravy": 0.1, "aliphatic": 0.1,
                 "boman": 0.1, "pocket_hydrophobicity": 0.1,
             },
             use_topsis_for_survivors=False,
-            **common,
+            **charge_sap, **common,
         ),
         CycleConfig(
             cycle_idx=1, n_samples=400, sampling_temperature=0.18,
-            net_charge_max=-4.0, net_charge_min=-18.0,
-            sap_max_threshold=100.0,
-            instability_max=70.0, gravy_min=-0.9, gravy_max=0.35,
-            aliphatic_min=35.0, boman_max=5.0,
+            instability_max=instability_max + 10.0,
+            gravy_min=gravy_min - 0.10, gravy_max=gravy_max + 0.05,
+            aliphatic_min=aliphatic_min - 5.0, boman_max=boman_max + 0.5,
             topsis_weight_overrides={},        # balanced (defaults)
             use_topsis_for_survivors=True,
-            **common,
+            **charge_sap, **common,
         ),
         CycleConfig(
             cycle_idx=2, n_samples=300, sampling_temperature=0.15,
-            net_charge_max=-4.0, net_charge_min=-18.0,
-            sap_max_threshold=100.0,
-            instability_max=60.0, gravy_min=-0.8, gravy_max=0.3,
-            aliphatic_min=40.0, boman_max=4.5,
+            instability_max=instability_max,
+            gravy_min=gravy_min, gravy_max=gravy_max,
+            aliphatic_min=aliphatic_min, boman_max=boman_max,
             topsis_weight_overrides={},        # balanced (defaults)
             use_topsis_for_survivors=True,
-            **common,
+            **charge_sap, **common,
         ),
     ]
 
@@ -405,6 +720,14 @@ def debug_short_test_cycles(
     consensus_threshold: float = 0.85,
     consensus_strength: float = 2.0,
     consensus_max_fraction: float = 0.30,
+    net_charge_min: float = -18.0,
+    net_charge_max: float = -4.0,
+    sap_max_threshold: float = 100.0,
+    instability_max: float = 60.0,
+    gravy_min: float = -0.8,
+    gravy_max: float = 0.3,
+    aliphatic_min: float = 40.0,
+    boman_max: float = 4.5,
 ) -> list[CycleConfig]:
     """Hardcoded fast smoke-test preset: 20/10/10 samples across 3 cycles.
 
@@ -412,7 +735,8 @@ def debug_short_test_cycles(
     ``args.target_k`` to 5 and ``args.cycles`` to 3, even if the caller
     set them to other values on the same command line; a WARNING is
     logged when that happens so it isn't silent. Intended for end-to-
-    end pipeline validation only — never use for production runs.
+    end pipeline validation only — never use for production runs. Band
+    overrides are forwarded so a debug run honors the same flags.
     """
     cycles = default_cycles(
         omit_AA=omit_AA,
@@ -426,6 +750,14 @@ def debug_short_test_cycles(
         consensus_threshold=consensus_threshold,
         consensus_strength=consensus_strength,
         consensus_max_fraction=consensus_max_fraction,
+        net_charge_min=net_charge_min,
+        net_charge_max=net_charge_max,
+        sap_max_threshold=sap_max_threshold,
+        instability_max=instability_max,
+        gravy_min=gravy_min,
+        gravy_max=gravy_max,
+        aliphatic_min=aliphatic_min,
+        boman_max=boman_max,
     )
     for cyc, n_samples in zip(cycles, (20, 10, 10)):
         cyc.n_samples = n_samples
@@ -558,7 +890,7 @@ def compute_graded_clash_bias(
         "first_shell", "buried",                                  # legacy
         "primary_sphere", "secondary_sphere", "distal_buried",    # new
     ),
-    bulky_aas: str = "YFWHMRK",   # K is as long as R (Cb->NZ ~6 A)
+    bulky_aas: str = _CLASH_BULKY_AAS,   # K is as long as R (Cb->NZ ~6 A)
     # Per-AA bias = -bias_strength_per_pct_clash * clash_pct.
     # Crude 9-stub rotamer grid produces small clash percentages
     # (typically 0.1-0.3), so we need a high strength to give a
@@ -579,10 +911,11 @@ def compute_graded_clash_bias(
 
         bias[i, j] -= bias_strength_per_pct_clash * clash_fraction
 
-    Result: positions where Y/F/W literally have no fitting rotamer
-    get -3 nats; positions where they fit fine get 0; in-between get
-    proportional. Replaces the previous all-or-nothing hard-omit which
-    forbade Y/F/W/H/M at every clash-prone position even when they fit.
+    Result: positions where a bulky AA has no fitting rotamer get the full
+    ``-bias_strength_per_pct_clash`` (−20 nats at the default strength=20);
+    positions where they fit fine get 0; in-between get proportional. Replaces
+    the previous all-or-nothing hard-omit which forbade the bulky set at every
+    clash-prone position even when they fit.
 
     Returns (bias_matrix, telemetry_dict). bias_matrix is shape (L, 20)
     in PLM_AA_ORDER ('ACDEFGHIKLMNPQRSTVWY').
@@ -777,6 +1110,274 @@ def merge_omit_dicts(*dicts: dict[str, str]) -> dict[str, str]:
             cur = set(out.get(k, ""))
             cur.update(aas)
             out[k] = "".join(sorted(cur))
+    return out
+
+
+def _read_seed_tunnel_lining(tsv_path) -> set:
+    """Resnos with ``is_tunnel_lining==True`` from ``seed_tunnel_residues.tsv``.
+
+    SINGLE source of truth for "tunnel lining" — the seed fpocket annotation
+    (``annotate_seed_tunnel_residues``), shared by WS-G's omit and WS-D's surface-
+    scope exclusion so the two can never drift. Returns an empty set on ANY failure
+    (missing file, empty/failed annotation, schema change) so callers degrade to a
+    no-op rather than crash.
+    """
+    try:
+        df = pd.read_csv(tsv_path, sep="\t")
+        return {int(r) for r in df.loc[df["is_tunnel_lining"].astype(bool), "resno"]}
+    except Exception:
+        return set()
+
+
+def _canonical_omit_aas(omit_AA: str) -> str:
+    """The canonical AAs the sampler is forbidden to pick, derived from an omit string.
+
+    Strips the structural ``X`` placeholder and upper-cases; returns the remaining hard-
+    omitted canonical AAs (e.g. ``"CX"`` -> ``"C"``, ``"WX"`` -> ``"W"``). Shared by the
+    WS-C composition exclusion and the seed-triage z-gate exclusion so that an AA the
+    sampler CANNOT pick is never up-weighted, capped, nor used as an over-representation
+    signal (codex: a single-cysteine special-case missed ``--omit_AA WX`` etc.).
+    """
+    return "".join(c for c in str(omit_AA).upper() if c != "X")
+
+
+def _build_tunnel_lining_omit(lining_resnos, chain: str, omit_aas: str, *,
+                              fixed_resnos=()) -> dict[str, str]:
+    """WS-G ``--omit_tunnel_lining``: forbid bulky/hydrophobic AAs at tunnel-lining
+    positions to keep the substrate channel open.
+
+    Returns ``{"<chain><resno>": AAs}`` for each NON-fixed lining resno (fixed /
+    catalytic residues keep their pinned identity). ``{}`` when the lining set or the
+    canonical AA set is empty → byte-identical no-op. Pure; mirrors
+    :func:`_build_fraction_cap_omit`. The default set (``_OMIT_TUNNEL_LINING_DEFAULT``
+    = ``FHKRWY`` = the throat's bulky-blocker set) is the aromatics W/F/Y/H + the long
+    charged R/K that line and constrict a tunnel; **Alanine is intentionally excluded**
+    — it is small and cannot constrict (controlling Ala over-representation is WS-C's
+    job, not WS-G's), and the medium hydrophobics I/L/M/V are left to the soft throat-
+    feedback bias rather than a permanent hard ban.
+    """
+    aas = "".join(sorted({a for a in str(omit_aas).upper() if a in _CANONICAL_AAS}))
+    if not aas:
+        return {}
+    # Never omit so many AAs that a lining position is left with fewer than
+    # _MIN_SAMPLEABLE_AAS_AFTER_CAP choices (fused MPNN would otherwise sample
+    # uniformly from the "forbidden" set) — fail fast on an absurd user set (codex).
+    if len(_CANONICAL_AAS) - len(aas) < _MIN_SAMPLEABLE_AAS_AFTER_CAP:
+        raise ValueError(
+            f"--omit_tunnel_lining_aas {omit_aas!r} omits {len(aas)} canonical AAs, "
+            f"leaving fewer than {_MIN_SAMPLEABLE_AAS_AFTER_CAP} sampleable at lining "
+            f"positions; use a smaller set (default {_OMIT_TUNNEL_LINING_DEFAULT}).")
+    fixed = {int(r) for r in fixed_resnos}
+    return {f"{chain}{int(r)}": aas for r in lining_resnos if int(r) not in fixed}
+
+
+# The 20 canonical amino acids (set; order-independent membership tests).
+_CANONICAL_AAS = frozenset("ACDEFGHIKLMNPQRSTVWY")
+
+
+def _clamp_bias_total(
+    bias_k: np.ndarray,
+    clamp: Optional[float],
+    bias_AA_vec: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """WS-E ``--bias_total_clamp``: bound the EFFECTIVE per-(pos, AA) sampling bias.
+
+    LigandMPNN adds the per-residue bias (``bias_k``) AND the global ``bias_AA``
+    separately, so the effective bias at ``(pos, AA)`` is their sum. When
+    ``bias_AA_vec`` (a ``(20,)`` per-AA vector parsed from the FINAL serialized
+    ``bias_AA`` string) is given, the clamp bounds ``bias_k + bias_AA`` to
+    ``±clamp`` and returns the adjusted ``bias_k`` (so the sum stays in band, while
+    the separately-passed global term is preserved); a cell already in band is
+    unchanged. Without ``bias_AA_vec`` it clamps ``bias_k`` alone.
+
+    ``clamp is None`` returns ``bias_k`` UNCHANGED (the same object) — the
+    byte-identical default. Bounds the otherwise-uncapped consensus(+2.0) + PLM-peak
+    stack that, at T≈0.15, locks a cell near-deterministically (~10¹³× odds).
+    """
+    if clamp is None:
+        return bias_k
+    n = abs(float(clamp))
+    if bias_AA_vec is None:
+        return np.clip(bias_k, -n, n)
+    g = np.asarray(bias_AA_vec, dtype=bias_k.dtype)[None, :]
+    total = bias_k + g
+    clipped = np.clip(total, -n, n)
+    # Only adjust cells that actually exceeded the band; leave in-band bias_k EXACT
+    # (the (bias_k+g)-g round-trip would otherwise perturb in-band cells by ~1e-7 in
+    # float32 and inflate the "n cells adjusted" telemetry).
+    return np.where(clipped != total, clipped - g, bias_k).astype(bias_k.dtype)
+
+
+# F3 (v1.4.0): the bias-sum safety cap is ON BY DEFAULT at this many nats. 3 nats
+# preserves a legit ~3-nat single-source PLM peak (so a clean PLM-on run is essentially
+# unaffected) while capping the pathological 6-20-nat double-count lock (codex: a fixed-
+# nats cap is the right semantic — it allows <=3 nats at EVERY temperature, unlike the
+# odds form or the coordinator's 1e3x, both of which would clip a legit peak). This is a
+# deliberate default-path change (like the 1.2.0 damping flip); --no_bias_total_clamp
+# (or NO_BIAS_TOTAL_CLAMP=1) restores the exact pre-1.4.0 (unclamped) path.
+_DEFAULT_BIAS_TOTAL_CLAMP_NATS = 3.0
+
+
+def _resolve_bias_total_clamp_default(
+    *,
+    bias_total_clamp: Optional[float],
+    bias_total_clamp_odds: Optional[float],
+    no_clamp: bool,
+) -> Optional[float]:
+    """Decide the effective ``--bias_total_clamp`` (nats) after applying the F3 default.
+
+    Pure precedence resolver (keeps the driver glue a one-liner + makes the rule unit-
+    testable without argparse):
+
+    * ``no_clamp`` (``--no_bias_total_clamp``) -> ``None`` — the EXACT legacy path
+      (``_clamp_bias_total`` is then the identity no-op => byte-identical to pre-1.4.0).
+    * an explicit ``--bias_total_clamp`` (not ``None``, INCLUDING ``0.0``) -> kept verbatim
+      (the user's value wins; never silently bumped to the default).
+    * an explicit ``--bias_total_clamp_odds`` -> leave the nats clamp ``None`` so the odds
+      path owns the clamp that cycle AND the two never collide / falsely trip the existing
+      nats-vs-odds mutual-exclusion guard.
+    * otherwise (a bare run) -> inject :data:`_DEFAULT_BIAS_TOTAL_CLAMP_NATS` (3.0).
+
+    NOTE: callers must run this AFTER the existing nats-vs-odds mutual-exclusion check so
+    the injected default never participates in that check.
+    """
+    if no_clamp:
+        return None
+    if bias_total_clamp is not None:
+        return bias_total_clamp
+    if bias_total_clamp_odds is not None:
+        return None
+    return _DEFAULT_BIAS_TOTAL_CLAMP_NATS
+
+
+# WS-C fraction cap never leaves a designable position with fewer than this many
+# sampleable AAs (guards the all-AAs-omitted → uniform-from-forbidden MPNN failure).
+_MIN_SAMPLEABLE_AAS_AFTER_CAP = 3
+
+# WS-G --omit_tunnel_lining_aas default = the throat's bulky-blocker set
+# (tunnel_metrics.bulky_blocker_aas(0.70) = "_BLOCKER_WEIGHT >= 0.70"): aromatics
+# W/F/Y/H + the long charged R/K. A guard-tested *literal* (not an import-time call)
+# so arg-parsing never has to import protein_chisel — see
+# test_ws_g_default_constant_matches_throat_bulky_set, which fails loudly if the
+# blocker weights drift out of sync with this string.
+_OMIT_TUNNEL_LINING_DEFAULT = "FHKRWY"
+
+# Upper bound (nats) on --composition_soft_bias_nats: well past a hard ban (the
+# effective odds penalty is exp(nats / T); at T≈0.15 even 0.5 is ~28x), and small
+# enough that the bias never overflows the float32 sampler matrix to -inf.
+_SOFT_BIAS_NATS_MAX = 20.0
+
+# WS-C composition soft-bias (pool-derived per cycle): a per-residue SOFT_BIAS
+# liability is applied only if it appears in >= _SOFT_BIAS_MIN_SUPPORT of the
+# survivor pool (so a one-off survivor can't pollute the bias), and only LOCAL
+# hits (span <= _SOFT_BIAS_MAX_SPAN_FRAC * L) count — whole-protein composition
+# hits are left to the suppress-all / fraction-cap levers.
+_SOFT_BIAS_MIN_SUPPORT = 0.5
+_SOFT_BIAS_MAX_SPAN_FRAC = 0.5
+
+
+def _build_fraction_cap_omit(
+    pool_seq: str,
+    cap: Optional[float],
+    *,
+    protein_resnos: Iterable[int],
+    fixed_resnos: Iterable[int],
+    chain: str = CHAIN,
+    exclude_aas: str = "",
+) -> dict[str, str]:
+    """WS-C per-AA fraction cap → per-residue omit dict (``--aa_fraction_cap``).
+
+    Returns ``{"<chain><resno>": "AAs"}`` forbidding every amino acid whose
+    fraction in ``pool_seq`` is at/over ``cap`` (e.g. 0.15), at every NON-FIXED
+    designable position (``protein_resnos`` minus ``fixed_resnos``). Catalytic /
+    fixed positions keep their identity (they are never redesigned). Members of
+    ``exclude_aas`` (already hard-omitted, e.g. cysteine) are never re-capped.
+
+    ``cap is None`` (the default) or no AA over the cap → ``{}`` (a no-op, so the
+    merged omit — and the whole run — is byte-identical). Pure + reference-free.
+    """
+    if cap is None:
+        return {}
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from protein_chisel.expression.aa_composition import AA_ORDER_REF, over_cap_aas
+    capped = over_cap_aas(pool_seq, cap, exclude_aas=exclude_aas)
+    if not capped:
+        return {}
+    # SAFETY GUARD: never omit so many AAs that the sampler is left with fewer
+    # than _MIN_SAMPLEABLE_AAS_AFTER_CAP choices. Omitting ALL canonical AAs makes
+    # fused MPNN's per-AA omit logits equal (-1e8), so it samples uniformly from
+    # the supposedly-forbidden set — a silent failure worse than a crash. A cap
+    # this aggressive is a misconfiguration (cap too low for a low-diversity
+    # pool); skip it this cycle and surface it loudly.
+    n_sampleable = len(set(AA_ORDER_REF) - {c for c in exclude_aas.upper()})
+    if len(capped) > max(0, n_sampleable - _MIN_SAMPLEABLE_AAS_AFTER_CAP):
+        LOGGER.error(
+            "aa_fraction_cap=%.4f would omit %d of %d sampleable AAs (%s), leaving "
+            "fewer than %d — cap too low for this pool; SKIPPING the cap this cycle.",
+            cap, len(capped), n_sampleable, "".join(capped),
+            _MIN_SAMPLEABLE_AAS_AFTER_CAP,
+        )
+        return {}
+    cap_str = "".join(capped)
+    fixed_set = {int(r) for r in fixed_resnos}
+    return {
+        f"{chain}{int(r)}": cap_str
+        for r in protein_resnos if int(r) not in fixed_set
+    }
+
+
+def _enforce_min_sampleable_after_cap(
+    merged_omit: dict[str, str],
+    base_omit: dict[str, str],
+    global_omit_AA: str,
+    min_keep: int = _MIN_SAMPLEABLE_AAS_AFTER_CAP,
+) -> dict[str, str]:
+    """Post-merge safety net for ``--aa_fraction_cap``.
+
+    The per-position fraction-cap omit is unioned with the structural omits
+    (expression hard-omit, first-shell diversity, position-1 M) *and* the global
+    ``omit_AA``. Even when the cap-set alone left enough AAs, that union can drive
+    an individual position to **zero** sampleable canonical AAs — which fused MPNN
+    encodes as all-equal ``-1e8`` logits and then samples *uniformly from the
+    "forbidden" set*. For any position the merge leaves with fewer than
+    ``min_keep`` sampleable canonical AAs, REVERT that position to its pre-cap
+    (``base_omit``) value — the structural omits never over-omit, so the revert is
+    always safe. Returns a (possibly modified) copy; ``merged_omit`` is unchanged.
+    """
+    g = _CANONICAL_AAS & set(str(global_omit_AA).upper())
+    n_canon = len(_CANONICAL_AAS)
+    out = dict(merged_omit)
+    reverted: list[str] = []
+    structural: list[str] = []                # still degenerate even without the cap
+    for key, aas in list(out.items()):
+        omitted = g | (_CANONICAL_AAS & set(str(aas).upper()))
+        if n_canon - len(omitted) < min_keep:
+            b = base_omit.get(key, "")
+            if b:
+                out[key] = b
+            else:
+                del out[key]
+            reverted.append(key)
+            # Reverting removes the cap; verify the structural base itself (with
+            # the global omit_AA) is safe. If not, the over-omit is NOT cap-induced
+            # — the guard cannot fix it (the cap is already gone), so surface it.
+            base_omitted = g | (_CANONICAL_AAS & set(str(b).upper()))
+            if n_canon - len(base_omitted) < min_keep:
+                structural.append(key)
+    if reverted:
+        LOGGER.error(
+            "aa_fraction_cap: reverted the cap at %d position(s) %s — the merged "
+            "omit (cap + structural + global omit_AA) would have left fewer than "
+            "%d sampleable AAs there.",
+            len(reverted), sorted(reverted)[:10], min_keep,
+        )
+    if structural:
+        LOGGER.error(
+            "aa_fraction_cap guard: position(s) %s remain below %d sampleable AAs "
+            "EVEN WITHOUT THE CAP (structural omit + global omit_AA) — a pre-existing "
+            "over-omit the cap guard cannot repair.",
+            sorted(structural)[:10], min_keep,
+        )
     return out
 
 
@@ -1482,35 +2083,28 @@ def _detect_hbond_to_his_sidechain(
     return hits
 
 
-# Kyte-Doolittle hydrophobicity + Tien max-SASA — same as v1 driver.
-KD_HYDROPHOBICITY = {
-    "I": 4.5, "V": 4.2, "L": 3.8, "F": 2.8, "C": 2.5, "M": 1.9, "A": 1.8,
-    "G": -0.4, "T": -0.7, "S": -0.8, "W": -0.9, "Y": -1.3, "P": -1.6,
-    "H": -3.2, "E": -3.5, "Q": -3.5, "D": -3.5, "N": -3.5, "K": -3.9, "R": -4.5,
-}
-SASA_MAX_RESIDUE = {
-    "A": 121, "C": 148, "D": 187, "E": 214, "F": 228, "G": 97,  "H": 216,
-    "I": 195, "K": 230, "L": 191, "M": 203, "N": 187, "P": 154, "Q": 214,
-    "R": 265, "S": 143, "T": 163, "V": 165, "W": 264, "Y": 255,
-}
-THREE_TO_ONE = {
-    "ALA":"A","ARG":"R","ASN":"N","ASP":"D","CYS":"C","GLN":"Q","GLU":"E",
-    "GLY":"G","HIS":"H","HID":"H","HIE":"H","HIP":"H","HIS_D":"H","ILE":"I",
-    "LEU":"L","LYS":"K","KCX":"K","MET":"M","PHE":"F","PRO":"P","SER":"S",
-    "THR":"T","TRP":"W","TYR":"Y","VAL":"V",
-}
+def _compute_sap_proxy(pdb_path: Path, corrected: bool = False) -> Optional[dict]:
+    """SAP proxy via freesasa SASA + Kyte-Doolittle hydrophobicity.
 
+    Per-residue SAP_i = sum over residues j within 10 Å of CA(i):
+        (SASA(j) / SASA_max(j)) * weight(restype(j))
 
-def _compute_sap_proxy(pdb_path: Path) -> Optional[dict]:
-    """Lauer-style SAP via freesasa SASA + Kyte-Doolittle hydrophobicity.
-
-    Per-residue SAP_i = sum over atoms within 10 Å of CA(i):
-        (SASA(j) / SASA_max(j)) * KD(restype(j))
+    Scales + the spatial reduction live in the shared ``protein_chisel.scoring.sap``
+    module (one source of truth, also used by the adaptive controller). The legacy
+    ``sap_*`` columns use the signed Kyte-Doolittle weight and are byte-identical to
+    before. When ``corrected`` is set it ALSO emits ``sap_corr_*`` using the
+    centered, zero-clamped weight, so exposed polar residues can no longer cancel
+    hydrophobic neighbours and alanine surfaces register (the legacy proxy's blind
+    spots, per the 2026-06 audit).
     """
     try:
         import freesasa
     except ImportError:
         return None
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from protein_chisel.scoring.sap import (
+        THREE_TO_ONE, kd_weight_raw, kd_weight_corrected, sap_neighborhood_metrics,
+    )
     try:
         freesasa.setVerbosity(freesasa.silent)
         struct = freesasa.Structure(str(pdb_path))
@@ -1552,28 +2146,23 @@ def _compute_sap_proxy(pdb_path: Path) -> Optional[dict]:
             ca = res_data[k]["atoms_xyz"][0] if res_data[k]["atoms_xyz"] else (0, 0, 0)
         cas.append(ca)
     cas_a = np.array(cas, dtype=float)
+    aas = [THREE_TO_ONE.get(res_data[k]["resname"]) for k in keys_sorted]
+    sasa_total = [res_data[k]["sasa"] for k in keys_sorted]
 
-    sap_per_res = []
-    for i, k_i in enumerate(keys_sorted):
-        d = np.linalg.norm(cas_a - cas_a[i], axis=1)
-        nbrs = np.where(d <= 10.0)[0]
-        s = 0.0
-        for j in nbrs:
-            rj = res_data[keys_sorted[j]]["resname"]
-            aa = THREE_TO_ONE.get(rj)
-            if aa is None:
-                continue
-            sasa_j = res_data[keys_sorted[j]]["sasa"]
-            sasa_max = SASA_MAX_RESIDUE.get(aa, 200.0)
-            s += (sasa_j / sasa_max) * KD_HYDROPHOBICITY.get(aa, 0.0)
-        sap_per_res.append(s)
-
-    arr = np.array(sap_per_res)
-    return {
-        "sap_max": float(np.max(arr)),
-        "sap_mean": float(np.mean(arr)),
-        "sap_p95": float(np.percentile(arr, 95)),
+    legacy = sap_neighborhood_metrics(
+        aas, sasa_total, cas_a, weight_fn=kd_weight_raw)
+    out = {
+        "sap_max": legacy["max"],
+        "sap_mean": legacy["mean"],
+        "sap_p95": legacy["p95"],
     }
+    if corrected:
+        corr = sap_neighborhood_metrics(
+            aas, sasa_total, cas_a, weight_fn=kd_weight_corrected)
+        out["sap_corr_max"] = corr["max"]
+        out["sap_corr_mean"] = corr["mean"]
+        out["sap_corr_p95"] = corr["p95"]
+    return out
 
 
 def stage_struct_filter(
@@ -1590,8 +2179,14 @@ def stage_struct_filter(
     # and broadcast to all designs (DFI is design-invariant for
     # fixed-backbone runs).
     seed_dfi_metrics: Optional[dict] = None,
+    sap_corrected: bool = False,
 ) -> Path:
-    """Apply h-bond + SAP-proxy structural filter."""
+    """Apply h-bond + SAP-proxy structural filter.
+
+    ``sap_corrected`` (opt-in; default False → byte-identical) additionally emits
+    ``sap_corr_*`` columns (centered, polar-cancellation-free SAP from the shared
+    ``scoring.sap`` module) alongside the legacy ``sap_*``.
+    """
     if catalytic_his_resnos is None:
         catalytic_his_resnos = CATALYTIC_HIS_RESNOS
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1611,7 +2206,7 @@ def stage_struct_filter(
         work_args.append((
             cid, pdb, cat_his_list, fixed_list,
             clash_severe_distance, sap_max_threshold,
-            seed_dfi_metrics,
+            seed_dfi_metrics, sap_corrected,
         ))
 
     from protein_chisel.utils.resources import pool_workers
@@ -1670,6 +2265,8 @@ def stage_struct_filter(
         # crash later filters that read this file.
         empty_cols = list(df.columns) + [
             "n_hbonds_to_cat_his", "sap_max", "sap_mean", "sap_p95",
+            *(["sap_corr_max", "sap_corr_mean", "sap_corr_p95"]
+              if sap_corrected else []),
             "passed_struct_filter", "struct_fail",
         ]
         survivors = pd.DataFrame(columns=empty_cols)
@@ -2299,11 +2896,12 @@ def _struct_filter_worker(args: tuple) -> tuple:
 
     Args tuple:
         (cid, pdb_path, catalytic_his_resnos, fixed_resnos,
-         clash_severe_distance, sap_max_threshold)
+         clash_severe_distance, sap_max_threshold, seed_dfi_metrics,
+         sap_corrected)
     Returns: (cid, row_dict, hbond_list, struct_fail_reasons)
     """
     (cid, pdb, cat_his, fixed_, sev_dist, sap_max_thr,
-     seed_dfi_metrics_) = args
+     seed_dfi_metrics_, sap_corrected_) = args
     if pdb is None or not Path(pdb).is_file():
         # Schema-consistent empty row — every key the parent loop
         # writes must be present so missing-PDB rows don't NaN-leak
@@ -2338,6 +2936,11 @@ def _struct_filter_worker(args: tuple) -> tuple:
             "struct_fail_reason": f"pdb_missing: {pdb}",
             "_passed": False,
         }
+        if sap_corrected_:
+            empty_row.update({
+                "sap_corr_max": float("nan"), "sap_corr_mean": float("nan"),
+                "sap_corr_p95": float("nan"),
+            })
         return cid, empty_row, [], [f"pdb_missing: {pdb}"]
     # Lazy imports inside worker so each Pool process re-imports cleanly.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -2353,8 +2956,8 @@ def _struct_filter_worker(args: tuple) -> tuple:
     panel = detect_interactions(pdb, chain=CHAIN, selection="protein_vs_ligand")
     gi_metrics = panel.to_dict("ligand_int__")
 
-    # SAP proxy via freesasa
-    sap = _compute_sap_proxy(pdb) or {}
+    # SAP proxy via freesasa (+ optional corrected sap_corr_* when requested)
+    sap = _compute_sap_proxy(pdb, corrected=sap_corrected_) or {}
     sap_max = sap.get("sap_max", float("nan"))
 
     # Clash detection (catalytic + ligand vs designed sidechains)
@@ -2382,8 +2985,11 @@ def _struct_filter_worker(args: tuple) -> tuple:
         }
 
     # Filter reasons (gated by --filters via _filter_active; all on => identical).
+    # The cat-HIS H-bond requirement is ADDITIONALLY gated by REQUIRE_CAT_HIS_HBOND
+    # (--no_require_cat_his_hbond): an enzyme with no catalytic His can never satisfy
+    # it, so opt out of just this criterion. Default True => byte-identical.
     reasons: list[str] = []
-    if _filter_active("cat_his_hbonds") and len(hbonds) < 1:
+    if REQUIRE_CAT_HIS_HBOND and _filter_active("cat_his_hbonds") and len(hbonds) < 1:
         reasons.append("no h-bonds to catalytic HIS")
     if _filter_active("sap") and sap_max == sap_max and sap_max > sap_max_thr:
         reasons.append(f"sap_max={sap_max:.2f} > {sap_max_thr}")
@@ -2395,6 +3001,11 @@ def _struct_filter_worker(args: tuple) -> tuple:
         "sap_max": sap_max,
         "sap_mean": sap.get("sap_mean", float("nan")),
         "sap_p95": sap.get("sap_p95", float("nan")),
+        **({
+            "sap_corr_max": sap.get("sap_corr_max", float("nan")),
+            "sap_corr_mean": sap.get("sap_corr_mean", float("nan")),
+            "sap_corr_p95": sap.get("sap_corr_p95", float("nan")),
+        } if sap_corrected_ else {}),
         **clash_dict,
         **preorg_metrics,
         **(seed_dfi_metrics_ or {}),
@@ -2972,7 +3583,13 @@ def _write_final_topk_artifacts(
     pdb_map: dict[str, Path],
     seed_pdb: Optional[Path] = None,
 ) -> tuple[Path, pd.DataFrame]:
-    """Write a self-consistent top-K artifact set and return the realized rows."""
+    """Write a self-consistent top-K artifact set and return the realized rows.
+
+    Pure writer (single responsibility): it copies PDBs + writes the TSV/FASTA for
+    whatever rows it is given. The opt-in solubility veto is applied UPSTREAM by
+    ``_apply_solubility_veto`` so this stays a faithful "write what you're handed"
+    step (and so the caller's row-count bookkeeping reflects the post-veto set).
+    """
     pdb_out = final_dir / "topk_pdbs"
     if pdb_out.exists():
         shutil.rmtree(pdb_out)
@@ -3047,6 +3664,7 @@ def _build_input_reference_row(
     clash_filter: bool,
     clash_severe_distance: float,
     sap_max_threshold: float,
+    sap_corrected: bool = False,
     seed_dfi_metrics: Optional[dict],
     tunnel_metrics_enabled: bool,
     ligand_min_radius: Optional[float],
@@ -3153,6 +3771,7 @@ def _build_input_reference_row(
     _, struct_row, _, struct_reasons = _struct_filter_worker((
         seed_id, seed_pdb, list(catalytic_resnos), list(fixed_resnos),
         clash_severe_distance, sap_max_threshold, seed_dfi_metrics,
+        sap_corrected,
     ))
     struct_reasons = list(struct_reasons)
     if clash_filter and _filter_active("clash") and struct_row.get("clash__has_severe"):
@@ -3423,6 +4042,86 @@ def _overlay_rows_by_id(base_df: pd.DataFrame, updates_df: pd.DataFrame) -> pd.D
     for col in upd.columns:
         out_idx.loc[common, col] = upd_idx.loc[common, col]
     return out_idx.reset_index(drop=True)
+
+
+def _within_solubility_band(
+    df: pd.DataFrame,
+    *,
+    gravy_min: float,
+    gravy_max: float,
+    net_charge_min: float,
+    net_charge_max: float,
+) -> pd.Series:
+    """Boolean mask: each row is inside the GRAVY + net-charge solubility band.
+
+    Thin wrapper over the single source of truth ``scoring.solubility``
+    (also used by WS-F's PLM-refresh representative selection) — kept here under its
+    historical name so the WS-A veto call sites are unchanged and byte-identical.
+    Charge EXCLUSIVE, GRAVY INCLUSIVE, missing data fails closed.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from protein_chisel.scoring.solubility import within_solubility_band
+    return within_solubility_band(
+        df, gravy_min=gravy_min, gravy_max=gravy_max,
+        net_charge_min=net_charge_min, net_charge_max=net_charge_max,
+    )
+
+
+def _apply_solubility_veto(
+    top: pd.DataFrame,
+    *,
+    enabled: bool,
+    gravy_min: Optional[float],
+    gravy_max: Optional[float],
+    net_charge_min: Optional[float],
+    net_charge_max: Optional[float],
+) -> pd.DataFrame:
+    """Opt-in hard solubility veto on a final-selection frame (modular, pure).
+
+    With ``enabled=False`` (default) returns ``top`` UNCHANGED — no copy, no new
+    column → byte-identical. With ``enabled=True`` it drops every row outside the
+    GRAVY + net-charge band (so the deferred-rescue / backfill path can never ship
+    a seq-filter-failing design, e.g. GRAVY=1.05), adds a truthful
+    ``selection__solubility_passed`` column, and logs the dropped offenders.
+
+    The band must match the final cycle's ACTUAL ``stage_seq_filter`` bounds — the
+    caller passes strategy-correct values (GRAVY is ``args.gravy_*`` under
+    'constant', ``cyc.gravy_*`` under 'annealing'; charge is the final
+    ``CycleConfig`` band). May return fewer than ``target_k`` rows (intended:
+    ship soluble-only). Applied in the caller BEFORE the row-count bookkeeping so
+    a legitimate veto drop is never mistaken for a PDB-export failure.
+
+    Distinct from ``selection__hard_final_filter_passed`` (= passed fpocket
+    druggability), which is NOT a solubility signal.
+    """
+    if not enabled or len(top) == 0:
+        return top
+    missing = [n for n, v in (("gravy_min", gravy_min), ("gravy_max", gravy_max),
+                              ("net_charge_min", net_charge_min),
+                              ("net_charge_max", net_charge_max)) if v is None]
+    if missing:
+        raise ValueError(
+            "_apply_solubility_veto: enabled but missing band bound(s): "
+            f"{', '.join(missing)} (caller must pass all four)")
+    band_ok = _within_solubility_band(
+        top, gravy_min=gravy_min, gravy_max=gravy_max,
+        net_charge_min=net_charge_min, net_charge_max=net_charge_max,
+    )
+    out = top.copy()
+    out["selection__solubility_passed"] = band_ok.values
+    n_veto = int((~band_ok).sum())
+    if n_veto:
+        cols = [c for c in ("id", "gravy", "net_charge_full_HH",
+                            "selection__bucket") if c in out.columns]
+        worst = out.loc[~band_ok, cols].head(5).to_dict("records")
+        LOGGER.error(
+            "ship_solubility_veto: dropping %d/%d final top-K rows OUTSIDE the "
+            "solubility band (GRAVY[%.2f, %.2f], charge(%.1f, %.1f)); shipping %d. "
+            "Worst offenders: %s",
+            n_veto, len(out), gravy_min, gravy_max,
+            net_charge_min, net_charge_max, len(out) - n_veto, worst,
+        )
+    return out.loc[band_ok].reset_index(drop=True)
 
 
 def _deferred_rescue_score_candidates(
@@ -4062,6 +4761,7 @@ def run_cycle(
     position_table_df=None,           # for first-shell diversity injection
     omit_AA_per_residue: Optional[dict[str, str]] = None,
     catalytic_his_resnos: Optional[Iterable[int]] = None,
+    aa_reference: str = "swissprot_ec3_hydrolases_2026_01",
     balance_z_threshold: float = 2.0,
     design_ph: float = 7.5,
     instability_max: float = 60.0,
@@ -4069,6 +4769,21 @@ def run_cycle(
     gravy_max: float = 0.3,
     aliphatic_min: float = 40.0,
     boman_max: float = 4.5,
+    sap_corrected: bool = False,
+    # ---- WS-C composition control (all opt-in; defaults → byte-identical) ----
+    composition_suppress_all_overrep: bool = False,
+    aa_fraction_cap: Optional[float] = None,
+    composition_soft_bias: bool = False,
+    composition_soft_bias_nats: float = 0.5,
+    expression_soft_bias: Optional[dict[int, str]] = None,
+    # Feature #29: opt-in composition POOL FALLBACK. When the flag is set AND
+    # this cycle's survivor pool is empty, derive the cap/class-balance/soft-bias
+    # from the previous cycle's full SAMPLED (pre-band-filter) pool carried in
+    # ``composition_fallback_pool``. Default OFF / None pool => byte-identical.
+    composition_pool_fallback: bool = False,
+    composition_fallback_pool: Optional[pd.DataFrame] = None,
+    bias_total_clamp: Optional[float] = None,
+    bias_total_clamp_odds: Optional[float] = None,
     n_term_pad: str = "",
     c_term_pad: str = "",
     omit_M_at_pos1: bool = True,
@@ -4078,6 +4793,11 @@ def run_cycle(
     ligand_resname: Optional[str] = None,
     throat_bias_prev: Optional[np.ndarray] = None,
     throat_bias_decay: float = 0.5,
+    adaptive_bias_global: Optional[dict] = None,
+    adaptive_bias_delta: Optional[np.ndarray] = None,
+    controller_coordinator: bool = False,
+    controller_ceiling: float = 8.0,
+    clash_bias: Optional[np.ndarray] = None,
 ) -> tuple[Optional[pd.DataFrame], dict[str, Path], dict]:
     """Run ONE iteration cycle. Returns (ranked DataFrame, pdb_map, cycle_telemetry).
 
@@ -4153,6 +4873,108 @@ def run_cycle(
         telem["throat_bias_n_positions"] = 0
         telem["throat_bias_max_penalty"] = 0.0
 
+    # ---- 0a-ter. Adaptive-bias per-position surface delta (opt-in) ----
+    # Carried (already gain-controlled / held) from the previous cycle's adaptive
+    # controller. Added in the SAME additive slot as the throat delta. None unless
+    # --adaptive_bias is set, so the default path is byte-identical.
+    if (adaptive_bias_delta is not None
+            and adaptive_bias_delta.shape == bias_k.shape):
+        bias_k = bias_k + adaptive_bias_delta.astype(bias_k.dtype)
+        n_ab_pos = int((np.abs(adaptive_bias_delta) > 1e-6).any(axis=1).sum())
+        telem["adaptive_bias_n_positions"] = n_ab_pos
+        telem["adaptive_bias_max_penalty"] = float(adaptive_bias_delta.min())
+        LOGGER.info(
+            "cycle %d: applied ADAPTIVE surface bias at %d positions (max %.2f nats)",
+            cycle_cfg.cycle_idx, n_ab_pos, float(adaptive_bias_delta.min()),
+        )
+
+    # ---- Feature #29: resolve the composition POOL FALLBACK source -----------
+    # When --composition_pool_fallback is set AND this cycle's survivor pool is
+    # empty, the WS-C cap / class-balance / soft-bias derive their composition
+    # signal from the previous cycle's full SAMPLED (pre-band-filter) pool instead
+    # of nothing. Returns None (no fallback) when the flag is off, survivors exist,
+    # or there is no previous pool (cycle 0) => the gated blocks below run unchanged
+    # on survivors => byte-identical. The fallback only carries the sampled pool
+    # forward; nothing about it touches the default path.
+    comp_fallback_pool = _resolve_composition_pool(
+        survivors_prev=survivors_prev,
+        fallback_pool=composition_fallback_pool,
+        composition_pool_fallback=composition_pool_fallback,
+    )
+    if comp_fallback_pool is not None:
+        LOGGER.info(
+            "cycle %d: composition_pool_fallback ACTIVE — survivor pool empty, "
+            "deriving cap/class-balance/soft-bias from the previous cycle's full "
+            "SAMPLED pool (n=%d, pre-band-filter)",
+            cycle_cfg.cycle_idx, len(comp_fallback_pool),
+        )
+
+    # ---- 0a-quater. Composition soft-bias per-residue delta (opt-in, WS-C) ----
+    # Activate the expression engine's per-residue SOFT_BIAS tier (long-hydrophobic-
+    # stretch, KR-near-catalytic-on-helix, polyproline, repetitive-segment, …) as an
+    # additive bias_k delta in the SAME slot as the throat/adaptive deltas. The map
+    # is POOL-DERIVED per cycle — the liabilities the *designs* introduce as the pool
+    # drifts (a seed-only map is blind to them, since polyproline/repeat/hydrophobic-
+    # stretch are sequence-determined). The seed map bootstraps cycle 0 (no survivors
+    # yet); with --composition_pool_fallback the previous cycle's SAMPLED pool stands
+    # in for an empty survivor pool. Whole-protein composition hits are excluded (span
+    # filter) — those are handled globally by the suppress-all / fraction-cap levers.
+    # Off unless --composition_soft_bias, so the default path is byte-identical.
+    # Defensively wrapped (mirrors the adaptive controller, commit 42f2f6b): the
+    # pool path adds N per-survivor engine evaluations, and a soft-bias failure must
+    # NEVER abort the design run — degrade to the unbiased path and continue.
+    if composition_soft_bias:
+        try:
+            from protein_chisel.expression.engine import (
+                aggregate_pool_soft_bias, soft_bias_to_bias_array,
+            )
+            from protein_chisel.sampling.plm_fusion import AA_ORDER
+            if survivors_prev is not None and len(survivors_prev) > 0:
+                _soft_pool_seqs = survivors_prev["sequence"].astype(str).tolist()
+                soft_src = "pool"
+            elif comp_fallback_pool is not None:
+                _soft_pool_seqs = comp_fallback_pool["sequence"].astype(str).tolist()
+                soft_src = "sampled_fallback"
+            else:
+                _soft_pool_seqs = None
+            if _soft_pool_seqs is not None:
+                soft_map = aggregate_pool_soft_bias(
+                    expression_engine,
+                    _soft_pool_seqs,
+                    ss_reduced=seed_ss_reduced, sasa=seed_sasa,
+                    position_class=seed_position_class,
+                    catalytic_resnos=fixed_resnos, fixed_resnos=fixed_resnos,
+                    protein_resnos=seed_protein_resnos,
+                    min_support=_SOFT_BIAS_MIN_SUPPORT,
+                    max_span_frac=_SOFT_BIAS_MAX_SPAN_FRAC,
+                )
+            else:
+                soft_map = expression_soft_bias or {}    # seed bootstrap (cycle 0)
+                soft_src = "seed"
+            if soft_map:
+                soft_delta = soft_bias_to_bias_array(
+                    soft_map, bias_k.shape[0],
+                    magnitude=composition_soft_bias_nats, aa_order=AA_ORDER,
+                )
+                bias_k = bias_k + soft_delta.astype(bias_k.dtype)
+                n_sb_pos = int((np.abs(soft_delta) > 1e-6).any(axis=1).sum())
+                n_sb_cells = int((np.abs(soft_delta) > 1e-6).sum())
+                telem["composition_soft_bias_n_positions"] = n_sb_pos
+                telem["composition_soft_bias_n_cells"] = n_sb_cells
+                telem["composition_soft_bias_source"] = soft_src
+                LOGGER.info(
+                    "cycle %d: applied COMPOSITION soft-bias (%s-derived) at %d "
+                    "positions, %d (pos,AA) cells (%.2f nats each)",
+                    cycle_cfg.cycle_idx, soft_src, n_sb_pos, n_sb_cells,
+                    composition_soft_bias_nats,
+                )
+        except Exception:
+            LOGGER.exception(
+                "cycle %d: composition soft-bias failed; continuing WITHOUT it "
+                "(degrade to unbiased — a soft-bias error never aborts the run)",
+                cycle_cfg.cycle_idx,
+            )
+
     np.save(bias_dir / "bias.npy", bias_k)
     with open(bias_dir / "telemetry.json", "w") as fh:
         json.dump(telem, fh, indent=2)
@@ -4164,22 +4986,51 @@ def run_cycle(
     # weight the over-rep AA AND up-weight the under-rep AA. Address
     # cases like "E z=+5, D z=-2": instead of just suppressing E (which
     # only reduces total negative charge), encourage D to take its place.
+    #
+    # Feature #29: when the survivor pool is empty and --composition_pool_fallback
+    # is set, derive both the per-AA fraction cap AND the class-balance bias from
+    # the previous cycle's full SAMPLED pool (``comp_fallback_pool``) instead — the
+    # cap is exactly what bounds the 26%-Ala backfill mode that an empty survivor
+    # pool would otherwise let through. Default (flag off / survivors exist / no
+    # previous pool) keeps the survivor-only path => byte-identical.
     bias_AA_str = ""
-    if survivors_prev is not None and len(survivors_prev) > 0:
+    fraction_cap_omit: dict[str, str] = {}
+    _have_survivors = survivors_prev is not None and len(survivors_prev) > 0
+    _comp_pool_df = survivors_prev if _have_survivors else comp_fallback_pool
+    if _comp_pool_df is not None and len(_comp_pool_df) > 0:
         from protein_chisel.expression.aa_class_balance import (
             compute_class_balanced_bias_AA,
         )
-        # Pool survivors into one mega-sequence: this gives a count-
-        # weighted average composition (each survivor contributes equally
+        # Pool the chosen source into one mega-sequence: this gives a count-
+        # weighted average composition (each member contributes equally
         # since they're the same length L).
-        pool_seq = "".join(survivors_prev["sequence"].astype(str).tolist())
+        pool_seq = "".join(_comp_pool_df["sequence"].astype(str).tolist())
         # exclude_aas matches cycle_cfg.omit_AA (default "X" or "CX") so
         # we don't try to up-weight an AA the sampler can't pick anyway.
-        excl = "".join(c for c in cycle_cfg.omit_AA.upper() if c != "X")
+        excl = _canonical_omit_aas(cycle_cfg.omit_AA)
+        # ---- WS-C per-AA fraction cap (opt-in) -------------------------
+        # Any AA whose fraction in the survivor pool is at/over the cap is
+        # hard-omitted at every NON-FIXED designable position next cycle,
+        # bounding runaway single-AA over-representation (the 26%-Ala mode).
+        # Recomputed each cycle from that cycle's survivors, so an AA is
+        # re-allowed once it falls back under the cap. None → no-op (empty dict).
+        fraction_cap_omit = _build_fraction_cap_omit(
+            pool_seq, aa_fraction_cap,
+            protein_resnos=protein_resnos, fixed_resnos=fixed_resnos,
+            chain=CHAIN, exclude_aas=excl,
+        )
+        if fraction_cap_omit:
+            LOGGER.info(
+                "cycle %d: aa_fraction_cap=%.3f -> omit %s at %d non-fixed "
+                "designable positions (pool fractions over cap)",
+                cycle_cfg.cycle_idx, aa_fraction_cap,
+                next(iter(fraction_cap_omit.values())), len(fraction_cap_omit),
+            )
         balance_telem = compute_class_balanced_bias_AA(
             pool_seq,
-            reference="swissprot_ec3_hydrolases_2026_01",
+            reference=aa_reference,
             exclude_aas=excl,
+            suppress_all_overrep=composition_suppress_all_overrep,
             # Threshold 2.0: only fire swaps when BOTH ends of the
             # class imbalance are clearly extreme (over-rep > +2σ AND
             # under-rep < −2σ). Keeps the bias_AA quiet under moderate
@@ -4193,6 +5044,12 @@ def run_cycle(
             bias_per_z=0.4,
         )
         bias_AA_str = balance_telem.bias_AA_string
+        # Record which pool the cap/class-balance was derived from so the
+        # fallback path is visible in telemetry (survivors vs the Feature #29
+        # sampled fallback). Default path => "survivors".
+        telem["composition_cap_pool_source"] = (
+            "survivors" if _have_survivors else "sampled_fallback"
+        )
         with open(bias_dir / "class_balance_telemetry.json", "w") as fh:
             json.dump(balance_telem.to_dict(), fh, indent=2)
         if bias_AA_str:
@@ -4216,6 +5073,20 @@ def run_cycle(
         else:
             LOGGER.info("cycle %d class-balanced bias_AA: (no swaps triggered)",
                          cycle_cfg.cycle_idx)
+
+    # ---- 0c. Adaptive-bias global per-AA term (opt-in) -------------
+    # Carried (raw, unmerged) from the previous cycle's adaptive controller; merge
+    # it with THIS cycle's fresh class-balance bias (class-balance wins conflicts).
+    # None unless --adaptive_bias, so the default path is byte-identical.
+    # CF-3: capture the CLASS-BALANCE-ONLY bias_AA *before* the controller merge so the
+    # nested-ceiling split below can recover the controller's SURVIVING global
+    # contribution (merged − class_balance), respecting "class-balance wins".
+    _class_balance_bias_AA = bias_AA_str
+    if adaptive_bias_global:
+        from protein_chisel.sampling.adaptive_bias import merge_bias_AA_strings
+        bias_AA_str, _ab_conflicts = merge_bias_AA_strings(bias_AA_str, adaptive_bias_global)
+        LOGGER.info("cycle %d: merged ADAPTIVE global bias_AA -> %s",
+                    cycle_cfg.cycle_idx, bias_AA_str or "(empty)")
 
     # ---- 1. Sample --------------------------------------------------
     sample_dir = cycle_dir / "01_sample"
@@ -4262,8 +5133,127 @@ def run_cycle(
         merged_omit = merge_omit_dicts(merged_omit, m_omit)
         LOGGER.info("cycle %d: pos-1 M omit added (%s)",
                      cycle_cfg.cycle_idx, m_omit)
+    # ---- WS-C fraction cap: layered LAST, then guarded -----------------
+    # Union the cap omit on top of the structural omits (expression/diversity/
+    # pos-1-M), then run the post-merge sampleable guard so no position is left
+    # with too few AAs after the union with the global omit_AA. Empty cap → no-op
+    # → the merged omit (and the whole run) is byte-identical. (See codex review:
+    # the cap-set alone passing its guard is not enough — the union can still
+    # zero out a position.)
+    if fraction_cap_omit:
+        _pre_cap_omit = merged_omit
+        merged_omit = merge_omit_dicts(_pre_cap_omit, fraction_cap_omit)
+        merged_omit = _enforce_min_sampleable_after_cap(
+            merged_omit, _pre_cap_omit, cycle_cfg.omit_AA,
+        )
+    # WS-E: bound the EFFECTIVE (bias_k + global bias_AA) sampling bias to ±N nats.
+    # None => bias_k unchanged (same object) => byte-identical. The bias.npy saved
+    # above is the un-clamped per-position fusion bias (a diagnostic); the clamp
+    # adjusts only what the sampler sees. Parse the FINAL serialized bias_AA so the
+    # 2-decimal rounding LigandMPNN actually applies is reflected exactly.
+    #
+    # CF-3a: --bias_total_clamp_odds X expresses the ceiling in temperature-invariant
+    # ODDS space — the per-cell clamp magnitude becomes nats_for_odds(X, T) = T*ln(X)
+    # at THIS cycle's sampling temperature (threaded via cycle_cfg.sampling_temperature),
+    # then runs through the SAME _clamp_bias_total path. The two clamp flags are
+    # mutually exclusive (validated at parse time), so at most one of these is set;
+    # neither set => bias_for_sampling stays bias_k (same object) => byte-identical.
+    bias_for_sampling = bias_k
+    _clamp_nats = bias_total_clamp
+    if bias_total_clamp_odds is not None:
+        from protein_chisel.sampling.bias_scale import nats_for_odds
+        _clamp_nats = nats_for_odds(bias_total_clamp_odds, cycle_cfg.sampling_temperature)
+    if _clamp_nats is not None:
+        from protein_chisel.sampling.adaptive_bias import AA_TO_IDX, parse_bias_AA
+        _bias_AA_vec = np.zeros(20, dtype=bias_k.dtype)
+        for _aa, _v in parse_bias_AA(bias_AA_str).items():
+            if _aa in AA_TO_IDX:
+                _bias_AA_vec[AA_TO_IDX[_aa]] = _v
+        bias_for_sampling = _clamp_bias_total(bias_k, _clamp_nats, _bias_AA_vec)
+        n_clamped = int((np.abs(bias_for_sampling - bias_k) > 1e-9).sum())
+        if n_clamped:
+            if bias_total_clamp_odds is not None:
+                LOGGER.info("cycle %d: bias_total_clamp_odds=%.2f (=%.3f nats @ T=%.3f) "
+                            "adjusted %d (pos,AA) cells (effective bias_k+bias_AA "
+                            "bounded to %.2fx odds)",
+                            cycle_cfg.cycle_idx, bias_total_clamp_odds, _clamp_nats,
+                            cycle_cfg.sampling_temperature, n_clamped,
+                            bias_total_clamp_odds)
+            else:
+                LOGGER.info("cycle %d: bias_total_clamp=%.2f adjusted %d (pos,AA) cells "
+                            "(effective bias_k+bias_AA bounded)",
+                            cycle_cfg.cycle_idx, _clamp_nats, n_clamped)
+    # ---- CF-3 §(c) nested ceilings (BUG-B): reserve the controller's odds headroom
+    # INSIDE the whole-stack ceiling so BOTH bind. Opt-in via --controller_coordinator
+    # (default OFF => this block is skipped entirely => byte-identical). The controller
+    # bucket = the adaptive surface delta + the controller's SURVIVING global term
+    # (merged − class-balance, so "class-balance wins" is respected); the rest = the
+    # PLM+consensus+throat stack. cell_total = clip(rest, ±(total−reserve)) +
+    # clip(controller, ±reserve), all in nats at THIS cycle's T (the application T).
+    if controller_coordinator:
+        from protein_chisel.sampling.bias_scale import nats_for_odds as _nfo
+        from protein_chisel.sampling.adaptive_bias import (
+            AA_TO_IDX as _AAI, parse_bias_AA as _pba)
+        from protein_chisel.sampling.coordinator import (
+            nested_total_clip as _nested, TOTAL_CEILING as _TOTAL_CEIL)
+        _T = cycle_cfg.sampling_temperature
+        if _T is not None and _T > 0:
+            _total_nats = _nfo(_TOTAL_CEIL, _T)
+            _reserve_nats = _nfo(controller_ceiling, _T)
+            # controller's surviving global = merged bias_AA − class-balance-only.
+            _merged_vec = np.zeros(20, dtype=bias_k.dtype)
+            for _aa, _v in _pba(bias_AA_str).items():
+                if _aa in _AAI:
+                    _merged_vec[_AAI[_aa]] = _v
+            _cb_vec = np.zeros(20, dtype=bias_k.dtype)
+            for _aa, _v in _pba(_class_balance_bias_AA).items():
+                if _aa in _AAI:
+                    _cb_vec[_AAI[_aa]] = _v
+            _ctrl_global_vec = (_merged_vec - _cb_vec)[None, :]
+            _ctrl_delta = (adaptive_bias_delta.astype(bias_k.dtype)
+                           if (adaptive_bias_delta is not None
+                               and adaptive_bias_delta.shape == bias_k.shape)
+                           else np.zeros_like(bias_k))
+            # The controller bucket is the coordinator's BUDGET-tier output, already
+            # bounded to ±reserve per cell by coordinate() (the global D/E/K/R and the
+            # surface hydrophobic actuators are DISJOINT in AA space, so they never sum
+            # past reserve at any one (pos,AA)). Clip to ±reserve as a belt-and-suspenders
+            # carve-out — NOT a heuristic "excess == veto" split: a budget term must never
+            # be reclassified as veto and allowed to bypass the total ceiling (codex). A
+            # true controller VETO-tier axis (none exist today — veto = omit masks / the
+            # clash floor, applied OUTSIDE the controller) would need its own separate
+            # threading here; the pure coordinate() still preserves veto bypass for direct
+            # callers (test_veto_tier_bypasses_budget).
+            _controller_bucket = np.clip(_ctrl_delta + _ctrl_global_vec,
+                                         -_reserve_nats, _reserve_nats)
+            # VETO bypass for the graded-clash term: it is a ban (clash/omit/fraction-cap
+            # tier) and "bypasses the budget entirely (never diluted)". It rides in bias_k
+            # (folded into base_bias), so subtract it from the stack BEFORE the nested clip
+            # and add it back un-clipped afterward, so the whole-stack ceiling never
+            # weakens a clash discouragement. None (not threaded) => zero => unchanged.
+            _veto_bias = (clash_bias.astype(bias_k.dtype)
+                          if (clash_bias is not None
+                              and clash_bias.shape == bias_k.shape)
+                          else np.zeros_like(bias_k))
+            _eff_total = bias_for_sampling + _merged_vec[None, :]
+            # rest = the BUDGETED whole-stack remainder = effective total − the reserved
+            # controller − the clash veto bypass (so the nested clip bounds only what
+            # should be bounded; the controller gets ±reserve; the clash veto untouched).
+            _rest = _eff_total - _controller_bucket - _veto_bias
+            _nested_total = (_nested(_rest, _controller_bucket,
+                                     total_nats=_total_nats, reserve_nats=_reserve_nats)
+                             + _veto_bias)
+            _new_bias = (_nested_total - _merged_vec[None, :]).astype(bias_k.dtype)
+            _n_nested = int((np.abs(_new_bias - bias_for_sampling) > 1e-9).sum())
+            bias_for_sampling = _new_bias
+            if _n_nested:
+                LOGGER.info("cycle %d: controller_coordinator nested ceilings "
+                            "(total %.0fx=%.3f nats, controller reserve %.0fx=%.3f nats "
+                            "@ T=%.3f) adjusted %d (pos,AA) cells",
+                            cycle_cfg.cycle_idx, _TOTAL_CEIL, _total_nats,
+                            controller_ceiling, _reserve_nats, _T, _n_nested)
     cand_tsv = stage_sample(
-        cycle_cfg=cycle_cfg, seed_pdb=seed_pdb, bias=bias_k,
+        cycle_cfg=cycle_cfg, seed_pdb=seed_pdb, bias=bias_for_sampling,
         protein_resnos=protein_resnos, fixed_resnos=fixed_resnos,
         out_dir=sample_dir,
         omit_AA_per_residue=merged_omit,
@@ -4317,6 +5307,7 @@ def run_cycle(
         clash_filter=cycle_cfg.clash_filter,
         clash_severe_distance=cycle_cfg.clash_severe_distance,
         seed_dfi_metrics=seed_dfi_metrics,
+        sap_corrected=sap_corrected,
     )
 
     n_struct = len(pd.read_csv(survivors_struct, sep="\t"))
@@ -4529,6 +5520,30 @@ def main() -> None:
                         "no canonical AAs are silently forbidden. Pass 'CX' "
                         "to also exclude cysteine (recommended for scaffolds "
                         "with no catalytic Cys); add others as needed.")
+    p.add_argument("--catalytic_resnos", type=_parse_catalytic_resnos_arg,
+                   default=None, metavar="R1,R2,...",
+                   help="Comma-separated 1-indexed catalytic resnos (chain A) to "
+                        "fix/protect, e.g. '41,64,187'. Default None. Resolution "
+                        "priority: this flag > the seed PDB's REMARK 666 motif "
+                        "block > the hard-coded PTE_i1 builtin "
+                        "(60,64,128,131,132,157). Set this for ANY non-PTE "
+                        "scaffold whose seed lacks REMARK 666 — otherwise the run "
+                        "falls back to the PTE positions (with a loud warning) "
+                        "and pins the wrong residues.")
+    p.add_argument("--chain", type=str, default="A", metavar="CHAIN_ID",
+                   help="Single-character chain id of the catalytic/design chain "
+                        "in the seed PDB. Default 'A' (byte-identical). Set this "
+                        "for any scaffold whose design chain is not 'A' (e.g. "
+                        "'--chain B'). All structural reads (H-bond/clash/preorg/"
+                        "interaction detection, sequence extraction, secondary "
+                        "structure, tunnel lining) use this chain.")
+    p.add_argument("--no_require_cat_his_hbond", action="store_true",
+                   help="Disable ONLY the structural filter criterion that "
+                        "requires >=1 side-chain H-bond to a catalytic HIS. "
+                        "Default OFF => the requirement stays ON (byte-identical). "
+                        "Set this for an enzyme whose mechanism has NO catalytic "
+                        "His — otherwise that criterion rejects every design. "
+                        "Other struct-filter criteria (SAP, clash) are unaffected.")
     p.add_argument("--expression_profile", type=str,
                    default="bl21_cytosolic_streptag",
                    choices=["bl21_cytosolic_streptag", "k12_cytosolic",
@@ -4548,6 +5563,17 @@ def main() -> None:
                         "sample time by auto-detected per-residue omits "
                         "for clash-prone positions. 1 = MPNN sees catalytic "
                         "sidechain rotamers (more WT-conservative).")
+    p.add_argument("--use_side_chain_context_schedule", type=_scc_schedule_arg,
+                   default=None, metavar="CSV01",
+                   help="Opt-in per-cycle side-chain-context schedule: a comma-"
+                        "separated list of 0/1, e.g. '1,1,0' = ON for cycles 0-1 "
+                        "(clash avoidance — materially helps avoid clashes early), "
+                        "OFF for cycle 2 (first-shell diversity late). Overrides "
+                        "the uniform --use_side_chain_context per cycle. Broadcast/"
+                        "truncate to the run's cycle count: a short schedule repeats "
+                        "its LAST entry for later cycles; a long one is truncated. "
+                        "Absent (default) => the uniform value is used unchanged "
+                        "(byte-identical).")
     p.add_argument("--enhance", type=str, default=None,
                    choices=[None, *AVAILABLE_ENHANCE_CHECKPOINTS],
                    help="Optional pLDDT-enhanced fused_mpnn checkpoint name. "
@@ -4556,12 +5582,13 @@ def main() -> None:
                         + ", ".join(AVAILABLE_ENHANCE_CHECKPOINTS))
     p.add_argument("--pi_min", type=float, default=5.0,
                    help="Minimum theoretical pI. Default 5.0 selects the "
-                        "least-acidic ~1%% of cycle-0 designs at "
-                        "--net_charge_max<-10. Low cycle-0 pass rate is "
-                        "fine: consensus-bias iteration in cycle 1+ pulls "
-                        "subsequent cycles toward less-acidic sequences. "
-                        "Relax to 4.7 for higher cycle-0 pass at the cost "
-                        "of weaker selection pressure.")
+                        "least-acidic ~1%% of cycle-0 designs under the "
+                        "net-charge band (see --net_charge_min/--net_charge_max; "
+                        "constant across cycles). Low cycle-0 pass rate is fine: "
+                        "consensus-bias iteration in cycle 1+ pulls subsequent "
+                        "cycles toward less-acidic sequences. Relax to 4.7 for "
+                        "higher cycle-0 pass at the cost of weaker selection "
+                        "pressure.")
     p.add_argument("--pi_max", type=float, default=7.5)
     p.add_argument("--fpocket_druggability_min", type=float, default=0.30,
                    help="Drop designs with fpocket-druggability below this "
@@ -4577,6 +5604,96 @@ def main() -> None:
                         "tool-failed fpocket rows are only used as a last "
                         "resort after real near-misses. Set false for strict "
                         "pass-only final outputs.")
+    p.add_argument("--ship_solubility_veto", action="store_true",
+                   help="Opt-in hard solubility veto (default OFF → byte-identical). "
+                        "When set, the final top-K writer drops any design OUTSIDE "
+                        "the final-cycle GRAVY + net-charge band before shipping, so "
+                        "the deferred-rescue / backfill path can never ship a "
+                        "seq-filter-failing design (e.g. GRAVY=1.05) as rank-0. May "
+                        "ship fewer than target_k (intended). Adds a truthful "
+                        "selection__solubility_passed column (distinct from "
+                        "selection__hard_final_filter_passed = fpocket druggability).")
+    p.add_argument("--sap_corrected", action="store_true",
+                   help="Opt-in (default OFF → byte-identical). Additionally emit "
+                        "sap_corr_{max,mean,p95} columns on per-cycle designs: a "
+                        "centered, polar-cancellation-free SAP (shared scoring.sap "
+                        "module) that — unlike the legacy signed-KD sap_* — registers "
+                        "alanine-rich hydrophobic surfaces and isn't cancelled by "
+                        "exposed polar residues. Legacy sap_* are unchanged. (Rescued "
+                        "backfill rows carry NaN sap_corr_* — they are not re-scored "
+                        "for it.)")
+    # ---- AA-composition baseline reference (opt-in; default == legacy) -----------
+    p.add_argument("--aa_reference", type=_aa_reference_arg,
+                   default="swissprot_ec3_hydrolases_2026_01",
+                   metavar="NAME",
+                   help="AA-composition baseline distribution that the over-"
+                        "representation checks score against — the per-cycle "
+                        "class-balanced bias_AA and the adaptive-bias hydrophobic "
+                        "over-rep mask. Default 'swissprot_ec3_hydrolases_2026_01' "
+                        "(EC-3 hydrolases) is unchanged, so an un-passed flag is "
+                        "BYTE-IDENTICAL. Select the design's own EC class for a "
+                        "non-hydrolase enzyme (e.g. 'swissprot_ec2_transferases_"
+                        "2026_01', 'swissprot_enzyme_2026_01') so compositions are "
+                        "compared to the right distribution. Validated at parse "
+                        "time against the bundled REFERENCE_DISTRIBUTIONS keys "
+                        "(unknown -> error listing the valid keys).")
+    # ---- WS-C composition control (opt-in, default OFF/None → byte-identical) ----
+    p.add_argument("--composition_suppress_all_overrep", action="store_true",
+                   help="Opt-in (default OFF → byte-identical). In the per-cycle "
+                        "class-balanced bias_AA, down-weight EVERY over-represented "
+                        "member of an AA class (z > --balance_z_threshold), not just "
+                        "the single class maximum. Without it, when Alanine is the "
+                        "hydrophobic-class max an also-over-represented Leucine "
+                        "escapes correction. The property-conserving within-class "
+                        "swap up-weight is preserved.")
+    p.add_argument("--aa_fraction_cap", type=_fraction_arg, default=None,
+                   metavar="FRAC",
+                   help="Opt-in (default None → byte-identical). Finite fraction in "
+                        "(0, 1]. Hard-omit any amino acid whose fraction in a cycle's "
+                        "survivor pool is >= FRAC (e.g. 0.15) at every non-fixed "
+                        "designable position the next cycle, bounding runaway "
+                        "single-AA over-representation (the 26%%-Ala failure mode). "
+                        "Recomputed per cycle, so an AA is re-allowed once it falls "
+                        "back under the cap. A cap so low it would omit nearly every "
+                        "AA for a low-diversity pool is skipped that cycle with an "
+                        "ERROR (never over-constrains the sampler).")
+    p.add_argument("--composition_soft_bias", action="store_true",
+                   help="Opt-in (default OFF → byte-identical). Activate the "
+                        "expression engine's per-residue SOFT_BIAS tier "
+                        "(long-hydrophobic-stretch, KR-near-catalytic-on-helix, "
+                        "polyproline, repetitive-segment, …): add a negative "
+                        "per-(position,AA) bias at those sites to every cycle's "
+                        "sampler bias. POOL-DERIVED per cycle (the engine is "
+                        "re-evaluated on the survivors and a liability is applied "
+                        "only if it recurs in >= half of them), so it tracks the "
+                        "liabilities the designs introduce; the seed map bootstraps "
+                        "cycle 0. Whole-protein composition hits are excluded (those "
+                        "are the suppress-all / fraction-cap levers' job).")
+    p.add_argument("--composition_soft_bias_nats",
+                   type=lambda s: _nonneg_finite_arg(s, max_value=_SOFT_BIAS_NATS_MAX),
+                   default=0.5,
+                   help="Down-weight magnitude (nats, finite in [0, "
+                        "%g]) applied at each SOFT_BIAS (position, AA) cell when "
+                        "--composition_soft_bias is set. Default 0.5. NOTE the bias "
+                        "is added in LOGIT space (before the softmax temperature "
+                        "divide), so the effective odds penalty is "
+                        "exp(nats / sampling_temperature) — at T≈0.15-0.20 a 0.5-nat "
+                        "bias is ~12-28x (a firm nudge), whereas 1.5 would be "
+                        "~1800-22000x (a near-hard ban). Keep this near the adaptive "
+                        "controller's ~0.6 clamp. No effect unless "
+                        "--composition_soft_bias." % _SOFT_BIAS_NATS_MAX)
+    p.add_argument("--composition_pool_fallback", action="store_true",
+                   help="Opt-in (default OFF → byte-identical). The WS-C "
+                        "composition cap / class-balance / soft-bias normally read "
+                        "the previous cycle's SURVIVOR pool, so on a hydrophobic seed "
+                        "where ~100%% of samples fail the GRAVY band (empty survivor "
+                        "pool) they never fire and the run ships a runaway single-AA "
+                        "composition (the 26%%-Ala backfill mode). With this flag, "
+                        "when a cycle's survivor pool is empty the cap/class-balance/"
+                        "soft-bias are built from the PREVIOUS cycle's full SAMPLED "
+                        "(pre-band-filter) pool instead — the same source the adaptive "
+                        "controller reads — so the levers still engage. No-op at cycle "
+                        "0 (no previous pool) and whenever survivors exist.")
     p.add_argument("--copy-input-structure-into-out-dir",
                    "--copy_input_structure_into_out_dir",
                    dest="copy_input_structure_into_out_dir",
@@ -4635,6 +5752,180 @@ def main() -> None:
                         "throat bias at the start of each cycle. 0.5 = halve "
                         "the previous bias before adding new observations. "
                         "Lower values release pressure faster.")
+    # ---- Adaptive solubility bias controller (opt-in, default OFF) ----
+    p.add_argument("--adaptive_bias", action="store_true", default=False,
+                   help="OPT-IN closed-loop controller: after each cycle, measure "
+                        "the candidate pool's net charge and surface hydrophobicity "
+                        "and steer the next cycle's MPNN biases toward target "
+                        "solubility (global D/E up-weight; per-position hydrophobic "
+                        "down-weight at solvent-exposed surface positions). Fires "
+                        "only when the pool is statistically out of target, holds the "
+                        "bias once in-band, and reverses if it overshoots. Default "
+                        "OFF => byte-identical to the legacy pipeline.")
+    p.add_argument("--adaptive_bias_gain", type=float, default=0.6,
+                   help="Initial integral gain (unitless band-normalized error).")
+    p.add_argument("--adaptive_bias_max_nats", type=float, default=0.6,
+                   help="Clamp on the per-AA / per-cell bias magnitude (nats).")
+    p.add_argument("--adaptive_bias_max_odds", type=float, default=None, metavar="X",
+                   help="CF-1 opt-in: clamp the controller |bias| in ODDS space at X-fold "
+                        "(temperature-invariant: max_nats := T*ln(X) each cycle) instead "
+                        "of the raw --adaptive_bias_max_nats. None (default) keeps the raw "
+                        "nats clamp => byte-identical. Typical 2 (nudge) to 8 (strong); "
+                        "MPNN odds shift is exp(bias/T) so a fixed nats clamp silently "
+                        "amplifies as T anneals — this makes the controller's authority "
+                        "invariant to the temperature schedule.")
+    p.add_argument("--adaptive_bias_carry", type=float, default=0.9,
+                   help="Integral leak during active correction (1=pure integral). "
+                        "When the pool is in-band the bias is held exactly.")
+    p.add_argument("--adaptive_bias_deadband", type=float, default=0.25,
+                   help="Deadband as a fraction of the band half-width: the "
+                        "controller aims for target but tolerates deviations within "
+                        "this fraction (avoids chasing noise).")
+    p.add_argument("--adaptive_bias_tmin", type=float, default=2.5,
+                   help="|t|-stat threshold (pool mean vs target) for the gate.")
+    p.add_argument("--adaptive_bias_fmin", type=float, default=0.15,
+                   help="Fail-fraction threshold for the gate.")
+    p.add_argument("--adaptive_bias_min_n", type=int, default=30,
+                   help="Minimum pool size to act on an axis.")
+    p.add_argument("--adaptive_bias_mode", choices=["proportional", "bangbang"],
+                   default="proportional",
+                   help="Control law: proportional (integral) or bang-bang "
+                        "(provably non-divergent; only the sign of the plant "
+                        "response matters).")
+    p.add_argument("--adaptive_bias_seed_from_input", action="store_true",
+                   default=False,
+                   help="Warm-start cycle 0 from the INPUT scaffold's hydrophobicity/"
+                        "charge instead of waiting for cycle 0's output.")
+    # ---- WS-D controller expansion (opt-in; defaults reproduce today's controller) ----
+    p.add_argument("--adaptive_surface_sasa_gate", type=_fraction_arg, default=None,
+                   metavar="FRAC",
+                   help="Opt-in (default None => legacy distal_surface scope, "
+                        "byte-identical). When set (e.g. 0.20), the controller's "
+                        "surface hydrophobic down-weight acts on the "
+                        "non_tunnel_surface set: every exposed (sidechain-SASA "
+                        "fraction >= FRAC) NON-active-site, non-tunnel-lining, "
+                        "non-fixed position — a superset of distal_surface (adds "
+                        "exposed nearby_surface, drops the ligand-distance gate) "
+                        "minus the tunnel mouth. Steers 'what you can see by eye'.")
+    p.add_argument("--adaptive_charge_band", type=str, default=None, metavar="LO,HI",
+                   help="Opt-in (default None => the cycle's net-charge filter band). "
+                        "Override the controller's net-charge target band, e.g. "
+                        "'-15,-5'. The target becomes the band midpoint and the "
+                        "fail-fraction is evaluated on raw net charge (the cycle-band "
+                        "gap columns no longer apply). Steers net charge to your band "
+                        "without changing the seq filter.")
+    p.add_argument("--adaptive_bias_axes", type=str, default=None, metavar="LIST",
+                   help="Opt-in comma list of controller axes to run (default "
+                        "'charge,surface_hydrophobicity'). Restrict (e.g. 'charge') "
+                        "or, as future registry entries land, extend. An unknown "
+                        "axis name is rejected.")
+    p.add_argument("--controller_damping", action="store_true", default=True,
+                   dest="controller_damping",
+                   help="Control-law DAMPING (ON by default as of 1.2.0; validated to "
+                        "stabilize charge regulation — held charge at target across mid "
+                        "+ hard seeds vs the legacy law's −6.8→−8.8→−1.3 limit-cycle. "
+                        "Pass --no_controller_damping to revert). The base law under-"
+                        "corrects against a drifting/lagging plant, relaxes its "
+                        "integral the moment the pool is momentarily in-band, then "
+                        "ramps hard when the pool drifts back. This bundle adds four "
+                        "stabilizers in one switch: act on an EWMA of the pool mean "
+                        "(measurement_ewma_alpha=0.5, filters per-cycle noise), a "
+                        "derivative-on-measurement term (derivative_gain=0.5*gain, "
+                        "anticipates drift before the hard ramp), a per-cycle slew "
+                        "limit (slew_limit_frac=0.15 of max_nats, no full-range "
+                        "lurch), and a soft 'ramp' deadband (continuous drive through "
+                        "target, kills the stick-slip of the hard band). No effect "
+                        "without --adaptive_bias.")
+    p.add_argument("--no_controller_damping", action="store_false",
+                   dest="controller_damping",
+                   help="Disable the default control-law damping (revert to the legacy "
+                        "under-damped integral law). No effect without --adaptive_bias.")
+    p.add_argument("--controller_verbose", action="store_true", default=False,
+                   help="CF-5 opt-in observability (default OFF => byte-identical). "
+                        "With --adaptive_bias, after each cycle append one row per "
+                        "axis to <run_dir>/controller_trace.tsv (long format: cycle, "
+                        "axis, scope, measured vs target/band, signed_error, gate + "
+                        "why, drive_u, effective_odds=exp(u/T), n) and emit a per-cycle "
+                        "CONTROLLER REPORT to the log, for step-by-step chronological "
+                        "validation. Advisory only — a trace write error never stops "
+                        "the run. No effect without --adaptive_bias.")
+    p.add_argument("--controller_coordinator", action="store_true", default=False,
+                   help="CF-2/CF-3 opt-in multi-objective controller COORDINATOR "
+                        "(default OFF => byte-identical). With --adaptive_bias, route "
+                        "the controller's GLOBAL per-AA bias AND the (L,20) surface "
+                        "delta through a weight-partitioned, work-conserving, signed-"
+                        "sum-bounded JOINT odds budget instead of the legacy sum-then-"
+                        "rescale. Axes that share an ACTUATOR (e.g. charge and pI both "
+                        "drive D/E/K/R) collapse by sign-selected MAX (same-sign, anti-"
+                        "double-count) or signed SUM (opposite-sign) — never a second "
+                        "lock. The controller share is bounded to "
+                        "--controller_ceiling odds and nested INSIDE a ~1e3x whole-"
+                        "stack ceiling at the sampler (both bind, reserved headroom), "
+                        "all at the application-cycle T. Enables the pI axis to share "
+                        "the charge actuator. No effect without --adaptive_bias.")
+    p.add_argument("--controller_ceiling", type=float, default=8.0, metavar="X",
+                   help="Joint CONTROLLER odds ceiling for --controller_coordinator "
+                        "(default 8 = ODDS_STRONG; moves a pool meaningfully without "
+                        "locking it). Must be > 1.0. No effect without "
+                        "--controller_coordinator.")
+    # ---- WS-E sampling-core safety (opt-in; defaults => byte-identical) ----
+    p.add_argument("--bias_total_clamp", type=_nonneg_finite_arg, default=None,
+                   metavar="NATS",
+                   help="Bound the EFFECTIVE per-(position,AA) sampling bias "
+                        "(bias_per_residue + global bias_AA) to ±NATS. As of v1.4.0 this "
+                        "is ON BY DEFAULT at 3.0 nats (a safety cap on the otherwise-"
+                        "uncapped consensus(+2.0)+PLM-peak stack, which at T≈0.15 locks a "
+                        "cell ~10^13x; 3 nats preserves a legit ~3-nat single-source PLM "
+                        "peak while capping the 6-20-nat double-count lock). Pass an "
+                        "explicit value to override the 3-nat default, or "
+                        "--no_bias_total_clamp to disable entirely (the pre-1.4.0 path). "
+                        "An overflow/stacking guard, not a gentle regularizer.")
+    p.add_argument("--no_bias_total_clamp", action="store_true", default=False,
+                   help="Opt OUT of the default 3-nat bias-sum safety cap (restores the "
+                        "exact pre-1.4.0 unclamped sampling bias). Mirrors the "
+                        "--no_controller_damping idiom. Mutually exclusive with an "
+                        "explicit --bias_total_clamp / --bias_total_clamp_odds.")
+    p.add_argument("--bias_total_clamp_odds", type=float, default=None, metavar="X",
+                   help="CF-3a opt-in (default None => byte-identical). Like "
+                        "--bias_total_clamp but the ceiling is expressed in ODDS space "
+                        "at X-fold: the per-(pos,AA) clamp magnitude becomes "
+                        "nats_for_odds(X, T) = T*ln(X) EACH cycle, so 'no cell's total "
+                        "bias exceeds X-fold odds' holds invariant to the temperature "
+                        "schedule (MPNN samples softmax((logits+bias)/T) so a fixed-nats "
+                        "clamp silently tracks T as it anneals). Mutually exclusive with "
+                        "--bias_total_clamp. Must be > 1.0 (an odds ceiling <=1 is a "
+                        "non-positive clamp). Suggested ~8-100 (a stacking guard).")
+    p.add_argument("--sampling_temperature_floor",
+                   type=lambda s: _nonneg_finite_arg(s, max_value=2.0), default=None,
+                   metavar="T",
+                   help="Opt-in (default None => byte-identical). Raise any cycle's "
+                        "sampling temperature to at least T (overriding the annealing "
+                        "schedule). At T≈0.15 a 0.5-nat bias is ~28x (near-"
+                        "deterministic); ~0.3 restores genuine multinomial diversity. "
+                        "No effect under the PoE backend.")
+    p.add_argument("--plm_class_strength", type=str, default="", metavar="K=V,...",
+                   help="Opt-in (default '' => byte-identical). ABSOLUTE per-class "
+                        "overrides of the PLM-fusion class weights, e.g. "
+                        "'distal_surface=0.3,primary_sphere=0.0'. The global "
+                        "--plm_strength still multiplies on top. Unknown class names "
+                        "and non-finite/negative values are rejected.")
+    # ---- WS-G omit tunnel-lining (opt-in/experimental; default OFF => byte-identical) ----
+    p.add_argument("--omit_tunnel_lining", action="store_true", default=False,
+                   help="Opt-in/experimental (default OFF => byte-identical). Hard-omit "
+                        "bulky AAs (--omit_tunnel_lining_aas) at the seed's tunnel-lining "
+                        "positions (is_tunnel_lining) to keep the substrate channel open "
+                        "from cycle 0. Complementary to the (soft, reactive) throat-"
+                        "feedback bias; a permanent hard ban is blunter, so this is off "
+                        "by default. Catalytic/fixed positions are never omitted.")
+    p.add_argument("--omit_tunnel_lining_aas", type=str,
+                   default=_OMIT_TUNNEL_LINING_DEFAULT, metavar="AAS",
+                   help="AAs to hard-omit at tunnel-lining positions when "
+                        "--omit_tunnel_lining is set. Default %(default)s = the throat's "
+                        "bulky-blocker set (tunnel_metrics._BLOCKER_WEIGHT >= 0.70): "
+                        "aromatics W/F/Y/H plus the long charged R/K (Lys Cb->NZ ~5.5 A, "
+                        "Arg ~6 A — genuine channel constrictors, same as the throat-"
+                        "feedback bias). The medium hydrophobics I/L/M/V are left to that "
+                        "controller's capped/decaying pressure; Ala can't constrict.")
     p.add_argument("--protonate_final", action="store_true", default=True,
                    help="After stage_diverse_topk, hydrate every top-K PDB "
                         "via PyRosetta and write a downstream-clean "
@@ -4799,24 +6090,48 @@ def main() -> None:
                         "sequence Hamming. Default 0 (disabled). Set "
                         "≥ 2 to enforce active-site diversity even "
                         "between designs that differ globally.")
+    p.add_argument("--net_charge_min", type=float, default=-18.0,
+                   help="Acceptance band: drop designs with net_charge_full_HH "
+                        "<= this (too acidic). Default -18.0. This is the FINAL "
+                        "(strictest) band; it stays CONSTANT across cycles in "
+                        "both strategies (charge does not anneal).")
+    p.add_argument("--net_charge_max", type=float, default=-4.0,
+                   help="Acceptance band: drop designs with net_charge_full_HH "
+                        ">= this (not acidic enough). Default -4.0. FINAL band; "
+                        "constant across cycles.")
+    p.add_argument("--sap_max_threshold", type=float, default=100.0,
+                   help="Acceptance band: drop designs with SAP (freesasa-proxy "
+                        "scale) above this. Default 100.0 (effectively OFF for "
+                        "PTE_i1). FINAL band; constant across cycles.")
     p.add_argument("--instability_max", type=float, default=60.0,
                    help="Light filter on Guruprasad 1990 instability index. "
                         "Lit threshold for native E. coli expression is 40, "
                         "but de novo designs run higher; default 60 catches "
-                        "truly broken sequences only. Set 9999 to disable.")
+                        "truly broken sequences only. Set 9999 to disable. "
+                        "This sets the FINAL (strictest) band; under "
+                        "--strategy annealing the earlier cycles relax from it "
+                        "by the fixed legacy offsets (c1=+10, c0=+20).")
     p.add_argument("--gravy_min", type=float, default=-0.8,
                    help="Light filter on Kyte-Doolittle GRAVY. Typical "
                         "soluble proteins fall in [-0.4, 0]; default [-0.8, "
-                        "0.3] is generous.")
-    p.add_argument("--gravy_max", type=float, default=0.3)
+                        "0.3] is generous. FINAL band; annealing relaxes "
+                        "earlier cycles by the legacy offsets (c1=-0.10, "
+                        "c0=-0.20).")
+    p.add_argument("--gravy_max", type=float, default=0.3,
+                   help="Upper Kyte-Doolittle GRAVY acceptance bound (default "
+                        "0.3). FINAL band; annealing relaxes earlier cycles "
+                        "(c1=+0.05, c0=+0.10).")
     p.add_argument("--aliphatic_min", type=float, default=40.0,
                    help="Light filter on Ikai 1980 aliphatic index. "
                         "Thermostable native: ~85-100. Default lower bound "
-                        "40 catches only extremely low-aliphatic outliers.")
+                        "40 catches only extremely low-aliphatic outliers. "
+                        "FINAL band; annealing relaxes earlier cycles "
+                        "(c1=-5, c0=-10).")
     p.add_argument("--boman_max", type=float, default=4.5,
                    help="Light filter on Boman index (PPI/sticky propensity). "
                         "Boman 2003 threshold ~2.5; default 4.5 catches only "
-                        "extreme cases.")
+                        "extreme cases. FINAL band; annealing relaxes earlier "
+                        "cycles (c1=+0.5, c0=+1.0).")
     p.add_argument("--n_term_pad", type=str, default="MSG",
                    help="N-terminal sequence pad added to the design body "
                         "BEFORE computing sequence-only metrics (charge, "
@@ -4858,7 +6173,53 @@ def main() -> None:
                         "1.5+ for maximum PLM influence (diminishing "
                         "returns; charge SD inflates). Must be ≥ 0; 0.0 "
                         "disables PLM bias entirely.")
+    # ---- Seed triage: opt-in PLM auto-skip on a pathological input (default OFF) ----
+    p.add_argument("--plm_autoskip_bad_input", action="store_true", default=False,
+                   help="Opt-in (default OFF => byte-identical). If the INPUT scaffold is "
+                        "pathologically hydrophobic / over-represented (per the "
+                        "--plm_autoskip_* thresholds), force --plm_strength to 0 for the "
+                        "run, so LigandMPNN regenerates from structure + fixed residues "
+                        "instead of the PLM bias amplifying the bad seed. Empirically on a "
+                        "GRAVY=1.34 seed this took GRAVY->-0.5 and Ala 27%%->0.5%%.")
+    p.add_argument("--plm_autoskip_gravy", type=float, default=0.4, metavar="G",
+                   help="Seed-triage GRAVY ceiling (default 0.4; trips above it).")
+    p.add_argument("--plm_autoskip_max_aa_frac", type=float, default=0.16, metavar="F",
+                   help="Seed-triage single-AA fraction ceiling (default 0.16).")
+    p.add_argument("--plm_autoskip_hydrophobic_frac", type=float, default=0.50, metavar="F",
+                   help="Seed-triage hydrophobic-fraction ceiling (default 0.50).")
+    # ---- F1: opt-in distribution-aware z-score over-representation gate -----------
+    p.add_argument("--plm_autoskip_aa_zmax", type=float, default=None, metavar="Z",
+                   help="Opt-in (default None => z-gate OFF => byte-identical). Add a "
+                        "distribution-aware single-AA over-representation signal to the "
+                        "seed triage: an AA trips iff its one-sided z (vs --aa_reference's "
+                        "per-sequence mean+SD) >= Z AND its log2 enrichment >= "
+                        "--plm_autoskip_aa_log2_floor. REDUNDANT with (ORed to) the flat "
+                        "--plm_autoskip_max_aa_frac so naturally-abundant (Leu/Ala) and "
+                        "rare (Trp/Cys) AAs are judged fairly. The z is a population "
+                        "DISTANCE not a significance test; pass the design's own EC class "
+                        "via --aa_reference (the EC-3 default is wrong for non-hydrolases). "
+                        "Only active with --plm_autoskip_bad_input.")
+    p.add_argument("--plm_autoskip_aa_log2_floor", type=float, default=0.25, metavar="L",
+                   help="Fold-change floor for the z-gate (default 0.25): an AA must ALSO "
+                        "have log2(design%%/ref-global%%) >= L to trip, so a naturally-rare "
+                        "AA at high z but a trivial %% does not falsely trip. Matches the "
+                        "existing aa_quality_check |log2|>0.25 precedent.")
+    # ---- F2: opt-in soft/graded plm_strength reduction (CLIFF stays default) ------
+    p.add_argument("--plm_autoskip_soft", action="store_true", default=False,
+                   help="Opt-in (default OFF => the CLIFF: a pathological seed forces "
+                        "--plm_strength to 0). When set, REDUCE plm_strength gradually "
+                        "instead: full strength at the trip threshold (severity 1) decaying "
+                        "linearly to 0 at --plm_autoskip_soft_zero. NOTE: soft does NOT "
+                        "rescue a pathological seed (at T~0.15 even strength 0.4 is ~602x "
+                        "odds >> the 8x controller), so the cliff is the validated default; "
+                        "soft is for cluster A/B comparison.")
+    p.add_argument("--plm_autoskip_soft_zero", type=float, default=2.0, metavar="S",
+                   help="Severity at which the soft curve reaches plm_strength 0 (default "
+                        "2.0 = twice over the trip threshold). Only used with "
+                        "--plm_autoskip_soft; S<=1 degrades to the cliff.")
     args = p.parse_args()
+    if not math.isfinite(args.plm_strength):
+        p.error("--plm_strength must be finite")
     if args.plm_strength < 0:
         p.error("--plm_strength must be >= 0 "
                 "(negative would invert the PLM signal)")
@@ -4868,6 +6229,84 @@ def main() -> None:
             "MPNN's structure-conditioned logits (collapse to PLM "
             "consensus). Typical range 0.5-2.0.", args.plm_strength,
         )
+    # Seed-triage thresholds: GRAVY any finite value; fractions in (0, 1] (codex).
+    if not math.isfinite(args.plm_autoskip_gravy):
+        p.error("--plm_autoskip_gravy must be finite")
+    for _tname, _tval in (("--plm_autoskip_max_aa_frac", args.plm_autoskip_max_aa_frac),
+                          ("--plm_autoskip_hydrophobic_frac", args.plm_autoskip_hydrophobic_frac)):
+        if not (math.isfinite(_tval) and 0.0 < _tval <= 1.0):
+            p.error(f"{_tname} must be a fraction in (0, 1], got {_tval}")
+    # F1 z-gate / F2 soft validation (only meaningful with --plm_autoskip_bad_input, but
+    # validate unconditionally so a typo fails fast). zmax must be a finite POSITIVE
+    # threshold (one-sided over-rep; <=0 is meaningless and would let the z=0 no-signal
+    # sentinel trip — codex); log2_floor finite; soft_zero finite (S<=1 is allowed —
+    # graded_plm_strength degrades it to the cliff).
+    if args.plm_autoskip_aa_zmax is not None and not (
+            math.isfinite(args.plm_autoskip_aa_zmax) and args.plm_autoskip_aa_zmax > 0.0):
+        p.error("--plm_autoskip_aa_zmax must be a finite positive z-threshold "
+                f"(one-sided over-representation), got {args.plm_autoskip_aa_zmax}")
+    if not math.isfinite(args.plm_autoskip_aa_log2_floor):
+        p.error("--plm_autoskip_aa_log2_floor must be finite")
+    if not math.isfinite(args.plm_autoskip_soft_zero):
+        p.error("--plm_autoskip_soft_zero must be finite")
+    if args.adaptive_bias_max_odds is not None and not (
+            math.isfinite(args.adaptive_bias_max_odds) and args.adaptive_bias_max_odds > 1.0):
+        p.error("--adaptive_bias_max_odds must be a finite odds multiplier > 1.0 "
+                f"(T*ln(X) must be positive), got {args.adaptive_bias_max_odds}")
+    # CF-3a: odds-space joint bias-total clamp validation. The odds ceiling must be
+    # > 1.0 (T*ln(X) must be a positive clamp), and it is mutually exclusive with the
+    # raw-nats --bias_total_clamp (clearer than a silent precedence between them).
+    if args.bias_total_clamp_odds is not None and not (
+            math.isfinite(args.bias_total_clamp_odds) and args.bias_total_clamp_odds > 1.0):
+        p.error("--bias_total_clamp_odds must be a finite odds multiplier > 1.0 "
+                f"(T*ln(X) must be positive), got {args.bias_total_clamp_odds}")
+    if args.bias_total_clamp is not None and args.bias_total_clamp_odds is not None:
+        p.error("--bias_total_clamp and --bias_total_clamp_odds are mutually exclusive "
+                "(one bounds the total bias in raw nats, the other in odds space); "
+                "set only one.")
+    # F3 (v1.4.0): --no_bias_total_clamp is the opt-OUT; pairing it with an explicit
+    # clamp value is contradictory (disable vs set). Check on the USER's explicit values
+    # BEFORE injecting the default below.
+    if args.no_bias_total_clamp and (
+            args.bias_total_clamp is not None or args.bias_total_clamp_odds is not None):
+        p.error("--no_bias_total_clamp (opt out of the default 3-nat cap) is mutually "
+                "exclusive with an explicit --bias_total_clamp / --bias_total_clamp_odds; "
+                "pass the value alone to set a custom cap, or --no_bias_total_clamp alone "
+                "to disable it.")
+    # F3: apply the default 3-nat safety cap (deliberate default-path change). Runs AFTER
+    # the mutual-exclusion checks so the injected default never participates in them.
+    args.bias_total_clamp = _resolve_bias_total_clamp_default(
+        bias_total_clamp=args.bias_total_clamp,
+        bias_total_clamp_odds=args.bias_total_clamp_odds,
+        no_clamp=args.no_bias_total_clamp,
+    )
+    # CF-3 coordinator: the joint controller odds ceiling must be a positive clamp
+    # (T*ln(X) > 0 <=> X > 1.0). Validated even when the coordinator is off so a typo
+    # fails fast rather than silently degrading the controller.
+    if not (math.isfinite(args.controller_ceiling) and args.controller_ceiling > 1.0):
+        p.error("--controller_ceiling must be a finite odds multiplier > 1.0 "
+                f"(T*ln(X) must be positive), got {args.controller_ceiling}")
+    # Shared-actuator guard (codex): axes that share an actuator (e.g. 'pi' shares the
+    # charge D/E/K/R actuator with 'charge') DOUBLE-COUNT in the legacy additive sum and
+    # re-create the multiplicative lock. The coordinator's max-not-sum is what makes a
+    # shared actuator safe, so reject the footgun at startup unless it is on. (--help
+    # exits in parse_args before this, so the import stays off the no-PYTHONPATH path.)
+    if args.adaptive_bias_axes and not args.controller_coordinator:
+        _gsel = [a.strip() for a in args.adaptive_bias_axes.split(",") if a.strip()]
+        try:
+            from protein_chisel.sampling.adaptive_bias import default_axes as _da_guard
+            _gacts = [ax.actuator for ax in _da_guard(axes=_gsel)
+                      if getattr(ax, "actuator", None)]
+            _gdup = sorted({a for a in _gacts if _gacts.count(a) > 1})
+        except ValueError:
+            _gdup = []   # an unknown/duplicate name surfaces with the full message later
+        if _gdup:
+            p.error(
+                "--adaptive_bias_axes selects axes that SHARE an actuator (%s) — they "
+                "double-count in the legacy additive sum and re-create the "
+                "multiplicative lock. Add --controller_coordinator (its max-not-sum "
+                "makes shared actuators safe) or drop the redundant axis (e.g. 'pi' "
+                "shares the charge D/E/K/R actuator with 'charge')." % ", ".join(_gdup))
     debug_short_test_override_msg = None
     if args.debug_short_test:
         if args.target_k != 5 or args.cycles != 3:
@@ -4894,22 +6333,61 @@ def main() -> None:
         # accidentally truncated.
         LOGGER.warning(debug_short_test_override_msg)
 
-    # Auto-derive catalytic resnos from the seed's REMARK 666 block. This
-    # makes the same driver/sbatch work on any scaffold in the design
-    # campaign — even though the catalytic His/Lys/Glu sequence positions
-    # vary between scaffolds (e.g. SEED1 LYS 157 vs SEED2 LYS 19), the
-    # REMARK 666 block records them and we adopt those positions for the
-    # filter / fixed-residue / catres-aware code paths.
+    # Resolve catalytic resnos for ANY scaffold, by priority:
+    #   --catalytic_resnos override > seed REMARK 666 derivation > PTE builtin.
+    # This makes the same driver/sbatch work on any scaffold in the design
+    # campaign — even though the catalytic His/Lys/Glu sequence positions vary
+    # between scaffolds (e.g. SEED1 LYS 157 vs SEED2 LYS 19), the REMARK 666
+    # block (or the explicit override) records them and we adopt those
+    # positions for the filter / fixed-residue / catres-aware code paths. The
+    # builtin-fallback path (no override AND no REMARK 666) is loudly warned
+    # inside _resolve_catalytic_resnos — those PTE positions are wrong off-PTE.
+    # Design/catalytic chain (any-enzyme generalization). Validate a single,
+    # non-space chain id, then set the module CHAIN global from args.chain so all
+    # structural reads (H-bond/clash/preorg/interaction/SS/sequence/tunnel) target
+    # it. Default 'A' leaves the global unchanged => byte-identical. Mirrors the
+    # DEFAULT_CATRES/CATALYTIC_HIS_RESNOS global-set idiom below.
+    global CHAIN
+    _chain_arg = str(args.chain)
+    if len(_chain_arg) != 1 or _chain_arg.isspace():
+        p.error("--chain must be a single non-space chain id (e.g. 'A', 'B')")
+    if _chain_arg != CHAIN:
+        LOGGER.info("design/catalytic chain set to %r (was default %r)",
+                    _chain_arg, CHAIN)
+    CHAIN = _chain_arg
+
     global DEFAULT_CATRES, CATALYTIC_HIS_RESNOS
-    derived_catres, derived_his = _derive_catres_from_remark_666(args.seed_pdb)
-    if derived_catres != DEFAULT_CATRES:
+    _orig_default_catres, _orig_default_his = DEFAULT_CATRES, CATALYTIC_HIS_RESNOS
+    derived_catres, derived_his, catres_source = _resolve_catalytic_resnos(
+        args.catalytic_resnos, args.seed_pdb,
+    )
+    if catres_source != "builtin" and derived_catres != _orig_default_catres:
         LOGGER.info(
-            "auto-derived catalytic resnos from seed REMARK 666: "
-            "all_catres=%s (was default %s); his_only=%s (was default %s)",
-            derived_catres, DEFAULT_CATRES, derived_his, CATALYTIC_HIS_RESNOS,
+            "catalytic resnos resolved from %s: all_catres=%s (was PTE default "
+            "%s); his_only=%s (was PTE default %s)",
+            catres_source, derived_catres, _orig_default_catres,
+            derived_his, _orig_default_his,
         )
     DEFAULT_CATRES = derived_catres
     CATALYTIC_HIS_RESNOS = derived_his
+
+    # Catalytic-HIS H-bond requirement (any-enzyme generalization). Default ON
+    # (byte-identical). --no_require_cat_his_hbond disables just this criterion.
+    # Bonus auto-relax: if the resolved catalytic set has NO His at all, the
+    # requirement is unsatisfiable and would reject every design, so turn it off
+    # with a loud warning (an explicit --no_require_cat_his_hbond stays off too).
+    global REQUIRE_CAT_HIS_HBOND
+    REQUIRE_CAT_HIS_HBOND = not bool(args.no_require_cat_his_hbond)
+    if REQUIRE_CAT_HIS_HBOND and catres_source != "builtin" and not derived_his:
+        LOGGER.warning(
+            "Resolved catalytic set (source=%s) contains NO His: the cat-HIS "
+            "H-bond struct filter is unsatisfiable and would reject EVERY design. "
+            "Auto-relaxing it for this run (equivalent to --no_require_cat_his_hbond). "
+            "Pass --no_require_cat_his_hbond explicitly to silence this, or "
+            "--catalytic_resnos with a His if your active site has one.",
+            catres_source,
+        )
+        REQUIRE_CAT_HIS_HBOND = False
 
     # ---- Conserved-hbond + REMARK-transfer config (Features 1 & 2) -------
     global CONSERVE_HBONDS, CONSERVE_HBOND_PROB, CONSERVE_HBOND_MAX_DIST
@@ -5133,7 +6611,9 @@ def main() -> None:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
     from protein_chisel.io.schemas import PositionTable
     from protein_chisel.io.pdb import extract_sequence
-    from protein_chisel.sampling.plm_fusion import FusionConfig, fuse_experts
+    from protein_chisel.sampling.plm_fusion import (
+        FusionConfig, decoupled_fitness_weights, fuse_experts,
+    )
 
     pt = PositionTable.from_parquet(args.position_table)
     # Detect legacy (5-class) PositionTable and re-classify with the new
@@ -5175,7 +6655,85 @@ def main() -> None:
     # numpy ops on (L, 20) matrices. We then snapshot the runtime
     # result to the run dir so offline analysis/replays use the
     # *actual* bias the cycles saw, not the stale cached one.
+    # WS-E: opt-in ABSOLUTE per-class PLM weight overrides (default {} -> unchanged
+    # -> byte-identical fusion). Fail-fast on a bad class name / value at startup.
+    try:
+        _plm_class_overrides = _parse_plm_class_strength(args.plm_class_strength)
+    except ValueError as _exc:
+        raise SystemExit(str(_exc))
+    # ---- Seed triage (opt-in): drop the PLM bias on a pathological input scaffold ----
+    # The PLM fusion is conditioned on the seed; on a hydrophobic / over-represented
+    # scaffold it AMPLIFIES the bad composition (a near-lock at low T). When enabled and
+    # the seed trips the triage, force plm_strength -> 0 BEFORE building the fusion so
+    # LigandMPNN regenerates from structure + fixed residues. Default OFF => the fusion
+    # below is byte-identical (imports + work happen only inside the opt-in branch).
+    # Whole-protein over-rep AAs the z-gate flags (always defined; only populated when the
+    # opt-in z-gate fires) — logged below; the composition cap (#29) handles them per-cycle.
+    _triage_over_rep_aas: list[str] = []
+    if args.plm_autoskip_bad_input:
+        # ALL imports + work inside the try so a missing dep (e.g. Biopython for
+        # protparam) degrades to "no skip" rather than crashing the run (codex).
+        _triage_new_strength = args.plm_strength
+        try:
+            from protein_chisel.sampling.seed_triage import (
+                assess_seed, graded_plm_strength, severity as _seed_severity,
+            )
+            from protein_chisel.io.pdb import extract_sequence as _triage_extract_seq
+            from protein_chisel.filters.protparam import protparam_metrics as _triage_ppm
+            _triage_seq = _triage_extract_seq(args.seed_pdb, chain=CHAIN)
+            _triage_gravy = float(_triage_ppm(
+                _triage_seq, ph=args.design_ph,
+                n_term_pad=args.n_term_pad, c_term_pad=args.c_term_pad).gravy)
+            # exclude_aas: drop EVERY hard-omitted canonical AA from the z-gate — flagging
+            # over-representation of an AA the sampler cannot pick is meaningless and would
+            # falsely amputate the PLM. Derived from the global omit the same way the WS-C
+            # composition path does (codex: not just cysteine — --omit_AA WX must drop W too).
+            _triage_exclude = _canonical_omit_aas(args.omit_AA)
+            _seed_assessment = assess_seed(
+                _triage_seq, _triage_gravy,
+                gravy_max=args.plm_autoskip_gravy,
+                max_aa_frac=args.plm_autoskip_max_aa_frac,
+                hydrophobic_frac_max=args.plm_autoskip_hydrophobic_frac,
+                aa_zmax=args.plm_autoskip_aa_zmax,
+                aa_reference=args.aa_reference,
+                aa_z_log2_floor=args.plm_autoskip_aa_log2_floor,
+                exclude_aas=_triage_exclude)
+            # Log the LOGIC of every z-gate trip: each tripped AA's z, log2, and reference
+            # (the reasons list already carries all three — emit them prominently).
+            if _seed_assessment.over_rep_aas:
+                _triage_over_rep_aas = list(_seed_assessment.over_rep_aas)
+                for _r in _seed_assessment.reasons:
+                    if "z=" in _r and "log2=" in _r:
+                        LOGGER.warning("SEED TRIAGE z-gate: %s", _r)
+                LOGGER.warning(
+                    "SEED TRIAGE z-gate flagged over-represented AAs %s (vs %s); they "
+                    "contribute to the triage decision and are capped per-cycle by the "
+                    "composition cap (--composition_pool_fallback / --aa_fraction_cap).",
+                    "".join(_triage_over_rep_aas), args.aa_reference)
+            # F2 policy: cliff (default) or soft/graded reduction of plm_strength.
+            _triage_new_strength = graded_plm_strength(
+                _seed_assessment, enabled=True,
+                current_plm_strength=args.plm_strength,
+                soft=args.plm_autoskip_soft,
+                soft_zero=args.plm_autoskip_soft_zero)
+            if _triage_new_strength != args.plm_strength:
+                _sev = _seed_severity(_seed_assessment)
+                _mode = ("soft (soft_zero=%.2f)" % args.plm_autoskip_soft_zero
+                         ) if args.plm_autoskip_soft else "cliff"
+                LOGGER.warning(
+                    "SEED TRIAGE [%s]: input scaffold is pathological (%s) -> "
+                    "severity %.3f -> --plm_strength %.2f -> %.3f (PLM bias would "
+                    "amplify the seed; LigandMPNN leans on structure + fixed residues).",
+                    _mode, "; ".join(_seed_assessment.reasons), _sev,
+                    args.plm_strength, _triage_new_strength)
+        except Exception as _triage_exc:               # advisory; never crash the run
+            LOGGER.warning("seed triage skipped (%s)", _triage_exc)
+        args.plm_strength = _triage_new_strength
     fusion_cfg = FusionConfig(global_strength=args.plm_strength)
+    if _plm_class_overrides:
+        fusion_cfg.class_weights.update(_plm_class_overrides)
+        LOGGER.info("PLM per-class strength overrides (absolute): %s",
+                    _plm_class_overrides)
     # Default ["esmc","saprot"] (no per-expert knobs) -> fuse_experts delegates to
     # the legacy fuse_plm_logits via its N=2 fast-path -> byte-identical bias
     # (see tests/sampling/test_fuse_experts.py). >=3 experts use the N-way path.
@@ -5184,14 +6742,31 @@ def main() -> None:
         config=fusion_cfg, expert_names=expert_names,
     )
     base_bias = fusion_res.bias
+    # WS-E PLM decouple: for --plm_strength > 0, reuse the EXACT strength-scaled
+    # fusion weights (byte-identical — the fused-mean RANK is scale-invariant in
+    # plm_strength, but the scalar is not bit-exact, so recomputing at 1.0 would
+    # perturb the fitness TSV column by ~1 ULP). Only at strength == 0 — where the
+    # sampling bias is off AND the legacy weights are all-zero (every design ties at
+    # 0, silently zeroing the weight-2.0 fitness objective) — substitute the
+    # structural strength-1.0 weights to rescue a meaningful rank. The (L, 2) fitness
+    # path is the 2-expert default; >2-expert runs keep the legacy None unchanged
+    # (the decoupled helper would return (L, N), which the fitness gather rejects).
     weights_per_position = fusion_res.weights_per_position
+    if args.plm_strength == 0 and weights_per_position is not None:
+        weights_per_position = decoupled_fitness_weights(
+            expert_logprobs, position_classes, config=fusion_cfg,
+            expert_names=expert_names,
+        )
     fusion_dir = run_dir / "fusion_runtime"
     fusion_dir.mkdir(parents=True, exist_ok=True)
     np.save(fusion_dir / "base_bias.npy", base_bias)
     # Legacy snapshots (populated for the default 2-expert case); guarded so a
     # custom >=3-expert set doesn't crash on the None legacy fields.
-    if weights_per_position is not None:
-        np.save(fusion_dir / "weights_per_position.npy", weights_per_position)
+    if fusion_res.weights_per_position is not None:
+        # Save the BIAS-strength weights (byte-identical write-only diagnostic); the
+        # fitness path uses the decoupled strength=1.0 weights in `weights_per_position`.
+        np.save(fusion_dir / "weights_per_position.npy",
+                fusion_res.weights_per_position)
     if fusion_res.log_odds_esmc is not None:
         np.save(fusion_dir / "log_odds_esmc.npy", fusion_res.log_odds_esmc)
     if fusion_res.log_odds_saprot is not None:
@@ -5268,6 +6843,30 @@ def main() -> None:
     wt_seq = extract_sequence(args.seed_pdb, chain=CHAIN)
     if len(wt_seq) != L:
         raise RuntimeError(f"WT seq length {len(wt_seq)} != PositionTable {L}")
+
+    # ---- Input-scaffold hydrophobicity warning (logging only) --------
+    # A scaffold whose whole-sequence GRAVY is already strongly positive folds into
+    # a hydrophobic blob with little polar surface; designs will track the backbone
+    # and tend to fail the solubility filters. --adaptive_bias can steer the surface
+    # but cannot make a hydrophobic FOLD soluble — surface this up front. Reuses the
+    # protparam GRAVY; never changes selection.
+    try:
+        from protein_chisel.filters.protparam import protparam_metrics as _pp_metrics
+        _seed_pp = _pp_metrics(wt_seq, ph=args.design_ph,
+                               n_term_pad=args.n_term_pad, c_term_pad=args.c_term_pad)
+        _seed_gravy = float(_seed_pp.gravy)
+        _seed_charge = float(_seed_pp.charge_at_pH_full_HH)
+        if _seed_gravy > 0.4:
+            LOGGER.warning(
+                "INPUT SCAFFOLD is hydrophobic: seed GRAVY=%+.2f (>+0.4), "
+                "net_charge=%+.1f. Designs will track this backbone and likely fail "
+                "the solubility/SAP filters; %s can steer the exposed surface but "
+                "cannot make a hydrophobic fold soluble. Consider pre-filtering "
+                "inputs by GRAVY upstream.", _seed_gravy, _seed_charge,
+                "--adaptive_bias" if args.adaptive_bias else "the adaptive controller")
+    except Exception:                              # pragma: no cover - advisory only
+        _seed_gravy = None
+        _seed_charge = None
 
     # Compute ligand geometry summary ONCE — scaffold-invariant. The
     # min_projected_radius is the relevant tunnel-fit threshold.
@@ -5357,13 +6956,36 @@ def main() -> None:
     LOGGER.info("WT engine eval: %s", wt_eng.summary())
     expression_omit = wt_eng.to_omit_AA_json("A", protein_resnos=protein_resnos)
     LOGGER.info("expression-engine HARD_OMIT JSON: %s", expression_omit)
+    # WS-C: seed-derived SOFT_BIAS map (0-indexed body position -> AAs to
+    # down-weight), LOCAL hits only (whole-protein composition hits excluded —
+    # those are the suppress-all / fraction-cap levers' job). Used by run_cycle
+    # only as the cycle-0 BOOTSTRAP; cycles 1+ rebuild the map from the survivor
+    # pool. Inert + free to compute unless --composition_soft_bias is set.
+    expression_soft_bias = wt_eng.soft_bias_per_residue(
+        max_span_frac=_SOFT_BIAS_MAX_SPAN_FRAC,
+    )
+    # F1 consequence (b): the z-gate's over-rep AAs are HANDLED PER-CYCLE by the existing
+    # composition cap (#29 --composition_pool_fallback + --aa_fraction_cap + suppress-overrep),
+    # which caps whatever is over-represented in each cycle's sampled pool. The earlier
+    # cycle-0 SEED bootstrap (forcing those AAs down at all positions from cycle 0) was
+    # REMOVED: cluster validation showed it over-committed and degraded hard seeds (Chigh
+    # GRAVY -0.01 -> +0.46, Clow -0.57 -> +0.03), while #29 alone steers them correctly. The
+    # z-gate's value is the triage CONTRIBUTION (above) + the prominent LOG (above); the cap
+    # is #29's job, not a one-shot seed forcing.
+    if args.composition_soft_bias:
+        LOGGER.info(
+            "expression-engine SOFT_BIAS seed-bootstrap map: %d local positions "
+            "(cycle 0 only; cycles 1+ rebuild from the survivor pool; %.2f nats "
+            "each)",
+            len(expression_soft_bias), args.composition_soft_bias_nats,
+        )
 
     # Graded clash-aware bias replacing the previous hard-omit. Per the
     # rotamer-feasibility audit (commit logs + scripts/audit_clash_omits.py),
     # no (clash-prone-pos, bulky-AA) pair has >50% clashing rotamers in
     # a 9-rotamer grid stub, so the previous hard-omit was unjustified.
     # Now: add a per-position per-AA bias proportional to the clash %
-    # to the base PLM-fusion bias (max -3 nats at 100% clash, 0 at 0%).
+    # to the base PLM-fusion bias (max -20 nats at 100% clash, 0 at 0%).
     # MPNN can still pick a "clash-prone" AA when other context strongly
     # favors it; the filter-time severe-clash check (1.5 A) catches the
     # remaining hard failures.
@@ -5373,14 +6995,41 @@ def main() -> None:
         fixed_resnos=DEFAULT_CATRES,
         chain=CHAIN,
         cb_clearance_threshold=5.0,
-        bulky_aas="YFWHMR",
+        bulky_aas=_CLASH_BULKY_AAS,
     )
     LOGGER.info(
         "graded clash bias: %d positions biased, mean magnitude=%.3f nats",
         clash_telem["n_positions_biased"], float(np.abs(clash_bias).mean()),
     )
-    base_bias = base_bias + clash_bias   # added to the cycle-0 fusion bias
+    base_bias = base_bias + clash_bias   # fusion baseline, carried into every cycle
     omit_AA_per_residue = expression_omit
+    # ---- WS-G: opt-in tunnel-lining hard-omit (merged ONLY when on) -----------
+    # Merge only inside the `if` so a no-flag run leaves expression_omit byte-for-byte
+    # untouched (merge_omit_dicts re-sorts AA strings, so even a `{}` merge is not a
+    # guaranteed no-op — codex). The lining set is the seed is_tunnel_lining
+    # annotation (the SAME source WS-D's surface scope uses).
+    if args.omit_tunnel_lining:
+        _lining = _read_seed_tunnel_lining(seed_tunnel_path)
+        try:
+            _tunnel_omit = _build_tunnel_lining_omit(
+                sorted(_lining), CHAIN, args.omit_tunnel_lining_aas,
+                fixed_resnos=DEFAULT_CATRES,
+            )
+        except ValueError as _exc:
+            raise SystemExit(str(_exc))
+        if _tunnel_omit:
+            omit_AA_per_residue = merge_omit_dicts(expression_omit, _tunnel_omit)
+            LOGGER.info("WS-G omit_tunnel_lining: hard-omit %r at %d non-catalytic "
+                        "lining positions; merged omit now %d positions",
+                        args.omit_tunnel_lining_aas, len(_tunnel_omit),
+                        len(omit_AA_per_residue))
+            if args.throat_feedback:
+                LOGGER.warning("WS-G omit_tunnel_lining + throat_feedback both ON: at "
+                               "lining∩throat positions the hard omit shadows the soft "
+                               "throat bias for those AAs (harmless; the omit wins).")
+        else:
+            LOGGER.warning("WS-G omit_tunnel_lining set but no tunnel-lining positions "
+                           "found (empty/failed seed annotation) — no-op this run.")
     LOGGER.info("structural omit_AA (from rule engine only): %s", omit_AA_per_residue)
 
     # ---- Cycle schedule ---------------------------------------------
@@ -5396,6 +7045,14 @@ def main() -> None:
         consensus_threshold=args.consensus_threshold,
         consensus_strength=args.consensus_strength,
         consensus_max_fraction=args.consensus_max_fraction,
+        net_charge_min=args.net_charge_min,
+        net_charge_max=args.net_charge_max,
+        sap_max_threshold=args.sap_max_threshold,
+        instability_max=args.instability_max,
+        gravy_min=args.gravy_min,
+        gravy_max=args.gravy_max,
+        aliphatic_min=args.aliphatic_min,
+        boman_max=args.boman_max,
     )
     if args.debug_short_test:
         LOGGER.info(
@@ -5424,6 +7081,57 @@ def main() -> None:
         # there is no per-cycle resampling/bias-refinement to iterate — one cycle.
         cycles = cycles[:1]
         LOGGER.info("PoE score-only: forcing a single cycle (one-shot pool).")
+        # WS-C: suppress-all-overrep and the fraction cap act on the PREVIOUS
+        # cycle's survivor pool, which never exists in a one-shot PoE run — so they
+        # are silent no-ops here. (The composition soft-bias still applies via its
+        # cycle-0 seed bootstrap.) Surface the dead flags rather than fail silently.
+        _poe_dead = [
+            name for name, on in (
+                ("--composition_suppress_all_overrep", args.composition_suppress_all_overrep),
+                ("--aa_fraction_cap", args.aa_fraction_cap is not None),
+            ) if on
+        ]
+        if _poe_dead:
+            LOGGER.warning(
+                "PoE one-shot backend: %s have NO effect (they steer the next "
+                "cycle from the survivor pool, and PoE runs a single cycle-0 pool "
+                "with no survivors). Use --mpnn_backend bias for these levers.",
+                " and ".join(_poe_dead),
+            )
+    # ---- Side-chain-context schedule (opt-in) --------------------------------
+    # Override each cycle's use_side_chain_context from a per-cycle 0/1 schedule
+    # (ON early for clash avoidance, OFF late for first-shell diversity). Applied
+    # ONCE here AFTER construction / truncation / PoE forcing so it matches the
+    # FINAL cycle count. None (flag absent) => the uniform --use_side_chain_context
+    # value built into every cycle is left untouched => byte-identical.
+    if args.use_side_chain_context_schedule is not None:
+        _apply_scc_schedule(cycles, args.use_side_chain_context_schedule)
+        LOGGER.info(
+            "use_side_chain_context schedule applied (broadcast/truncate to %d "
+            "cycles): per-cycle sc = %s",
+            len(cycles), [c.use_side_chain_context for c in cycles],
+        )
+    # ---- WS-E: sampling temperature floor (opt-in) ---------------------------
+    # Raise any cycle's sampling temperature to at least the floor, applied ONCE
+    # here (after construction / truncation / PoE forcing) so the sampler AND the
+    # logged/telemetered temperature agree. At T≈0.15 even a 0.5-nat bias is ~28x
+    # (near-deterministic); a floor ~0.3 restores genuine multinomial diversity.
+    # None => byte-identical (the schedule is untouched). The floor OVERRIDES the
+    # annealing schedule (a floor above the max cycle temp disables annealing).
+    if args.sampling_temperature_floor is not None:
+        _floored = []
+        for cyc in cycles:
+            if cyc.sampling_temperature < args.sampling_temperature_floor:
+                _floored.append((cyc.cycle_idx, cyc.sampling_temperature))
+                cyc.sampling_temperature = args.sampling_temperature_floor
+        if _floored:
+            LOGGER.info("sampling_temperature_floor=%.3f raised cycles %s",
+                        args.sampling_temperature_floor,
+                        [f"{i}:{t:.3f}->{args.sampling_temperature_floor:.3f}"
+                         for i, t in _floored])
+        if args.poe_output_dir is not None:
+            LOGGER.warning("--sampling_temperature_floor has NO effect under the PoE "
+                           "backend (it already sampled at POE_TEMPERATURE).")
     LOGGER.info("cycle schedule: %d cycles, omit_AA=%r", len(cycles), args.omit_AA)
 
     # ---- Pre-compute seed DFI once (design-invariant for fixed-backbone) --
@@ -5478,6 +7186,143 @@ def main() -> None:
     # Throat-blocker bias delta carried forward across cycles. None for
     # cycle 0 (no prior data); populated from cycle k for cycle k+1.
     throat_bias_prev: Optional[np.ndarray] = None
+    # Feature #29: the previous cycle's full SAMPLED (pre-band-filter) pool,
+    # carried forward so run_cycle can fall back to it for the WS-C cap /
+    # class-balance / soft-bias when --composition_pool_fallback is set and the
+    # survivor pool is empty. None for cycle 0 (no prior pool) and whenever the
+    # flag is off (it is simply never read in run_cycle). This is the SAME pool
+    # the adaptive controller measures (``seq_stage_df`` below).
+    seq_stage_pool_prev: Optional[pd.DataFrame] = None
+
+    # ---- Adaptive solubility-bias controller (opt-in) ----------------
+    # The controller LOGIC lives here in the loop (where the full per-cycle
+    # candidate pool is available); run_cycle only APPLIES the carried biases.
+    # All three carried objects are None until the controller produces them, so
+    # when --adaptive_bias is off run_cycle receives None and the path is
+    # byte-identical.
+    adaptive_state: Optional[dict] = None          # {axis: AxisState.to_dict()}
+    adaptive_global: Optional[dict] = None         # raw global per-AA bias to apply next
+    adaptive_delta: Optional[np.ndarray] = None    # (L,20) surface delta to apply next
+    _ab_sasa = None
+    _ab_fixed_idx: set = set()
+    _ab_cfg = None
+    _ab_surface_mask = None        # WS-D non_tunnel_surface mask (None => legacy)
+    _ab_charge_band = None         # WS-D --adaptive_charge_band override (None => cycle)
+    _ab_axes_sel = None            # WS-D --adaptive_bias_axes selector (None => default)
+    # pI controller band/target (default_axes' own defaults until set from --pi_min/max
+    # below) — defined at function scope so every default_axes() call site is safe.
+    _pi_band = (float(args.pi_min), float(args.pi_max))
+    _pi_target = min(args.pi_min + 0.5, (args.pi_min + args.pi_max) / 2.0)
+    if args.adaptive_bias:
+        from protein_chisel.sampling.adaptive_bias import (
+            AdaptiveBiasConfig, compute_adaptive_bias, default_axes,
+        )
+        # OPT-IN control-law damping bundle (default OFF => the four damping fields
+        # keep their no-op defaults => byte-identical to the legacy controller). When
+        # --controller_damping is set: act on an EWMA of the pool mean (alpha=0.5),
+        # add a derivative-on-measurement term (gain 0.5*the integral gain), slew-limit
+        # |Δu| to 0.15*max_nats/cycle, and use the soft 'ramp' deadband.
+        _ab_damp = dict(measurement_ewma_alpha=0.5,
+                        derivative_gain=0.5 * args.adaptive_bias_gain,
+                        slew_limit_frac=0.15,
+                        deadband_mode="ramp") if args.controller_damping else {}
+        _ab_cfg = AdaptiveBiasConfig(
+            gain=args.adaptive_bias_gain, max_nats=args.adaptive_bias_max_nats,
+            carry=args.adaptive_bias_carry, t_min=args.adaptive_bias_tmin,
+            f_min=args.adaptive_bias_fmin, min_n=args.adaptive_bias_min_n,
+            mode=args.adaptive_bias_mode, max_odds=args.adaptive_bias_max_odds,
+            # CF-3 coordinator (opt-in; both default to the byte-identical legacy path
+            # when --controller_coordinator is absent).
+            coordinator=args.controller_coordinator,
+            controller_ceiling=args.controller_ceiling,
+            **_ab_damp,
+        )
+        try:
+            _ab_r2s = dict(zip(pt.df["resno"].astype(int),
+                               pt.df["sasa_sc_fraction"].astype(float)))
+            _ab_sasa = np.array([_ab_r2s.get(int(r), 0.0) for r in protein_resnos],
+                                dtype=float)
+        except Exception:                          # pragma: no cover - defensive
+            _ab_sasa = None
+        _ab_r2i = {int(r): i for i, r in enumerate(protein_resnos)}
+        _ab_fixed_idx = {_ab_r2i[int(r)] for r in fixed_resnos if int(r) in _ab_r2i}
+        # ---- WS-D: opt-in charge band + axes selector (None => today's behavior) ----
+        if args.adaptive_charge_band:
+            try:
+                _ab_charge_band = _parse_charge_band_arg(args.adaptive_charge_band)
+            except ValueError as _exc:
+                raise SystemExit(str(_exc))
+        _ab_axes_sel = ([a.strip() for a in args.adaptive_bias_axes.split(",") if a.strip()]
+                        if args.adaptive_bias_axes else None)
+        # Fail-fast on a bad band/axis selector at STARTUP — the per-cycle controller
+        # is defensively wrapped, so without this an invalid band (lo>=hi) or unknown
+        # axis name would silently degrade the run to unbiased every cycle.
+        try:
+            default_axes(charge_band=_ab_charge_band, axes=_ab_axes_sel,
+                         pi_band=_pi_band, pi_target=_pi_target)
+        except ValueError as _exc:
+            raise SystemExit(f"adaptive-bias config error: {_exc}")
+        # ---- WS-D: non_tunnel_surface scope mask (structure-invariant; built once).
+        # None unless --adaptive_surface_sasa_gate is set, so build_surface_delta keeps
+        # the legacy distal_surface gate => byte-identical. Tunnel-lining comes from the
+        # seed annotation; the throat-band source is not yet wired (frozenset()).
+        if args.adaptive_surface_sasa_gate is not None:
+            from protein_chisel.sampling.adaptive_bias import surface_scope
+            # Shared single source of truth (also WS-G's omit source): resno set
+            # from the seed is_tunnel_lining annotation, mapped to 0-based indices.
+            _ab_tunnel_lining = {
+                _ab_r2i[r] for r in _read_seed_tunnel_lining(seed_tunnel_path)
+                if r in _ab_r2i
+            }
+            _ab_surface_mask = surface_scope(
+                L=base_bias.shape[0], position_classes=position_classes,
+                sasa_fraction=_ab_sasa, fixed_idx=_ab_fixed_idx,
+                sasa_gate=args.adaptive_surface_sasa_gate,
+                tunnel_lining_idx=frozenset(_ab_tunnel_lining),
+                throat_band_idx=frozenset(),
+            )
+            LOGGER.info("adaptive surface scope: non_tunnel_surface (sasa_gate=%.2f) => "
+                        "%d steerable positions (%d tunnel-lining, %d fixed excluded)",
+                        args.adaptive_surface_sasa_gate, int(_ab_surface_mask.sum()),
+                        len(_ab_tunnel_lining), len(_ab_fixed_idx))
+        LOGGER.info("adaptive-bias controller ENABLED (gain=%.2f max=%.2f carry=%.2f "
+                    "tmin=%.1f fmin=%.2f min_n=%d mode=%s)",
+                    _ab_cfg.gain, _ab_cfg.max_nats, _ab_cfg.carry, _ab_cfg.t_min,
+                    _ab_cfg.f_min, _ab_cfg.min_n, _ab_cfg.mode)
+        if args.controller_damping:
+            LOGGER.info("controller DAMPING ENABLED (ewma_alpha=%.2f derivative_gain=%.3f "
+                        "slew_limit_frac=%.2f deadband_mode=%s)",
+                        _ab_cfg.measurement_ewma_alpha, _ab_cfg.derivative_gain,
+                        _ab_cfg.slew_limit_frac, _ab_cfg.deadband_mode)
+        if args.controller_coordinator:
+            LOGGER.info("controller COORDINATOR ENABLED (CF-2/CF-3): joint odds budget "
+                        "%.0fx (controller share), nested inside ~%.0fx whole-stack "
+                        "ceiling; shared actuators collapse by sign-selected max/sum.",
+                        args.controller_ceiling, 1.0e3)
+        # Optional cycle-0 warm-start from the input scaffold's own properties.
+        if args.adaptive_bias_seed_from_input and _seed_gravy is not None:
+            from protein_chisel.sampling.adaptive_bias import seed_warmstart
+            _ab_seed_axes = default_axes(
+                gravy_band=(args.gravy_min, args.gravy_max),
+                net_charge_band=(cycles[0].net_charge_min, cycles[0].net_charge_max),
+                deadband_frac=args.adaptive_bias_deadband,
+                charge_band=_ab_charge_band, axes=_ab_axes_sel,
+                pi_band=_pi_band, pi_target=_pi_target,
+            )
+            adaptive_global, adaptive_delta, adaptive_state, _ab_seed_tele = seed_warmstart(
+                seed_metrics={"gravy": _seed_gravy, "net_charge_full_HH": _seed_charge},
+                axes=_ab_seed_axes, cfg=_ab_cfg, L=base_bias.shape[0],
+                position_classes=position_classes, sasa_fraction=_ab_sasa,
+                fixed_idx=_ab_fixed_idx, surface_mask=_ab_surface_mask,
+                # The warm-start bias is APPLIED at cycle 0, so the coordinator (when on)
+                # sizes its budget at cycle 0's T. Only consumed under the coordinator;
+                # legacy path ignores it => byte-identical.
+                temperature=cycles[0].sampling_temperature,
+            )
+            adaptive_global = adaptive_global or None
+            adaptive_delta = adaptive_delta if np.any(adaptive_delta) else None
+            LOGGER.info("adaptive-bias seed warm-start from input: global=%s surface=%s",
+                        adaptive_global or "{}", _ab_seed_tele["seed_warmstart"])
 
     # Per-cycle metrics snapshot — written to run_dir/cycle_metrics.tsv at the
     # end so the user can grep / plot how filter populations and quality
@@ -5485,8 +7330,14 @@ def main() -> None:
     # debug output to the log itself but the TSV is always there.
     cycle_metric_rows: list[dict] = []
 
-    for cyc in cycles:
+    for _cyc_pos, cyc in enumerate(cycles):
         cycle_dir = run_dir / f"cycle_{cyc.cycle_idx:02d}"
+        # The adaptive controller measures THIS cycle's pool but its bias is APPLIED at
+        # the NEXT cycle (a possibly lower, annealed T). The CF-3 coordinator sizes its
+        # odds budget at the APPLICATION-cycle T (math review §2.4); on the last cycle
+        # there is no next application, so fall back to this cycle's T (harmless).
+        _next_apply_T = (cycles[_cyc_pos + 1].sampling_temperature
+                         if _cyc_pos + 1 < len(cycles) else cyc.sampling_temperature)
         ranked_df, pdb_map, cyc_telem = run_cycle(
             cycle_cfg=cyc, seed_pdb=args.seed_pdb,
             base_bias=base_bias,
@@ -5509,6 +7360,7 @@ def main() -> None:
             wt_fitness=wt_fitness,
             position_table_df=pt.df,
             omit_AA_per_residue=omit_AA_per_residue,
+            aa_reference=args.aa_reference,
             balance_z_threshold=args.balance_z_threshold,
             design_ph=args.design_ph,
             # Per-cycle filter thresholds: in 'annealing' strategy these
@@ -5525,6 +7377,16 @@ def main() -> None:
                           else args.aliphatic_min,
             boman_max=cyc.boman_max if args.strategy == "annealing"
                       else args.boman_max,
+            sap_corrected=args.sap_corrected,
+            composition_suppress_all_overrep=args.composition_suppress_all_overrep,
+            aa_fraction_cap=args.aa_fraction_cap,
+            composition_soft_bias=args.composition_soft_bias,
+            composition_soft_bias_nats=args.composition_soft_bias_nats,
+            expression_soft_bias=expression_soft_bias,
+            composition_pool_fallback=args.composition_pool_fallback,
+            composition_fallback_pool=seq_stage_pool_prev,
+            bias_total_clamp=args.bias_total_clamp,
+            bias_total_clamp_odds=args.bias_total_clamp_odds,
             n_term_pad=args.n_term_pad,
             c_term_pad=args.c_term_pad,
             omit_M_at_pos1=not args.no_omit_M_at_pos1,
@@ -5534,6 +7396,17 @@ def main() -> None:
             ligand_resname=ligand_geometry_summary.get("ligand_resname"),
             throat_bias_prev=throat_bias_prev,
             throat_bias_decay=args.throat_feedback_decay,
+            adaptive_bias_global=adaptive_global,
+            adaptive_bias_delta=adaptive_delta,
+            # The coordinator's nested-ceiling clamp at the sampler is meaningful only
+            # when the controller is actually running (--adaptive_bias); without it the
+            # controller buckets are empty and the nesting would just clamp the PLM
+            # stack. Gate on BOTH so --controller_coordinator alone is a true no-op.
+            controller_coordinator=(args.controller_coordinator and args.adaptive_bias),
+            controller_ceiling=args.controller_ceiling,
+            # The graded-clash bias (VETO tier) so the nested whole-stack clamp can
+            # bypass it (a ban must never be diluted by the total ceiling).
+            clash_bias=clash_bias,
         )
         # Carry throat-bias forward to next cycle (None if disabled or
         # this cycle didn't produce one).
@@ -5545,6 +7418,102 @@ def main() -> None:
         seq_stage_df = _load_cycle_seq_stage_pool(cycle_dir, cyc.cycle_idx)
         if len(seq_stage_df) > 0:
             all_seq_stage_rows.append(seq_stage_df)
+        # Feature #29: carry THIS cycle's full sampled pool forward as the next
+        # cycle's composition fallback source (only when the opt-in flag is set,
+        # so the default path holds no extra state). This is the SAME sampled pool
+        # the adaptive controller measures just below.
+        if args.composition_pool_fallback:
+            seq_stage_pool_prev = seq_stage_df if len(seq_stage_df) > 0 else None
+
+        # ---- Adaptive controller: measure THIS cycle's full candidate pool and
+        # produce the bias to apply NEXT cycle (mirrors the throat carry pattern).
+        # Defensively wrapped: a controller failure must NEVER abort the design run
+        # (degrade to the legacy UNBIASED path and continue). Byte-identical on the
+        # success path; the except only triggers on an unanticipated edge.
+        if args.adaptive_bias and _ab_cfg is not None:
+            try:
+                ab_axes = default_axes(
+                    gravy_band=(
+                        cyc.gravy_min if args.strategy == "annealing" else args.gravy_min,
+                        cyc.gravy_max if args.strategy == "annealing" else args.gravy_max),
+                    net_charge_band=(cyc.net_charge_min, cyc.net_charge_max),
+                    deadband_frac=args.adaptive_bias_deadband,
+                    charge_band=_ab_charge_band, axes=_ab_axes_sel,
+                    pi_band=_pi_band, pi_target=_pi_target,
+                )
+                from protein_chisel.sampling.adaptive_bias import hydrophobic_over_rep_mask
+                _ab_overrep = (hydrophobic_over_rep_mask(
+                    seq_stage_df["sequence"].astype(str).tolist(),
+                    reference=args.aa_reference)
+                    if "sequence" in seq_stage_df.columns else None)
+                # CF-3 owns bias-application timing: under --controller_coordinator the
+                # joint odds budget is sized at the APPLICATION-cycle T (the bias is
+                # applied NEXT cycle). The legacy CF-1 odds clamp keeps using THIS
+                # cycle's T so existing --adaptive_bias_max_odds runs stay byte-identical
+                # (the budget is the only thing that should track the application T).
+                _ctrl_T = (_next_apply_T if args.controller_coordinator
+                           else cyc.sampling_temperature)
+                ab_res = compute_adaptive_bias(
+                    pool_df=seq_stage_df, axes=ab_axes, cfg=_ab_cfg, state=adaptive_state,
+                    L=base_bias.shape[0], position_classes=position_classes,
+                    sasa_fraction=_ab_sasa, fixed_idx=_ab_fixed_idx,
+                    over_rep_mask=_ab_overrep, surface_mask=_ab_surface_mask,
+                    temperature=_ctrl_T,
+                )
+                adaptive_state = ab_res.new_state
+                adaptive_global = ab_res.controller_global or None
+                adaptive_delta = (ab_res.per_position_delta
+                                  if np.any(ab_res.per_position_delta) else None)
+                try:
+                    ab_bias_dir = cycle_dir / "00_bias"
+                    ab_bias_dir.mkdir(parents=True, exist_ok=True)
+                    with open(ab_bias_dir / "adaptive_bias_telemetry.json", "w") as fh:
+                        json.dump(ab_res.telemetry, fh, indent=2, default=str)
+                except Exception:                  # pragma: no cover - telemetry only
+                    pass
+                # CF-5: opt-in verbose controller trace. Default OFF => byte-identical
+                # (nothing below runs, controller_trace is not imported). Advisory only:
+                # a write/format error is logged and swallowed, never stopping the run.
+                if args.controller_verbose:
+                    try:
+                        from protein_chisel.sampling.controller_trace import (
+                            TRACE_COLUMNS, controller_trace_rows,
+                            format_controller_report_lines,
+                        )
+                        _axes_by_name = {ax.name: ax for ax in ab_axes}
+                        _trace_rows = controller_trace_rows(
+                            ab_res.outcomes, _axes_by_name,
+                            cycle_idx=cyc.cycle_idx,
+                            temperature=cyc.sampling_temperature,
+                        )
+                        # append-only long-format TSV at the RUN ROOT (one row per axis
+                        # per cycle across the whole run); header written once.
+                        _trace_tsv = run_dir / "controller_trace.tsv"
+                        _need_header = not _trace_tsv.exists()
+                        with open(_trace_tsv, "a") as _tfh:
+                            if _need_header:
+                                _tfh.write("\t".join(TRACE_COLUMNS) + "\n")
+                            for _row in _trace_rows:
+                                _tfh.write("\t".join(
+                                    str(_row[_c]) for _c in TRACE_COLUMNS) + "\n")
+                        LOGGER.info("cycle %d CONTROLLER REPORT (T=%.3f):",
+                                    cyc.cycle_idx, cyc.sampling_temperature)
+                        for _line in format_controller_report_lines(_trace_rows):
+                            LOGGER.info("%s", _line)
+                    except Exception:              # pragma: no cover - advisory only
+                        LOGGER.exception(
+                            "cycle %d controller_verbose trace failed (advisory; "
+                            "run continues)", cyc.cycle_idx)
+                _open = [o.name for o in ab_res.outcomes if o.gate_open]
+                LOGGER.info("cycle %d adaptive controller: axes_active=%s global=%s "
+                            "surface_positions=%d", cyc.cycle_idx, _open or "none",
+                            adaptive_global or "{}",
+                            ab_res.telemetry.get("n_surface_positions_touched", 0))
+            except Exception:
+                LOGGER.exception(
+                    "cycle %d adaptive controller FAILED; continuing UNBIASED "
+                    "(legacy path) for the rest of this run", cyc.cycle_idx)
+                adaptive_global, adaptive_delta = None, None
         if ranked_df is not None and len(ranked_df) > 0:
             ranked_df = ranked_df.copy()
             ranked_df["cycle"] = cyc.cycle_idx
@@ -5582,6 +7551,15 @@ def main() -> None:
             else:
                 # Legacy: by fitness alone.
                 survivors_prev = ranked_df
+        elif args.composition_pool_fallback:
+            # Feature #29: this cycle collapsed (zero ranked survivors). Clear the
+            # carried survivor pool so the NEXT cycle correctly sees "no survivors
+            # from the previous cycle" and routes WS-C through the sampled fallback
+            # (seq_stage_pool_prev, set above) instead of a STALE older survivor
+            # pool. Gated on the opt-in flag, so the default path keeps today's
+            # behavior (survivors_prev unchanged on the empty-ranked path) =>
+            # byte-identical. (codex review.)
+            survivors_prev = None
         all_pdb_maps.update(pdb_map)
 
         # Snapshot metrics for this cycle (best-effort; never blocks).
@@ -6061,6 +8039,16 @@ def main() -> None:
             )
             top = _overlay_rows_by_id(top, rescued_top)
 
+        top = _apply_solubility_veto(
+            top,
+            enabled=args.ship_solubility_veto,
+            gravy_min=(final_cycle_cfg.gravy_min if args.strategy == "annealing"
+                       else args.gravy_min),
+            gravy_max=(final_cycle_cfg.gravy_max if args.strategy == "annealing"
+                       else args.gravy_max),
+            net_charge_min=final_cycle_cfg.net_charge_min,
+            net_charge_max=final_cycle_cfg.net_charge_max,
+        )
         requested_topk_rows = len(top)
         topk_tsv, top = _write_final_topk_artifacts(
             top=top,
@@ -6078,11 +8066,15 @@ def main() -> None:
         if args.final_filter_backfill and copied_pdbs < args.target_k:
             LOGGER.warning(
                 "stage_diverse_topk: final materialized top-K underfilled "
-                "(%d/%d requested). materializable_candidates=%d",
-                copied_pdbs, args.target_k, materializable_candidates,
+                "(%d/%d requested)%s. materializable_candidates=%d",
+                copied_pdbs, args.target_k,
+                " (solubility veto active — underfill is expected)"
+                if args.ship_solubility_veto else "",
+                materializable_candidates,
             )
         if (
             args.final_filter_backfill
+            and not args.ship_solubility_veto
             and copied_pdbs < args.target_k
             and materializable_candidates >= args.target_k
         ):
@@ -6134,6 +8126,7 @@ def main() -> None:
                 clash_filter=final_cycle_cfg.clash_filter,
                 clash_severe_distance=final_cycle_cfg.clash_severe_distance,
                 sap_max_threshold=final_cycle_cfg.sap_max_threshold,
+                sap_corrected=args.sap_corrected,
                 seed_dfi_metrics=seed_dfi_metrics,
                 tunnel_metrics_enabled=_tunnel_metrics_enabled,
                 ligand_min_radius=ligand_geometry_summary.get("min_projected_radius"),
@@ -6385,6 +8378,16 @@ def main() -> None:
                     chain=CHAIN,
                 )
                 top = _overlay_rows_by_id(top, rescued_top)
+            top = _apply_solubility_veto(
+                top,
+                enabled=args.ship_solubility_veto,
+                gravy_min=(final_cycle_cfg.gravy_min if args.strategy == "annealing"
+                           else args.gravy_min),
+                gravy_max=(final_cycle_cfg.gravy_max if args.strategy == "annealing"
+                           else args.gravy_max),
+                net_charge_min=final_cycle_cfg.net_charge_min,
+                net_charge_max=final_cycle_cfg.net_charge_max,
+            )
             requested_topk_rows = len(top)
             topk_tsv, top = _write_final_topk_artifacts(
                 top=top,
@@ -6402,8 +8405,11 @@ def main() -> None:
             if args.final_filter_backfill and copied_pdbs < args.target_k:
                 LOGGER.warning(
                     "stage_diverse_topk: final materialized top-K underfilled "
-                    "(%d/%d requested). materializable_candidates=%d",
-                    copied_pdbs, args.target_k, materializable_candidates,
+                    "(%d/%d requested)%s. materializable_candidates=%d",
+                    copied_pdbs, args.target_k,
+                    " (solubility veto active — underfill is expected)"
+                    if args.ship_solubility_veto else "",
+                    materializable_candidates,
                 )
 
             if args.copy_input_structure_into_out_dir:
@@ -6441,6 +8447,7 @@ def main() -> None:
                     clash_filter=final_cycle_cfg.clash_filter,
                     clash_severe_distance=final_cycle_cfg.clash_severe_distance,
                     sap_max_threshold=final_cycle_cfg.sap_max_threshold,
+                    sap_corrected=args.sap_corrected,
                     seed_dfi_metrics=seed_dfi_metrics,
                     tunnel_metrics_enabled=_tunnel_metrics_enabled,
                     ligand_min_radius=ligand_geometry_summary.get("min_projected_radius"),

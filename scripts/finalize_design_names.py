@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -23,6 +24,11 @@ def main() -> int:
                    help="Keep the intermediate iterative_design + protonate_topk "
                         "DESIGN_PATH lines (default: drop them, leaving one "
                         "chisel_iterative_design line with the final path).")
+    p.add_argument("--design_token",
+                   default=(os.environ.get("CHISEL_SUFFIX") or "chisel"),
+                   help="Name component in the shipped filename "
+                        "<stem>_<design_token>_<NNN>.pdb (default 'chisel', or "
+                        "the CHISEL_SUFFIX env var). Alphanumeric only.")
     args = p.parse_args()
 
     logging.basicConfig(
@@ -35,7 +41,8 @@ def main() -> int:
     from protein_chisel.tools.finalize_names import finalize_design_names
 
     summary = finalize_design_names(
-        args.final_root, keep_intermediate=args.keep_intermediate)
+        args.final_root, keep_intermediate=args.keep_intermediate,
+        design_token=args.design_token)
     logging.getLogger("finalize_design_names").info("DONE: %s", summary)
     return 0
 
