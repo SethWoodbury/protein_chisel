@@ -21,6 +21,48 @@ controllers were added (they would double-lock). Also adds `--aa_reference` (con
 baseline for non-hydrolase enzymes) and `--catalytic_resnos` (catalytic-residue override + loud
 PTE-fallback warning) for cross-enzyme generality. Host suite: 909 passed.
 
+## [1.3.0] — multi-objective controller coordinator + fully-configurable ranges
+
+The headline release for diverse-backbone effectiveness. Everything below is **opt-in and
+byte-identical by default** (the 1067-test host suite includes A/A run-twice + frozen-literal
+byte-identity guards); a recommended driver-cell env template (see `docs/validation/`) turns on the
+validated stack. Validated full-pipeline on the organophosphatase i4 seeds (evidence:
+`docs/validation/solubility_steering_validation.md`).
+
+### Added — CF-2/CF-3 controller coordinator + pI-in-range controller (`--controller_coordinator`)
+- New pure `sampling/coordinator.py`: replaces the naive additive bias sum with a per-cell,
+  weight-partitioned, **signed-sum-bounded odds budget**. Axes that share an actuator collapse by
+  **max-by-magnitude when same-sign** (the pI+charge double-count is structurally impossible) and
+  signed-sum when opposite-sign; the controller budget **nests inside** a ~1e3× whole-stack ceiling
+  with reserved headroom (so both ceilings bind), all at the *application-cycle* temperature. This
+  is the default-off-but-recommended bound on the otherwise-unbounded bias stack (an independent
+  codex units audit measured an aligned cell at up to ~1e20× without it).
+- New **pI-in-range** controller (opt-in via `--adaptive_bias_axes charge,surface_hydrophobicity,pi`)
+  sharing the charge D/E/K/R actuator — the requested "reinforcing redundancy," made safe by
+  max-not-sum. Its band/target follow `--pi_min/--pi_max`.
+- `--controller_ceiling X` (default 8×) tunes the joint controller odds budget.
+- **Shared-actuator guard**: selecting a shared-actuator axis (`pi`) without `--controller_coordinator`
+  is a startup error (the legacy sum would double-count) — redundancy that is safe by construction.
+- Two independent codex reviews (the build's + a second pass) plus the math committee; CF-2/CF-3
+  ship after the A/B confirmed diversity is preserved, no lock occurs, and easy seeds don't regress.
+
+### Added — composition-pool fallback (`--composition_pool_fallback`) [#29] + side-chain-context schedule (`--use_side_chain_context_schedule`) [#30]
+- `--composition_pool_fallback`: when a cycle's survivor pool is empty (a hydrophobic seed where
+  ~100% fail the GRAVY band), the WS-C cap / class-balance / soft-bias fire on the previous cycle's
+  full **sampled** pool instead — the lever that bounds the 23–27% single-AA backfill. **The
+  dominant effectiveness fix**: rescued a GRAVY +0.78 seed to **+0.02** (0 → 137 cycle-1 survivors).
+- `--use_side_chain_context_schedule '1,1,0'`: per-cycle side-chain-context override (ON early for
+  clash avoidance, OFF late for first-shell diversity).
+
+### Added — every acceptance range CLI + env configurable through annealing [#40]
+- New `--net_charge_min/--net_charge_max` and `--sap_max_threshold`; the existing
+  `--gravy_min/max`, `--instability_max`, `--aliphatic_min`, `--boman_max`, `--pi_min/max` now
+  **actually take effect** under the default annealing strategy (they were silently overridden by
+  the hardcoded per-cycle schedule). Your flag sets the *final/strictest* band and annealing relaxes
+  earlier cycles from it; net_charge/pi/sap stay constant across cycles. Env passthroughs:
+  `NET_CHARGE_MIN/MAX`, `SAP_MAX`, `GRAVY_MIN/MAX`, `INSTABILITY_MAX`, `ALIPHATIC_MIN`, `BOMAN_MAX`,
+  `PI_MIN/MAX`. Defaults reproduce the prior schedule byte-for-byte.
+
 ## [Unreleased] — diverse-backbone effectiveness (post-1.1.0, opt-in, byte-identical)
 
 Root-cause work after cluster validation revealed two reasons steering under-performed on
