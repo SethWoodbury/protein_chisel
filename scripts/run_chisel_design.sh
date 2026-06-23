@@ -348,6 +348,13 @@ OMIT_AA="${OMIT_AA:-X}"
 # detected per-residue omits.
 USE_SIDE_CHAIN_CONTEXT="${USE_SIDE_CHAIN_CONTEXT:-0}"
 
+# Opt-in per-cycle side-chain-context SCHEDULE (default unset => byte-identical;
+# the uniform USE_SIDE_CHAIN_CONTEXT applies to every cycle). A comma-separated
+# list of 0/1, e.g. USE_SIDE_CHAIN_CONTEXT_SCHEDULE='1,1,0' = ON early (clash
+# avoidance) then OFF late (first-shell diversity). Broadcast/truncated to the
+# run's cycle count by the driver. Overrides USE_SIDE_CHAIN_CONTEXT per cycle.
+USE_SIDE_CHAIN_CONTEXT_SCHEDULE="${USE_SIDE_CHAIN_CONTEXT_SCHEDULE:-}"
+
 # Post-translational modifications declared for catalytic residues.
 # Records the modification in the output PDB's REMARK 668 block so
 # downstream consumers (docking, MD setup) know the residue should
@@ -546,6 +553,11 @@ SAP_CORRECTED_CLI=()
 #   COMPOSITION_SOFT_BIAS=1             activate the expression SOFT_BIAS tier
 #                                        (per-residue AA down-weights at sampling).
 #   COMPOSITION_SOFT_BIAS_NATS=<nats>   magnitude per SOFT_BIAS cell (default 0.5).
+#   COMPOSITION_POOL_FALLBACK=1        when a cycle's survivor pool is empty (e.g. a
+#                                        hydrophobic seed where ~100% fail the GRAVY
+#                                        band), derive the cap/class-balance/soft-bias
+#                                        from the previous cycle's full SAMPLED pool
+#                                        instead — bounds the 26%-Ala backfill mode.
 COMPOSITION_CLI=()
 [[ "${COMPOSITION_SUPPRESS_ALL_OVERREP:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]] \
     && COMPOSITION_CLI+=( --composition_suppress_all_overrep )
@@ -556,6 +568,14 @@ if [[ "${COMPOSITION_SOFT_BIAS:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|
     [[ -n "${COMPOSITION_SOFT_BIAS_NATS:-}" ]] \
         && COMPOSITION_CLI+=( --composition_soft_bias_nats "$COMPOSITION_SOFT_BIAS_NATS" )
 fi
+[[ "${COMPOSITION_POOL_FALLBACK:-0}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]] \
+    && COMPOSITION_CLI+=( --composition_pool_fallback )
+
+# Per-cycle side-chain-context schedule (opt-in; unset => byte-identical). Passed
+# through verbatim; the driver validates each entry is 0/1 at parse time.
+USE_SIDE_CHAIN_CONTEXT_SCHEDULE_CLI=()
+[[ -n "${USE_SIDE_CHAIN_CONTEXT_SCHEDULE:-}" ]] \
+    && USE_SIDE_CHAIN_CONTEXT_SCHEDULE_CLI+=( --use_side_chain_context_schedule "$USE_SIDE_CHAIN_CONTEXT_SCHEDULE" )
 
 # AA-composition baseline reference (opt-in; unset => byte-identical default of
 # the EC-3 hydrolase distribution). AA_REFERENCE=<key> selects which Swiss-Prot
@@ -898,6 +918,7 @@ run_stage3_driver() {
             "${SHIP_SOLUBILITY_VETO_CLI[@]}" \
             "${SAP_CORRECTED_CLI[@]}" \
             "${COMPOSITION_CLI[@]}" \
+            "${USE_SIDE_CHAIN_CONTEXT_SCHEDULE_CLI[@]}" \
             "${AA_REFERENCE_CLI[@]}" \
             "${WS_E_CLI[@]}" \
             "${PLM_AUTOSKIP_CLI[@]}" \

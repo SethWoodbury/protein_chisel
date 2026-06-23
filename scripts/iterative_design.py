@@ -221,6 +221,88 @@ def _nonneg_finite_arg(value: str, *, max_value: Optional[float] = None) -> floa
     return v
 
 
+def _scc_schedule_arg(value: str) -> list[int]:
+    """Parse ``--use_side_chain_context_schedule '1,1,0'`` -> ``[1, 1, 0]``.
+
+    A comma-separated per-cycle 0/1 schedule for LigandMPNN's side-chain-context
+    flag (ON early for clash avoidance, OFF late for first-shell diversity).
+    Every entry must be EXACTLY 0 or 1, and at least one entry is required — a
+    typo (``2``, ``0.5``, an empty field) would otherwise silently mis-set the
+    sampler's context flag for a whole cycle. The list is broadcast/truncated to
+    the run's cycle count by :func:`_apply_scc_schedule`.
+
+    The parse is pure (no ``protein_chisel`` import), so ``--help`` builds even
+    without the package on ``PYTHONPATH``.
+    """
+    parts = [p.strip() for p in str(value).split(",")]
+    if not parts or any(p == "" for p in parts):
+        raise argparse.ArgumentTypeError(
+            f"--use_side_chain_context_schedule must be a non-empty comma-"
+            f"separated list of 0/1 (e.g. '1,1,0'), got {value!r}",
+        )
+    out: list[int] = []
+    for p in parts:
+        if p not in ("0", "1"):
+            raise argparse.ArgumentTypeError(
+                f"--use_side_chain_context_schedule entries must each be 0 or 1, "
+                f"got {p!r} in {value!r}",
+            )
+        out.append(int(p))
+    return out
+
+
+def _apply_scc_schedule(cycles: list, schedule: list[int]) -> None:
+    """Override each cycle's ``use_side_chain_context`` from ``schedule`` IN PLACE.
+
+    Broadcast/truncate rule (clear + documented): the schedule is matched to the
+    cycle count position-by-position; if it is SHORTER than the cycle count, its
+    LAST entry is repeated to fill the remaining (later) cycles (so ``'1,0'`` over
+    3 cycles becomes ``[1, 0, 0]`` — ON early, OFF late carries through); if it is
+    LONGER, the extra trailing entries are ignored (truncate to the cycle count).
+    A length-1 schedule broadcasts that single value to every cycle.
+
+    Called ONLY when ``--use_side_chain_context_schedule`` is given, so when the
+    flag is absent each cycle keeps the uniform ``--use_side_chain_context``
+    value => byte-identical.
+    """
+    if not cycles or not schedule:
+        return
+    last = schedule[-1]
+    for i, cyc in enumerate(cycles):
+        cyc.use_side_chain_context = schedule[i] if i < len(schedule) else last
+
+
+def _resolve_composition_pool(
+    *,
+    survivors_prev,
+    fallback_pool,
+    composition_pool_fallback: bool,
+):
+    """Choose the pool the WS-C cap / class-balance / soft-bias should derive from.
+
+    The WS-C levers normally read the previous cycle's *survivor* pool. On a
+    hydrophobic seed where ~100% of samples fail the GRAVY band, that survivor
+    pool is empty, so the levers never fire and the run ships a runaway single-AA
+    composition (the ~26%-Ala backfill mode). With ``--composition_pool_fallback``
+    set, when survivors are empty we instead derive them from the PREVIOUS cycle's
+    full SAMPLED (pre-band-filter) pool — the SAME source the adaptive controller
+    reads (``_load_cycle_seq_stage_pool``) — so the cap/class-balance/soft-bias
+    still engage.
+
+    Returns the fallback DataFrame ONLY when: the flag is set AND survivors are
+    empty/None AND a non-empty fallback pool exists. Otherwise returns ``None``
+    (the gated block then runs unchanged on survivors => byte-identical when the
+    flag is off, survivors exist, or there is no previous pool, e.g. cycle 0).
+    """
+    if not composition_pool_fallback:
+        return None
+    if survivors_prev is not None and len(survivors_prev) > 0:
+        return None
+    if fallback_pool is None or len(fallback_pool) == 0:
+        return None
+    return fallback_pool
+
+
 def _aa_reference_arg(value: str) -> str:
     """Validate ``--aa_reference NAME`` against the bundled baseline keys.
 
@@ -4593,6 +4675,12 @@ def run_cycle(
     composition_soft_bias: bool = False,
     composition_soft_bias_nats: float = 0.5,
     expression_soft_bias: Optional[dict[int, str]] = None,
+    # Feature #29: opt-in composition POOL FALLBACK. When the flag is set AND
+    # this cycle's survivor pool is empty, derive the cap/class-balance/soft-bias
+    # from the previous cycle's full SAMPLED (pre-band-filter) pool carried in
+    # ``composition_fallback_pool``. Default OFF / None pool => byte-identical.
+    composition_pool_fallback: bool = False,
+    composition_fallback_pool: Optional[pd.DataFrame] = None,
     bias_total_clamp: Optional[float] = None,
     bias_total_clamp_odds: Optional[float] = None,
     n_term_pad: str = "",
@@ -4696,6 +4784,27 @@ def run_cycle(
             cycle_cfg.cycle_idx, n_ab_pos, float(adaptive_bias_delta.min()),
         )
 
+    # ---- Feature #29: resolve the composition POOL FALLBACK source -----------
+    # When --composition_pool_fallback is set AND this cycle's survivor pool is
+    # empty, the WS-C cap / class-balance / soft-bias derive their composition
+    # signal from the previous cycle's full SAMPLED (pre-band-filter) pool instead
+    # of nothing. Returns None (no fallback) when the flag is off, survivors exist,
+    # or there is no previous pool (cycle 0) => the gated blocks below run unchanged
+    # on survivors => byte-identical. The fallback only carries the sampled pool
+    # forward; nothing about it touches the default path.
+    comp_fallback_pool = _resolve_composition_pool(
+        survivors_prev=survivors_prev,
+        fallback_pool=composition_fallback_pool,
+        composition_pool_fallback=composition_pool_fallback,
+    )
+    if comp_fallback_pool is not None:
+        LOGGER.info(
+            "cycle %d: composition_pool_fallback ACTIVE — survivor pool empty, "
+            "deriving cap/class-balance/soft-bias from the previous cycle's full "
+            "SAMPLED pool (n=%d, pre-band-filter)",
+            cycle_cfg.cycle_idx, len(comp_fallback_pool),
+        )
+
     # ---- 0a-quater. Composition soft-bias per-residue delta (opt-in, WS-C) ----
     # Activate the expression engine's per-residue SOFT_BIAS tier (long-hydrophobic-
     # stretch, KR-near-catalytic-on-helix, polyproline, repetitive-segment, …) as an
@@ -4703,9 +4812,10 @@ def run_cycle(
     # is POOL-DERIVED per cycle — the liabilities the *designs* introduce as the pool
     # drifts (a seed-only map is blind to them, since polyproline/repeat/hydrophobic-
     # stretch are sequence-determined). The seed map bootstraps cycle 0 (no survivors
-    # yet). Whole-protein composition hits are excluded (span filter) — those are
-    # handled globally by the suppress-all / fraction-cap levers. Off unless
-    # --composition_soft_bias, so the default path is byte-identical.
+    # yet); with --composition_pool_fallback the previous cycle's SAMPLED pool stands
+    # in for an empty survivor pool. Whole-protein composition hits are excluded (span
+    # filter) — those are handled globally by the suppress-all / fraction-cap levers.
+    # Off unless --composition_soft_bias, so the default path is byte-identical.
     # Defensively wrapped (mirrors the adaptive controller, commit 42f2f6b): the
     # pool path adds N per-survivor engine evaluations, and a soft-bias failure must
     # NEVER abort the design run — degrade to the unbiased path and continue.
@@ -4716,9 +4826,17 @@ def run_cycle(
             )
             from protein_chisel.sampling.plm_fusion import AA_ORDER
             if survivors_prev is not None and len(survivors_prev) > 0:
+                _soft_pool_seqs = survivors_prev["sequence"].astype(str).tolist()
+                soft_src = "pool"
+            elif comp_fallback_pool is not None:
+                _soft_pool_seqs = comp_fallback_pool["sequence"].astype(str).tolist()
+                soft_src = "sampled_fallback"
+            else:
+                _soft_pool_seqs = None
+            if _soft_pool_seqs is not None:
                 soft_map = aggregate_pool_soft_bias(
                     expression_engine,
-                    survivors_prev["sequence"].astype(str).tolist(),
+                    _soft_pool_seqs,
                     ss_reduced=seed_ss_reduced, sasa=seed_sasa,
                     position_class=seed_position_class,
                     catalytic_resnos=fixed_resnos, fixed_resnos=fixed_resnos,
@@ -4726,7 +4844,6 @@ def run_cycle(
                     min_support=_SOFT_BIAS_MIN_SUPPORT,
                     max_span_frac=_SOFT_BIAS_MAX_SPAN_FRAC,
                 )
-                soft_src = "pool"
             else:
                 soft_map = expression_soft_bias or {}    # seed bootstrap (cycle 0)
                 soft_src = "seed"
@@ -4765,16 +4882,25 @@ def run_cycle(
     # weight the over-rep AA AND up-weight the under-rep AA. Address
     # cases like "E z=+5, D z=-2": instead of just suppressing E (which
     # only reduces total negative charge), encourage D to take its place.
+    #
+    # Feature #29: when the survivor pool is empty and --composition_pool_fallback
+    # is set, derive both the per-AA fraction cap AND the class-balance bias from
+    # the previous cycle's full SAMPLED pool (``comp_fallback_pool``) instead — the
+    # cap is exactly what bounds the 26%-Ala backfill mode that an empty survivor
+    # pool would otherwise let through. Default (flag off / survivors exist / no
+    # previous pool) keeps the survivor-only path => byte-identical.
     bias_AA_str = ""
     fraction_cap_omit: dict[str, str] = {}
-    if survivors_prev is not None and len(survivors_prev) > 0:
+    _have_survivors = survivors_prev is not None and len(survivors_prev) > 0
+    _comp_pool_df = survivors_prev if _have_survivors else comp_fallback_pool
+    if _comp_pool_df is not None and len(_comp_pool_df) > 0:
         from protein_chisel.expression.aa_class_balance import (
             compute_class_balanced_bias_AA,
         )
-        # Pool survivors into one mega-sequence: this gives a count-
-        # weighted average composition (each survivor contributes equally
+        # Pool the chosen source into one mega-sequence: this gives a count-
+        # weighted average composition (each member contributes equally
         # since they're the same length L).
-        pool_seq = "".join(survivors_prev["sequence"].astype(str).tolist())
+        pool_seq = "".join(_comp_pool_df["sequence"].astype(str).tolist())
         # exclude_aas matches cycle_cfg.omit_AA (default "X" or "CX") so
         # we don't try to up-weight an AA the sampler can't pick anyway.
         excl = "".join(c for c in cycle_cfg.omit_AA.upper() if c != "X")
@@ -4814,6 +4940,12 @@ def run_cycle(
             bias_per_z=0.4,
         )
         bias_AA_str = balance_telem.bias_AA_string
+        # Record which pool the cap/class-balance was derived from so the
+        # fallback path is visible in telemetry (survivors vs the Feature #29
+        # sampled fallback). Default path => "survivors".
+        telem["composition_cap_pool_source"] = (
+            "survivors" if _have_survivors else "sampled_fallback"
+        )
         with open(bias_dir / "class_balance_telemetry.json", "w") as fh:
             json.dump(balance_telem.to_dict(), fh, indent=2)
         if bias_AA_str:
@@ -5254,6 +5386,17 @@ def main() -> None:
                         "sample time by auto-detected per-residue omits "
                         "for clash-prone positions. 1 = MPNN sees catalytic "
                         "sidechain rotamers (more WT-conservative).")
+    p.add_argument("--use_side_chain_context_schedule", type=_scc_schedule_arg,
+                   default=None, metavar="CSV01",
+                   help="Opt-in per-cycle side-chain-context schedule: a comma-"
+                        "separated list of 0/1, e.g. '1,1,0' = ON for cycles 0-1 "
+                        "(clash avoidance — materially helps avoid clashes early), "
+                        "OFF for cycle 2 (first-shell diversity late). Overrides "
+                        "the uniform --use_side_chain_context per cycle. Broadcast/"
+                        "truncate to the run's cycle count: a short schedule repeats "
+                        "its LAST entry for later cycles; a long one is truncated. "
+                        "Absent (default) => the uniform value is used unchanged "
+                        "(byte-identical).")
     p.add_argument("--enhance", type=str, default=None,
                    choices=[None, *AVAILABLE_ENHANCE_CHECKPOINTS],
                    help="Optional pLDDT-enhanced fused_mpnn checkpoint name. "
@@ -5363,6 +5506,18 @@ def main() -> None:
                         "~1800-22000x (a near-hard ban). Keep this near the adaptive "
                         "controller's ~0.6 clamp. No effect unless "
                         "--composition_soft_bias." % _SOFT_BIAS_NATS_MAX)
+    p.add_argument("--composition_pool_fallback", action="store_true",
+                   help="Opt-in (default OFF → byte-identical). The WS-C "
+                        "composition cap / class-balance / soft-bias normally read "
+                        "the previous cycle's SURVIVOR pool, so on a hydrophobic seed "
+                        "where ~100%% of samples fail the GRAVY band (empty survivor "
+                        "pool) they never fire and the run ships a runaway single-AA "
+                        "composition (the 26%%-Ala backfill mode). With this flag, "
+                        "when a cycle's survivor pool is empty the cap/class-balance/"
+                        "soft-bias are built from the PREVIOUS cycle's full SAMPLED "
+                        "(pre-band-filter) pool instead — the same source the adaptive "
+                        "controller reads — so the levers still engage. No-op at cycle "
+                        "0 (no previous pool) and whenever survivors exist.")
     p.add_argument("--copy-input-structure-into-out-dir",
                    "--copy_input_structure_into_out_dir",
                    dest="copy_input_structure_into_out_dir",
@@ -6583,6 +6738,19 @@ def main() -> None:
                 "with no survivors). Use --mpnn_backend bias for these levers.",
                 " and ".join(_poe_dead),
             )
+    # ---- Side-chain-context schedule (opt-in) --------------------------------
+    # Override each cycle's use_side_chain_context from a per-cycle 0/1 schedule
+    # (ON early for clash avoidance, OFF late for first-shell diversity). Applied
+    # ONCE here AFTER construction / truncation / PoE forcing so it matches the
+    # FINAL cycle count. None (flag absent) => the uniform --use_side_chain_context
+    # value built into every cycle is left untouched => byte-identical.
+    if args.use_side_chain_context_schedule is not None:
+        _apply_scc_schedule(cycles, args.use_side_chain_context_schedule)
+        LOGGER.info(
+            "use_side_chain_context schedule applied (broadcast/truncate to %d "
+            "cycles): per-cycle sc = %s",
+            len(cycles), [c.use_side_chain_context for c in cycles],
+        )
     # ---- WS-E: sampling temperature floor (opt-in) ---------------------------
     # Raise any cycle's sampling temperature to at least the floor, applied ONCE
     # here (after construction / truncation / PoE forcing) so the sampler AND the
@@ -6658,6 +6826,13 @@ def main() -> None:
     # Throat-blocker bias delta carried forward across cycles. None for
     # cycle 0 (no prior data); populated from cycle k for cycle k+1.
     throat_bias_prev: Optional[np.ndarray] = None
+    # Feature #29: the previous cycle's full SAMPLED (pre-band-filter) pool,
+    # carried forward so run_cycle can fall back to it for the WS-C cap /
+    # class-balance / soft-bias when --composition_pool_fallback is set and the
+    # survivor pool is empty. None for cycle 0 (no prior pool) and whenever the
+    # flag is off (it is simply never read in run_cycle). This is the SAME pool
+    # the adaptive controller measures (``seq_stage_df`` below).
+    seq_stage_pool_prev: Optional[pd.DataFrame] = None
 
     # ---- Adaptive solubility-bias controller (opt-in) ----------------
     # The controller LOGIC lives here in the loop (where the full per-cycle
@@ -6823,6 +6998,8 @@ def main() -> None:
             composition_soft_bias=args.composition_soft_bias,
             composition_soft_bias_nats=args.composition_soft_bias_nats,
             expression_soft_bias=expression_soft_bias,
+            composition_pool_fallback=args.composition_pool_fallback,
+            composition_fallback_pool=seq_stage_pool_prev,
             bias_total_clamp=args.bias_total_clamp,
             bias_total_clamp_odds=args.bias_total_clamp_odds,
             n_term_pad=args.n_term_pad,
@@ -6847,6 +7024,12 @@ def main() -> None:
         seq_stage_df = _load_cycle_seq_stage_pool(cycle_dir, cyc.cycle_idx)
         if len(seq_stage_df) > 0:
             all_seq_stage_rows.append(seq_stage_df)
+        # Feature #29: carry THIS cycle's full sampled pool forward as the next
+        # cycle's composition fallback source (only when the opt-in flag is set,
+        # so the default path holds no extra state). This is the SAME sampled pool
+        # the adaptive controller measures just below.
+        if args.composition_pool_fallback:
+            seq_stage_pool_prev = seq_stage_df if len(seq_stage_df) > 0 else None
 
         # ---- Adaptive controller: measure THIS cycle's full candidate pool and
         # produce the bias to apply NEXT cycle (mirrors the throat carry pattern).
@@ -6970,6 +7153,15 @@ def main() -> None:
             else:
                 # Legacy: by fitness alone.
                 survivors_prev = ranked_df
+        elif args.composition_pool_fallback:
+            # Feature #29: this cycle collapsed (zero ranked survivors). Clear the
+            # carried survivor pool so the NEXT cycle correctly sees "no survivors
+            # from the previous cycle" and routes WS-C through the sampled fallback
+            # (seq_stage_pool_prev, set above) instead of a STALE older survivor
+            # pool. Gated on the opt-in flag, so the default path keeps today's
+            # behavior (survivors_prev unchanged on the empty-ranked path) =>
+            # byte-identical. (codex review.)
+            survivors_prev = None
         all_pdb_maps.update(pdb_map)
 
         # Snapshot metrics for this cycle (best-effort; never blocks).
