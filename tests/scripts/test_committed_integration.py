@@ -1511,32 +1511,6 @@ def test_cli_rejects_non_positive_aa_zmax():
         assert "--plm_autoskip_aa_zmax" in proc.stderr
 
 
-def test_seed_overrep_bootstrap_map_adds_aas_at_every_designable_position():
-    """The pure helper that folds triage's whole-protein over_rep_aas into the cycle-0
-    expression_soft_bias seed-map: each over-rep AA is appended to EVERY designable body
-    position (0-indexed) so the composition cap targets them from cycle 0. Existing
-    entries are preserved + de-duplicated; empty over_rep_aas is a no-op."""
-    base = {0: "M", 2: "F"}                              # pre-existing local soft-bias
-    # 4 body positions; over-rep AAs A and V applied globally.
-    out = idz._merge_seed_overrep_into_soft_bias(
-        dict(base), over_rep_aas=["A", "V"], n_positions=4)
-    for pos in range(4):
-        assert "A" in out[pos] and "V" in out[pos]
-    assert "M" in out[0] and "F" in out[2]               # locals preserved
-    # de-dup: applying again doesn't double a letter.
-    out2 = idz._merge_seed_overrep_into_soft_bias(
-        out, over_rep_aas=["A"], n_positions=4)
-    assert out2[0].count("A") == 1
-    # empty over_rep_aas => unchanged map.
-    same = idz._merge_seed_overrep_into_soft_bias(dict(base), over_rep_aas=[], n_positions=4)
-    assert same == base
-
-
-def test_seed_overrep_bootstrap_empty_positions_is_safe():
-    """n_positions=0 (degenerate) yields an unchanged map (no crash)."""
-    assert idz._merge_seed_overrep_into_soft_bias({}, over_rep_aas=["A"], n_positions=0) == {}
-
-
 def test_shell_z_gate_value_passthrough():
     """PLM_AUTOSKIP_AA_ZMAX / _AA_LOG2_FLOOR / PLM_AUTOSKIP_SOFT[_ZERO] emit their flags
     only when --plm_autoskip_bad_input is on AND they're set. Pins to the shipped sh."""

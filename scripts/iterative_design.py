@@ -1250,32 +1250,6 @@ def _resolve_bias_total_clamp_default(
     return _DEFAULT_BIAS_TOTAL_CLAMP_NATS
 
 
-def _merge_seed_overrep_into_soft_bias(
-    soft_bias: dict[int, str],
-    *,
-    over_rep_aas: list[str],
-    n_positions: int,
-) -> dict[int, str]:
-    """Fold the seed-triage whole-protein ``over_rep_aas`` into the cycle-0
-    ``expression_soft_bias`` seed-map (0-indexed body position -> AAs to down-weight).
-
-    The z-gate over-rep is a WHOLE-PROTEIN signal, so each flagged AA is appended to EVERY
-    designable body position ``[0, n_positions)`` — that is exactly what arms the cycle-0
-    composition bootstrap (the existing ``soft_bias_to_bias_array`` path) to push those AAs
-    down from the very first cycle, before any survivors exist. Pre-existing local entries
-    are preserved and the per-position AA set is de-duplicated (str of sorted unique AAs).
-    Mutates a COPY-friendly dict in place and returns it; empty ``over_rep_aas`` /
-    ``n_positions==0`` is a no-op (returns the map unchanged).
-    """
-    if not over_rep_aas or n_positions <= 0:
-        return soft_bias
-    add = set("".join(over_rep_aas).upper())
-    for pos in range(n_positions):
-        existing = set(soft_bias.get(pos, ""))
-        soft_bias[pos] = "".join(sorted(existing | add))
-    return soft_bias
-
-
 # WS-C fraction cap never leaves a designable position with fewer than this many
 # sampleable AAs (guards the all-AAs-omitted → uniform-from-forbidden MPNN failure).
 _MIN_SAMPLEABLE_AAS_AFTER_CAP = 3
@@ -6694,7 +6668,7 @@ def main() -> None:
     # LigandMPNN regenerates from structure + fixed residues. Default OFF => the fusion
     # below is byte-identical (imports + work happen only inside the opt-in branch).
     # Whole-protein over-rep AAs the z-gate flags (always defined; only populated when the
-    # opt-in z-gate fires) — fed to the cycle-0 composition bootstrap below.
+    # opt-in z-gate fires) — logged below; the composition cap (#29) handles them per-cycle.
     _triage_over_rep_aas: list[str] = []
     if args.plm_autoskip_bad_input:
         # ALL imports + work inside the try so a missing dep (e.g. Biopython for
@@ -6732,8 +6706,9 @@ def main() -> None:
                     if "z=" in _r and "log2=" in _r:
                         LOGGER.warning("SEED TRIAGE z-gate: %s", _r)
                 LOGGER.warning(
-                    "SEED TRIAGE z-gate flagged over-represented AAs %s (vs %s); these "
-                    "are armed into the cycle-0 composition bootstrap.",
+                    "SEED TRIAGE z-gate flagged over-represented AAs %s (vs %s); they "
+                    "contribute to the triage decision and are capped per-cycle by the "
+                    "composition cap (--composition_pool_fallback / --aa_fraction_cap).",
                     "".join(_triage_over_rep_aas), args.aa_reference)
             # F2 policy: cliff (default) or soft/graded reduction of plm_strength.
             _triage_new_strength = graded_plm_strength(
@@ -6989,19 +6964,14 @@ def main() -> None:
     expression_soft_bias = wt_eng.soft_bias_per_residue(
         max_span_frac=_SOFT_BIAS_MAX_SPAN_FRAC,
     )
-    # F1 consequence (b): the z-gate's whole-protein over_rep_aas are folded into the
-    # cycle-0 soft-bias seed-map so the composition cap targets them from the first cycle
-    # (cycles 1+ rebuild the map from the survivor pool, so this is a cycle-0 bootstrap).
-    # Only when --composition_soft_bias consumes the map AND the z-gate flagged something.
-    if args.composition_soft_bias and _triage_over_rep_aas:
-        _n_before = len(expression_soft_bias)
-        expression_soft_bias = _merge_seed_overrep_into_soft_bias(
-            expression_soft_bias, over_rep_aas=_triage_over_rep_aas,
-            n_positions=len(protein_resnos))
-        LOGGER.warning(
-            "SEED TRIAGE z-gate -> cycle-0 composition bootstrap: armed over-rep AAs %s "
-            "at all %d designable body positions (was %d local soft-bias positions).",
-            "".join(_triage_over_rep_aas), len(protein_resnos), _n_before)
+    # F1 consequence (b): the z-gate's over-rep AAs are HANDLED PER-CYCLE by the existing
+    # composition cap (#29 --composition_pool_fallback + --aa_fraction_cap + suppress-overrep),
+    # which caps whatever is over-represented in each cycle's sampled pool. The earlier
+    # cycle-0 SEED bootstrap (forcing those AAs down at all positions from cycle 0) was
+    # REMOVED: cluster validation showed it over-committed and degraded hard seeds (Chigh
+    # GRAVY -0.01 -> +0.46, Clow -0.57 -> +0.03), while #29 alone steers them correctly. The
+    # z-gate's value is the triage CONTRIBUTION (above) + the prominent LOG (above); the cap
+    # is #29's job, not a one-shot seed forcing.
     if args.composition_soft_bias:
         LOGGER.info(
             "expression-engine SOFT_BIAS seed-bootstrap map: %d local positions "
