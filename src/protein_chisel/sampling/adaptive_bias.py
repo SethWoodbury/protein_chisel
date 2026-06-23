@@ -1089,7 +1089,8 @@ def seed_warmstart(*, seed_metrics: dict, axes: list, cfg: AdaptiveBiasConfig,
                    L: int, position_classes: list,
                    sasa_fraction: Optional[np.ndarray], fixed_idx: set,
                    strength: float = 0.5,
-                   surface_mask: Optional[np.ndarray] = None
+                   surface_mask: Optional[np.ndarray] = None,
+                   temperature: Optional[float] = None,
                    ) -> tuple[dict, np.ndarray, dict]:
     """Warm-start the controller from the INPUT scaffold's scalar properties.
 
@@ -1108,6 +1109,12 @@ def seed_warmstart(*, seed_metrics: dict, axes: list, cfg: AdaptiveBiasConfig,
     outcomes: list = []
     tele: dict = {}
     state: dict = {}
+    # CF-3: route the cycle-0 warm-start bias through the SAME coordinator as cycles 1+
+    # (signed-sum joint odds budget at the application T) when opted in and T is usable,
+    # so the seed push is consistent with the rest of the run. Off (or no T) => the
+    # legacy raw-nats global_per_aa_bias + per-axis surface delta => byte-identical.
+    coordinated = bool(cfg.coordinator
+                       and temperature is not None and temperature > 0)
     # Carry the seed's own value forward as the cycle-1 EWMA/derivative prior, but
     # only when a damping feature consumes it (else None => byte-identical state dict).
     damping_on = (cfg.measurement_ewma_alpha < 1.0) or (cfg.derivative_gain != 0.0)
@@ -1139,13 +1146,23 @@ def seed_warmstart(*, seed_metrics: dict, axes: list, cfg: AdaptiveBiasConfig,
         state[axis.name] = AxisState(last_u=u, history=[],
                                      m_smooth_prev=seed_msp).to_dict()
         tele[axis.name] = {"seed_value": val, "u": round(u, 4)}
-        if axis.scope == "surface":
+        # Legacy: accumulate the per-axis surface delta in-loop. Under the coordinator
+        # the (L,20) delta is produced jointly below, so skip here.
+        if axis.scope == "surface" and not coordinated:
             delta = delta + build_surface_delta(
                 oc, L=L, position_classes=position_classes,
                 sasa_fraction=sasa_fraction, fixed_idx=fixed_idx, cfg=cfg,
                 surface_mask=surface_mask)
     axes_by_name = {a.name: a for a in axes}
-    global_bias = global_per_aa_bias(outcomes, axes_by_name, cfg)
+    if coordinated:
+        from protein_chisel.sampling.coordinator import coordinate as _coordinate
+        global_bias, delta = _coordinate(
+            outcomes, axes_by_name, cfg, temperature, L=L,
+            position_classes=position_classes, sasa_fraction=sasa_fraction,
+            fixed_idx=fixed_idx, surface_mask=surface_mask,
+            controller_ceiling=cfg.controller_ceiling)
+    else:
+        global_bias = global_per_aa_bias(outcomes, axes_by_name, cfg)
     return global_bias, delta, state, {"seed_warmstart": tele}
 
 

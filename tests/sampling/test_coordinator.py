@@ -175,6 +175,31 @@ def test_signed_sum_budget_invariant_bug_a():
     assert abs(got.get("D", 0.0)) <= budget + 1e-9
 
 
+def test_allocate_cell_cross_actuator_matches_spec_algorithm():
+    """Pin the EXACT spec algorithm for the (theoretical) cross-actuator opposite-sign
+    case: two SEPARATE actuators with symmetric opposing drives go through the joint
+    BUDGET (weight-partition + work-conserving re-lend + final clip), NOT a pure
+    signed-sum — so the result is the priority-ordered budget allocation, bounded by
+    BUG-A (|cell| ≤ budget). The pure signed-sum rule applies WITHIN one actuator
+    (test_signed_sum_opposite_sign_shared_actuator), which is the only case the real
+    pipeline produces (charge/pI share ONE actuator; surface is AA-disjoint). This test
+    documents the cross-actuator budget behaviour as intentional, per the spec's
+    `cell = clip(Σ grant_g, ±budget)` definition (the re-lend overshoots then the final
+    clip binds — the spec's 'belt-and-suspenders' clip)."""
+    from protein_chisel.sampling.coordinator import _allocate_cell
+    # +10 / -10 on two DIFFERENT actuators, budget 1: the spec's algorithm yields
+    # +budget (priority a first) — bounded, deterministic, |cell| ≤ budget.
+    cell_a = _allocate_cell({"a": 10.0, "b": -10.0}, {"a": 1.0, "b": 1.0},
+                            {"a": 1, "b": 2}, budget_nats=1.0)
+    assert cell_a == pytest.approx(1.0, abs=1e-9)
+    assert abs(cell_a) <= 1.0 + 1e-9          # BUG-A invariant holds
+    # reversing priority reverses the winner (deterministic by (priority, name)).
+    cell_b = _allocate_cell({"a": 10.0, "b": -10.0}, {"a": 1.0, "b": 1.0},
+                            {"a": 2, "b": 1}, budget_nats=1.0)
+    assert cell_b == pytest.approx(-1.0, abs=1e-9)
+    assert abs(cell_b) <= 1.0 + 1e-9
+
+
 def test_budget_invariant_holds_for_every_cell():
     """For arbitrary drives across several actuators, every cell's |Σ grant| ≤
     budget_nats (the invariant is per-cell, not just on D)."""
@@ -455,6 +480,30 @@ def test_compute_adaptive_bias_coordinator_pi_shares_charge_no_double():
     assert r.controller_global.get("D", 0.0) <= budget + 1e-9
     assert r.controller_global.get("D", 0.0) > 0.0   # it did steer D up
     assert r.telemetry["coordinator"]["active"] is True
+
+
+def test_seed_warmstart_coordinator_bounds_cycle0_and_off_is_byte_identical():
+    """codex #3: --controller_coordinator must also route the cycle-0 warm-start through
+    the coordinator (bounded to the controller ceiling at the application T), and the
+    OFF path must stay byte-identical (the temperature arg is ignored when off)."""
+    from protein_chisel.sampling.adaptive_bias import seed_warmstart
+    L = 20
+    kw = dict(L=L, position_classes=["distal_surface"] * L,
+              sasa_fraction=np.full(L, 0.5), fixed_idx=set())
+    seed = {"gravy": 0.9, "net_charge_full_HH": 5.0}     # too hydrophobic + too positive
+    # coordinator ON: the cycle-0 controller share is bounded to the ceiling at T_apply.
+    g_on, d_on, _s, _t = seed_warmstart(
+        seed_metrics=seed, axes=default_axes(),
+        cfg=AdaptiveBiasConfig(coordinator=True), temperature=0.20, **kw)
+    for aa, v in g_on.items():
+        assert odds_for_nats(abs(v), 0.20) <= CONTROLLER_CEILING + 1e-6
+    assert np.all(odds_for_nats_vec(np.abs(d_on), 0.20) <= CONTROLLER_CEILING + 1e-6)
+    # coordinator OFF: byte-identical regardless of the temperature argument.
+    g1, d1, _, _ = seed_warmstart(seed_metrics=seed, axes=default_axes(),
+                                  cfg=AdaptiveBiasConfig(), temperature=0.20, **kw)
+    g2, d2, _, _ = seed_warmstart(seed_metrics=seed, axes=default_axes(),
+                                  cfg=AdaptiveBiasConfig(), temperature=None, **kw)
+    assert g1 == g2 and np.array_equal(d1, d2)
 
 
 def test_compute_adaptive_bias_coordinator_total_odds_bounded():

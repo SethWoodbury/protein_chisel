@@ -7049,6 +7049,10 @@ def main() -> None:
                 axes=_ab_seed_axes, cfg=_ab_cfg, L=base_bias.shape[0],
                 position_classes=position_classes, sasa_fraction=_ab_sasa,
                 fixed_idx=_ab_fixed_idx, surface_mask=_ab_surface_mask,
+                # The warm-start bias is APPLIED at cycle 0, so the coordinator (when on)
+                # sizes its budget at cycle 0's T. Only consumed under the coordinator;
+                # legacy path ignores it => byte-identical.
+                temperature=cycles[0].sampling_temperature,
             )
             adaptive_global = adaptive_global or None
             adaptive_delta = adaptive_delta if np.any(adaptive_delta) else None
