@@ -85,3 +85,53 @@ A new sif containing **ProLIF + pdbe-arpeggio + fpocket** would unlock three cur
 - Verify `tools/fpocket_run` end-to-end with a real PDB.
 
 The cluster's existing `metal3d.sif` could be extended with a thin Metal3D-inference driver script, after which `tools/metal3d_score` also flips from "stub" to "wrapped + tested".
+
+---
+
+## Solubility metric: reconsider whole-sequence GRAVY as a hard filter (investigate, 2026-06-11)
+
+**Question raised (Seth):** GRAVY is a *sequence-only* Kyte-Doolittle average — it can't tell a buried
+hydrophobic *core* from an exposed hydrophobic *surface*. A perfectly soluble globular enzyme with a
+large packed hydrophobic core can score high GRAVY yet have a clean, polar surface. So rejecting designs
+on GRAVY may penalize good globular folds; **surface aggregation propensity (SAP)** — which is
+structure-aware (SASA-weighted hydrophobicity, `_compute_sap_proxy`) — is the more appropriate
+solubility/aggregation signal.
+
+**What the i2 data shows (n≈3200 designs):**
+- GRAVY *does* correlate with SAP here: `corr(GRAVY, sap_mean)=+0.93`, `corr(GRAVY, sap_max)=+0.73`,
+  `corr(GRAVY, sap_p95)=+0.79`. So in *this* campaign the high-GRAVY designs also tend to have
+  hydrophobic *surfaces* (not merely cores) — GRAVY isn't badly misleading on average.
+- **BUT GRAVY is the binding filter, not SAP.** Designs fail the GRAVY band ([-0.8, 0.3]; ~76% of designs
+  have GRAVY>0.3) while **passing** the SAP filter (threshold `sap_max ≤ 100`; observed sap_max median
+  ~18–20, max ~28). So the pipeline is rejecting on the sequence metric while the structure-aware metric
+  is lenient and unused as a real gate.
+
+**Recommendations (future):**
+1. Reconsider whole-sequence GRAVY as a *hard* solubility filter — at minimum loosen it, or demote it to a
+   soft/ranking term, so a design isn't rejected for a hydrophobic *core*.
+2. Make SAP the primary solubility gate: **calibrate a `sap_max`/`sap_p95` threshold against known-soluble
+   EC3 hydrolases** (the SAP proxy needs a reference baseline; threshold 100 is effectively off). Ties
+   directly to the planned **per-residue SAP ControlAxis** (see the per-residue-bias future plan) — surface
+   SAP is both the better filter *and* the better steering signal.
+3. Report both, but trust surface SAP over GRAVY for the soluble/insoluble call.
+
+## Adaptive controller: `distal_surface` scope may be too narrow (investigate, 2026-06-11)
+
+**Question raised (Seth):** is the controller's `distal_surface` sphere too narrow? **Yes, plausibly.**
+Definition (`classify_positions.py`): `distal_surface = CA > 10.0 Å from any ligand atom AND sidechain
+SASA fraction ≥ 0.20`. The adaptive controller's surface-hydrophobicity axis acts **only** on
+`distal_surface`, so it **excludes exposed (SASA ≥ 0.20) residues that are within 10 Å of the ligand**
+(those are classed `nearby_surface`). For *solubility* steering, ligand-distance is the wrong gate — an
+exposed, non-catalytic residue 8 Å from the ligand is still surface and still drives aggregation, but the
+controller can't touch it. The `10.0 Å` cutoff (`nearby_ca_distance`, "Richter 2011 design shell") is an
+*active-site* shell, not a solubility-surface boundary.
+
+**Recommendations (future):**
+1. Broaden the controller's surface scope from `{distal_surface}` to **all genuinely-exposed, non-catalytic
+   positions** = `{distal_surface} ∪ {exposed subset of nearby_surface}`, excluding only
+   `primary_sphere`/`secondary_sphere` (catalytic/binding). Gate purely on `sasa_sc_fraction` (≥ ~0.20)
+   rather than on ligand distance.
+2. Quantify first: per protein, what fraction of the *exposed* surface is excluded by the 10 Å cutoff
+   (i.e. how many SASA≥0.20 residues fall in `nearby_surface`)? If it's a large fraction, the surface axis
+   is leaving most of the steerable surface untouched.
+3. Make the "distal" CA cutoff and the SASA exposure threshold configurable knobs of the controller.
